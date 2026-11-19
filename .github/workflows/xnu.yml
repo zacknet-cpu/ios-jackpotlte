@@ -2,7 +2,7 @@ name: xnu
 
 on:
   push:
-    branches: [a8-build]
+    branches: [a8-build, a8-build-intel]
   workflow_dispatch:
     inputs:
       macos_version:
@@ -43,7 +43,7 @@ jobs:
     # macos-15 ships Xcode 16+, whose iig emits IORPC.kernelContent. Patch
     # 0083-xcode27-iig-kernel-content.patch adds that field to xnu-8796, so the
     # modern SDK builds this kernel. (macos-14 was rejected by the runner.)
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 120
     permissions:
       contents: write
