@@ -1,6 +1,8 @@
 name: xnu
 
 on:
+  push:
+    branches: [a8-build]
   workflow_dispatch:
     inputs:
       macos_version:
@@ -43,6 +45,8 @@ jobs:
     # modern SDK builds this kernel. (macos-14 was rejected by the runner.)
     runs-on: macos-15
     timeout-minutes: 120
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -286,3 +290,23 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      - name: Save the kernel to the kernel-out branch
+        if: success()
+        run: |
+          mkdir -p kout
+          for k in out/kernel.*; do
+            case "$k" in *.link|*.dSYM|*.lse.txt) continue ;; esac
+            [ -f "$k" ] || continue
+            gzip -9 -c "$k" > "kout/$(basename "$k").gz"
+          done
+          cp out/SHA256SUMS kout/ 2>/dev/null || true
+          ls -la kout
+          cd kout
+          git init -q -b kernel-out
+          git config user.name "a8-build"
+          git config user.email "a8-build@users.noreply.github.com"
+          echo "built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})" > BUILD_INFO.txt
+          git add .
+          git commit -q -m "kernel from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" kernel-out
