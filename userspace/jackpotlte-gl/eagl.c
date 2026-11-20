@@ -63,6 +63,7 @@
 
 #include <fcntl.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -307,12 +308,110 @@ sync_mode(void)
    return mode;
 }
 
+/*
+ * a8-gpu2: one batch a frame.  The flush after every draw (below) is how the
+ * bring-up got a frame to the GPU at all, but it makes each draw its own
+ * fragment job, and a fragment job loads and stores the whole 1080x2220 render
+ * target: the lock screen's first frame (a8log-2, frame 10: 57 draws) was 57
+ * full-screen passes.  CoreAnimation ends every frame with glFenceSync, which
+ * submits the batch, and frame_end() waits for the GPU there (jtglsync >= 1),
+ * so the frame still reaches the GPU before the swap.
+ *
+ * Boot-arg jtglflush: 1 = flush after every draw (default, the old behaviour),
+ * 0 = no flush after a draw: one batch a render target a frame.
+ */
+static int
+flush_mode(void)
+{
+   static int mode = -1;
+
+   if (mode < 0) {
+      mode = boot_arg_int("jtglflush", 1);
+      say("flush: jtglflush=%d (1 a flush after every draw, 0 one batch a "
+          "frame)", mode);
+   }
+   return mode;
+}
+
+/*
+ * a8-gpu2: what a frame costs, from the display server's side.  Every 10 s in
+ * which frames were drawn: how many, the gaps between them (a gap during an
+ * animation is the frame time), and the time spent waiting for the GPU
+ * (frame_end's glFinish), in the per-draw flushes and in cache maintenance.
+ * Boot-arg jtglperf=0 turns it off.
+ */
+static mach_timebase_info_data_t timebase;
+static struct {
+   uint64_t start, last;               /* mach time: window start, last frame */
+   unsigned long frames, draws;
+   unsigned long gaps[5];              /* <=17, <=34, <=50, <=100, >100 ms */
+   uint64_t wait, wait_max, flush, clean;      /* mach ticks */
+} perf;
+static unsigned long perf_lines;
+
+static uint64_t
+ticks_us(uint64_t ticks)
+{
+   if (timebase.denom == 0)
+      (void)mach_timebase_info(&timebase);
+   return timebase.denom == 0 ? 0 : ticks * timebase.numer / timebase.denom / 1000;
+}
+
+static int
+perf_on(void)
+{
+   static int on = -1;
+
+   if (on < 0)
+      on = boot_arg_int("jtglperf", 1);
+   return on;
+}
+
+/* CoreAnimation's glFenceSync: a frame is about to be swapped. */
+static void
+perf_frame(void)
+{
+   uint64_t now, us, gap;
+   unsigned long n;
+
+   if (!perf_on())
+      return;
+   now = mach_absolute_time();
+   if (perf.start == 0)
+      perf.start = now;
+   if (perf.last != 0) {
+      gap = ticks_us(now - perf.last) / 1000;
+      perf.gaps[gap <= 17 ? 0 : gap <= 34 ? 1 : gap <= 50 ? 2 : gap <= 100 ? 3 : 4]++;
+   }
+   perf.last = now;
+   perf.frames++;
+   us = ticks_us(now - perf.start);
+   if (us < 10000000ull)
+      return;
+   n = perf.frames;
+   if (perf_lines++ < 3000)
+      say("perf: %llu ms, %lu frames, %lu draws (%lu a frame); gaps <=17/34/50/100/more ms: "
+          "%lu/%lu/%lu/%lu/%lu; GPU wait %llu us a frame (max %llu), flush %llu us a "
+          "frame, cache %llu us a frame; jtglflush=%d jtglsync=%d",
+          (unsigned long long)(us / 1000), n, perf.draws, perf.draws / n,
+          perf.gaps[0], perf.gaps[1], perf.gaps[2], perf.gaps[3], perf.gaps[4],
+          (unsigned long long)(ticks_us(perf.wait) / n),
+          (unsigned long long)ticks_us(perf.wait_max),
+          (unsigned long long)(ticks_us(perf.flush) / n),
+          (unsigned long long)(ticks_us(perf.clean) / n),
+          flush_mode(), sync_mode());
+   memset(&perf, 0, sizeof(perf));
+   perf.start = now;
+   perf.last = now;
+}
+
 static void
 clean_surface(unsigned i, const char *why)
 {
    uint32_t seed = 0;
    void *base;
    size_t length;
+   uint64_t t0;
 
    if (IOSurfaceLock(shared[i].surface, SURFACE_LOCK_READ_ONLY, &seed) != 0) {
       if (cleans < 40)
@@ -321,8 +420,10 @@ clean_surface(unsigned i, const char *why)
    }
    base = IOSurfaceGetBaseAddress(shared[i].surface);
    length = IOSurfaceGetAllocSize(shared[i].surface);
+   t0 = mach_absolute_time();
    if (base != NULL && length != 0)
       sys_dcache_flush(base, length);
+   perf.clean += mach_absolute_time() - t0;
    (void)IOSurfaceUnlock(shared[i].surface, SURFACE_LOCK_READ_ONLY, &seed);
    cleans++;
    if (cleans <= 40 || cleans % 500 == 0)
@@ -434,8 +535,14 @@ frame_end(const char *why, int finished)
       void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
 
       if (finish != NULL) {
+         uint64_t t0 = mach_absolute_time(), t;
+
          finish();
          finishes++;
+         t = mach_absolute_time() - t0;
+         perf.wait += t;
+         if (t > perf.wait_max)
+            perf.wait_max = t;
       }
    }
    for (i = 0; i < SHARED_MAX; i++) {
@@ -471,11 +578,16 @@ jackpotlte_gl_after_draw(void)
    int mode = sync_mode();
 
    draws++;
+   perf.draws++;
    frame_drawn = 1;
    if (mode != 0)
       shared_sync();
-   if (flush != NULL)
+   if (flush != NULL && flush_mode() != 0) {
+      uint64_t t0 = mach_absolute_time();
+
       flush();
+      perf.flush += mach_absolute_time() - t0;
+   }
    if (mode == 2)
       frame_end("a draw (jtglsync=2)", 0);
    if (draws <= 20 || draws % 600 == 0)
@@ -531,6 +643,7 @@ my_glFenceSync(void *context, GLenum condition, GLbitfield flags)
    if (real == NULL)
       real = (GLsync (*)(GLenum, GLbitfield))jackpotlte_gl_proc("glFenceSync");
    frame_end("glFenceSync", 0);
+   perf_frame();
    return real != NULL ? real(condition, flags) : NULL;
 }
 

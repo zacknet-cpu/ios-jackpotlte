@@ -14,7 +14,7 @@ name: userspace
 
 on:
   push:
-    branches: [a8-gpu, a8-gpu-cache]
+    branches: [a8-gpu, a8-gpu-cache, a8-gpu2]
   workflow_dispatch:
 
 concurrency:
@@ -85,6 +85,15 @@ jobs:
       - name: The host copy runs
         run: userspace/out/maliprobe.host --help
 
+      # a8-gpu2: a copy of the shim without local symbols, small enough to be
+      # written over the installed one in place (same file, same size, padded),
+      # so a new shim does not need a 16 GB USERDATA flash and a first boot.
+      - name: Stripped copy of the shim
+        run: |
+          strip -x -o userspace/out/libjackpotlte-gl.stripped.dylib userspace/out/libjackpotlte-gl.dylib
+          ls -l userspace/out/libjackpotlte-gl.dylib userspace/out/libjackpotlte-gl.stripped.dylib
+          shasum -a 256 userspace/out/libjackpotlte-gl.dylib userspace/out/libjackpotlte-gl.stripped.dylib
+
       # The arm64 copies are the artifacts that go onto the phone:
       # /usr/local/bin/maliprobe, and libjackpotlte.a with its header for the
       # next userspace layer to link against.  This project keeps no Mac, so a
@@ -101,10 +110,14 @@ jobs:
           cp userspace/out/* saveout/ 2>/dev/null || true
           ls -la saveout
           cd saveout
-          git init -q -b userspace-out
+          # a8-gpu2 saves to its own branch so the shim the phone was flashed
+          # with (userspace-out, a8-gpu-cache) stays where it is.
+          outbranch=userspace-out
+          if [ "${GITHUB_REF_NAME}" = a8-gpu2 ]; then outbranch=userspace-out-gpu2; fi
+          git init -q -b "$outbranch"
           git config user.name "a8-gpu"
           git config user.email "a8-gpu@users.noreply.github.com"
           echo "built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})" > BUILD_INFO.txt
           git add .
-          git commit -q -m "userspace-out from ${GITHUB_SHA}"
-          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" userspace-out
+          git commit -q -m "$outbranch from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" "$outbranch"
