@@ -250,20 +250,31 @@ jackpotlte_gl_use(void *context)
  * surface whose seed moved, or every SYNC_EVERY draws any surface, is written
  * back and invalidated with sys_dcache_flush (DC CIVAC by address).
  *
- * Boot-arg jtglsync: 0 = off (the old behaviour), 1 = textures and targets
- * cleaned before the GPU runs (default), 2 = also wait for the GPU after each
- * flush and clean the render targets again, so nothing the CPU later reads
- * (the kernel's present copy) comes from a stale cache line.  2 is slow.
+ * The other direction matters as much: the kernel's framebuffer copies a
+ * render target to the panel with the CPU as soon as it is swapped, without
+ * waiting for the GPU and without touching the caches (this kernel has no
+ * HakiosMaliDrawn() like the S9+ port's, danstronics/ios-s9plus-exynos).  So
+ * at the end of each frame the GPU is waited for (glFinish) and the render
+ * targets are cleaned and invalidated, as the S7 and S9+ shims do in their
+ * frame_end() (boot-arg glwait there).
+ *
+ * Boot-arg jtglsync: 0 = off (the old behaviour), 1 = textures cleaned before
+ * the GPU runs, the GPU waited for at the end of each frame and the render
+ * targets cleaned after it (default), 2 = that after every single draw too.
+ * 2 is very slow; it is a test of whether the frames are right at all.
  */
-#define SHARED_MAX 48
+#define SHARED_MAX 32
 #define SYNC_EVERY 120
 static struct {
-   IOSurfaceRef surface;
+   IOSurfaceRef surface;               /* retained while it is in here */
+   void *owner;                        /* the context whose texture it is */
+   int texture;                        /* that texture's name */
    uint32_t id, seed;
-   int target;
+   int target;                         /* drawn into (-attachImage:) */
 } shared[SHARED_MAX];
-static unsigned nshared, shared_next;
-static unsigned long draws, cleans, finishes;
+static unsigned shared_next;
+static unsigned long draws, cleans, finishes, frames, forgotten;
+static int frame_drawn;                /* a draw since the last frame_end() */
 
 static int
 boot_arg_int(const char *name, int fallback)
@@ -290,7 +301,8 @@ sync_mode(void)
 
    if (mode < 0) {
       mode = boot_arg_int("jtglsync", 1);
-      say("cache: jtglsync=%d (0 off, 1 clean before the GPU, 2 also after)", mode);
+      say("cache: jtglsync=%d (0 off, 1 clean before the GPU and wait at the "
+          "end of a frame, 2 wait after every draw)", mode);
    }
    return mode;
 }
@@ -319,32 +331,68 @@ clean_surface(unsigned i, const char *why)
           shared[i].target ? "render target" : "texture", cleans);
 }
 
+static unsigned
+shared_count(void)
+{
+   unsigned i, n = 0;
+
+   for (i = 0; i < SHARED_MAX; i++)
+      n += shared[i].surface != NULL;
+   return n;
+}
+
+/* A texture of `owner`'s now shows `surface` (in place, memory shared). */
 static void
-shared_note(IOSurfaceRef surface, int target)
+shared_note(void *owner, int texture, IOSurfaceRef surface, int target)
 {
    uint32_t id;
-   unsigned i;
+   unsigned i, slot = SHARED_MAX;
 
    if (sync_mode() == 0 || surface == NULL)
       return;
    id = (uint32_t)IOSurfaceGetID(surface);
-   for (i = 0; i < nshared; i++) {
-      if (shared[i].surface != NULL && shared[i].id == id) {
-         shared[i].target |= target;
-         return;
+   for (i = 0; i < SHARED_MAX; i++) {
+      if (shared[i].surface != NULL && shared[i].owner == owner &&
+          shared[i].texture == texture) {
+         if (shared[i].id == id) {
+            shared[i].target |= target;
+            return;
+         }
+         slot = i;                     /* the texture shows another surface now */
+         break;
       }
    }
-   if (nshared < SHARED_MAX) {
-      i = nshared++;
-   } else {
-      i = shared_next++ % SHARED_MAX;
-      CFRelease(shared[i].surface);
+   for (i = 0; slot == SHARED_MAX && i < SHARED_MAX; i++) {
+      if (shared[i].surface == NULL)
+         slot = i;
    }
-   shared[i].surface = (IOSurfaceRef)CFRetain(surface);
-   shared[i].id = id;
-   shared[i].seed = IOSurfaceGetSeed(surface);
-   shared[i].target = target;
-   clean_surface(i, target ? "new render target" : "new texture");
+   if (slot == SHARED_MAX)
+      slot = shared_next++ % SHARED_MAX;   /* full: an old one goes */
+   if (shared[slot].surface != NULL)
+      CFRelease(shared[slot].surface);
+   shared[slot].surface = (IOSurfaceRef)CFRetain(surface);
+   shared[slot].owner = owner;
+   shared[slot].texture = texture;
+   shared[slot].id = id;
+   shared[slot].seed = IOSurfaceGetSeed(surface);
+   shared[slot].target = target;
+   clean_surface(slot, target ? "new render target" : "new texture");
+}
+
+/* The texture is deleted: let its surface go (backboardd must not keep them). */
+static void
+shared_forget(void *owner, int texture)
+{
+   unsigned i;
+
+   for (i = 0; i < SHARED_MAX; i++) {
+      if (shared[i].surface != NULL && shared[i].owner == owner &&
+          shared[i].texture == texture) {
+         CFRelease(shared[i].surface);
+         shared[i].surface = NULL;
+         forgotten++;
+      }
+   }
 }
 
 static void
@@ -353,7 +401,7 @@ shared_sync(void)
    unsigned i;
    int every = draws % SYNC_EVERY == 0;
 
-   for (i = 0; i < nshared; i++) {
+   for (i = 0; i < SHARED_MAX; i++) {
       uint32_t seed;
 
       if (shared[i].surface == NULL)
@@ -369,6 +417,41 @@ shared_sync(void)
 }
 
 /*
+ * The end of a frame: wait for the GPU (unless the caller just did), then
+ * clean and invalidate the render targets so the kernel's present copy reads
+ * what the GPU wrote and not lines the CPU fetched before.  Nothing writes a
+ * render target with the CPU between frames, so the clean writes nothing back.
+ */
+static void
+frame_end(const char *why, int finished)
+{
+   unsigned i, targets = 0;
+
+   if (sync_mode() == 0 || !frame_drawn)
+      return;
+   frame_drawn = 0;
+   if (!finished) {
+      void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
+
+      if (finish != NULL) {
+         finish();
+         finishes++;
+      }
+   }
+   for (i = 0; i < SHARED_MAX; i++) {
+      if (shared[i].surface != NULL && shared[i].target) {
+         clean_surface(i, "frame drawn");
+         targets++;
+      }
+   }
+   frames++;
+   if (frames <= 30 || frames % 300 == 0)
+      say("frame %lu ended by %s: %lu draws, %u render targets cleaned, "
+          "%lu GPU waits, %u surfaces kept, %lu let go", frames, why, draws,
+          targets, finishes, shared_count(), forgotten);
+}
+
+/*
  * The dispatch table's drawing entries call this after the call is passed on.
  * Apple's driver submits a draw to the GPU as it is made; the library behind
  * this table keeps it in a batch until a flush, so a renderer that never
@@ -378,7 +461,8 @@ shared_sync(void)
  * frame becomes a real one, and the driver's own job log says so.
  *
  * a8-gpu-cache: the caches are cleaned first, because the GPU reads the
- * surfaces only once the flush has submitted the batch.
+ * surfaces only once the flush has submitted the batch.  A draw also marks the
+ * frame as drawn, for frame_end().
  */
 void
 jackpotlte_gl_after_draw(void)
@@ -387,26 +471,176 @@ jackpotlte_gl_after_draw(void)
    int mode = sync_mode();
 
    draws++;
+   frame_drawn = 1;
    if (mode != 0)
       shared_sync();
    if (flush != NULL)
       flush();
-   if (mode == 2) {
-      void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
-      unsigned i;
+   if (mode == 2)
+      frame_end("a draw (jtglsync=2)", 0);
+   if (draws <= 20 || draws % 600 == 0)
+      say("draws: %lu, %u surfaces kept, %lu cleans, %lu GPU waits, %lu frames",
+          draws, shared_count(), cleans, finishes, frames);
+}
 
-      if (finish != NULL) {
-         finish();
-         finishes++;
-      }
-      for (i = 0; i < nshared; i++) {
-         if (shared[i].surface != NULL && shared[i].target)
-            clean_surface(i, "after the GPU");
-      }
+/* ---- entries CoreAnimation calls that the library answered wrongly ------ */
+
+/*
+ * glFlush, glFinish and glFenceSync end a frame: CoreAnimation makes a fence
+ * right before each swap (the a5log of the first GPU boot: glFenceSync, then
+ * "SWEET FB: swap 1").  They go through frame_end() before they are passed on.
+ */
+static void
+my_glFlush(void *context)
+{
+   static void (*real)(void);
+
+   jackpotlte_gl_use(context);
+   if (real == NULL)
+      real = (void (*)(void))jackpotlte_gl_proc("glFlush");
+   if (sync_mode() != 0)
+      shared_sync();
+   if (real != NULL)
+      real();
+   frame_end("glFlush", 0);
+}
+
+static void
+my_glFinish(void *context)
+{
+   static void (*real)(void);
+
+   jackpotlte_gl_use(context);
+   if (real == NULL)
+      real = (void (*)(void))jackpotlte_gl_proc("glFinish");
+   if (sync_mode() != 0)
+      shared_sync();
+   if (real != NULL) {
+      real();
+      finishes++;
    }
-   if (draws <= 20 || draws % 300 == 0)
-      say("frames: %lu draws, %u surfaces remembered, %lu cleans, %lu GPU waits",
-          draws, nshared, cleans, finishes);
+   frame_end("glFinish", 1);
+}
+
+static GLsync
+my_glFenceSync(void *context, GLenum condition, GLbitfield flags)
+{
+   static GLsync (*real)(GLenum, GLbitfield);
+
+   jackpotlte_gl_use(context);
+   if (real == NULL)
+      real = (GLsync (*)(GLenum, GLbitfield))jackpotlte_gl_proc("glFenceSync");
+   frame_end("glFenceSync", 0);
+   return real != NULL ? real(condition, flags) : NULL;
+}
+
+/*
+ * GL_APPLE_fence and the object waits.  Mesa has none of them, so the table's
+ * entries found no function: every test answered 0 ("the GPU is still busy")
+ * and every wait did nothing.  iOS 16's CoreAnimation calls
+ * glFinishObjectAPPLE before it deletes a render target (the Galaxy S7 port,
+ * wardevsa/ios-a5xelte gpu/eagl/src/gl_resolve.c, which answers them the
+ * same way); the first GPU boot's log has it too.  Everything is done after
+ * glFinish, so a wait finishes the GPU and a test answers yes.
+ */
+static void
+my_glGenFencesAPPLE(void *context, GLsizei n, GLuint *fences)
+{
+   static GLuint next = 1;
+   GLsizei i;
+
+   (void)context;
+   for (i = 0; fences != NULL && i < n; i++)
+      fences[i] = next++;
+}
+
+static void
+my_glDeleteFencesAPPLE(void *context, GLsizei n, const GLuint *fences)
+{
+   (void)context;
+   (void)n;
+   (void)fences;
+}
+
+static void
+my_glSetFenceAPPLE(void *context, GLuint fence)
+{
+   (void)fence;
+   my_glFlush(context);
+}
+
+static GLboolean
+my_glIsFenceAPPLE(void *context, GLuint fence)
+{
+   (void)context;
+   return fence != 0;
+}
+
+static GLboolean
+my_glTestFenceAPPLE(void *context, GLuint fence)
+{
+   (void)fence;
+   my_glFinish(context);
+   return 1;
+}
+
+static void
+my_glFinishFenceAPPLE(void *context, GLuint fence)
+{
+   (void)fence;
+   my_glFinish(context);
+}
+
+static GLboolean
+my_glTestObjectAPPLE(void *context, GLenum object, GLuint name)
+{
+   (void)object;
+   (void)name;
+   my_glFinish(context);
+   return 1;
+}
+
+static void
+my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
+{
+   static unsigned shown;
+
+   if (shown++ < 8)
+      say("glFinishObjectAPPLE(%#x, %d): the GPU is waited for", object, name);
+   my_glFinish(context);
+}
+
+static void
+my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
+{
+   static void (*real)(GLsizei, const GLuint *);
+   GLsizei i;
+
+   jackpotlte_gl_use(context);
+   if (real == NULL)
+      real = (void (*)(GLsizei, const GLuint *))jackpotlte_gl_proc("glDeleteTextures");
+   for (i = 0; textures != NULL && i < n; i++)
+      shared_forget(context, (int)textures[i]);
+   if (real != NULL)
+      real(n, textures);
+}
+
+/* Offsets from eagl_slots.txt (gl_slots.c): index = offset / 8. */
+static void
+install_fixes(void *table[JACKPOTLTE_GL_SLOTS])
+{
+   table[0x03c] = (void *)my_glDeleteTextures;       /* 0x01e0 */
+   table[0x05a] = (void *)my_glFinish;               /* 0x02d0 */
+   table[0x05b] = (void *)my_glFlush;                /* 0x02d8 */
+   table[0x1d0] = (void *)my_glGenFencesAPPLE;       /* 0x0e80 */
+   table[0x1d1] = (void *)my_glDeleteFencesAPPLE;    /* 0x0e88 */
+   table[0x1d2] = (void *)my_glSetFenceAPPLE;        /* 0x0e90 */
+   table[0x1d3] = (void *)my_glIsFenceAPPLE;         /* 0x0e98 */
+   table[0x1d4] = (void *)my_glTestFenceAPPLE;       /* 0x0ea0 */
+   table[0x1d5] = (void *)my_glFinishFenceAPPLE;     /* 0x0ea8 */
+   table[0x1d6] = (void *)my_glTestObjectAPPLE;      /* 0x0eb0 */
+   table[0x1d7] = (void *)my_glFinishObjectAPPLE;    /* 0x0eb8 */
+   table[0x30c] = (void *)my_glFenceSync;            /* 0x1860 */
 }
 
 static struct jackpotlte_eagl *
@@ -462,6 +696,7 @@ make_context(id self, unsigned long api)
    e->api = api;
    e->table[0] = e;
    jackpotlte_gl_fill_table(e->table);
+   install_fixes(e->table);
    contexts[place] = e;
 
    if (resolve_helpers()) {
@@ -923,7 +1158,7 @@ surface_is_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
    }
    if (!jackpotlte_gl_surface_texture(e->gl, (uint32_t)IOSurfaceGetID(surface)))
       return NO;
-   shared_note(surface, strcmp(method, "-attachImage:") == 0);
+   shared_note(e, texture, surface, strcmp(method, "-attachImage:") == 0);
    if (shown++ < 16) {
       say("%s: texture %d is surface %u, %zu x %zu, memory shared", method,
           texture, (unsigned)IOSurfaceGetID(surface), IOSurfaceGetWidth(surface),
