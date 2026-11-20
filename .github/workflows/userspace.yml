@@ -14,7 +14,7 @@ name: userspace
 
 on:
   push:
-    branches: [a8-gpu]
+    branches: [a8-gpu, a8-gpu-cache]
   workflow_dispatch:
 
 concurrency:

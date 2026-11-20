@@ -62,6 +62,7 @@
 #include "jackpotlte_gl.h"
 
 #include <fcntl.h>
+#include <libkern/OSCacheControl.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -91,6 +92,9 @@ size_t IOSurfaceGetHeight(IOSurfaceRef surface);
 void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
 int IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 int IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+uint32_t IOSurfaceGetSeed(IOSurfaceRef surface);
+const void *CFRetain(const void *object);
+void CFRelease(const void *object);
 
 /* The GL names this file itself uses. */
 #define GL_TEXTURE_2D             0x0de1
@@ -233,13 +237,176 @@ jackpotlte_gl_use(void *context)
  * flush per draw is expensive and is exactly what a bring-up wants: a drawn
  * frame becomes a real one, and the driver's own job log says so.
  */
+/*
+ * a8-gpu-cache: the Mali-G71 here is not cache-coherent with the CPUs, so a
+ * surface that another process drew with the CPU can still sit in the CPU
+ * caches when the GPU reads it as a "memory shared" texture: the GPU then
+ * samples stale RAM.  The Galaxy S7 port found the same thing in its shim
+ * (egemengunel/ios-a5xelte HEROLTE_PROGRESS.md: "0 textures refilled") and
+ * cleaned the IOSurface's cache when its seed changed and every 30 frames.
+ *
+ * Here every surface that becomes a shared texture or a render target is
+ * remembered, and before each flush (when Mesa hands the batch to the GPU) a
+ * surface whose seed moved, or every SYNC_EVERY draws any surface, is written
+ * back and invalidated with sys_dcache_flush (DC CIVAC by address).
+ *
+ * Boot-arg jtglsync: 0 = off (the old behaviour), 1 = textures and targets
+ * cleaned before the GPU runs (default), 2 = also wait for the GPU after each
+ * flush and clean the render targets again, so nothing the CPU later reads
+ * (the kernel's present copy) comes from a stale cache line.  2 is slow.
+ */
+#define SHARED_MAX 48
+#define SYNC_EVERY 120
+static struct {
+   IOSurfaceRef surface;
+   uint32_t id, seed;
+   int target;
+} shared[SHARED_MAX];
+static unsigned nshared, shared_next;
+static unsigned long draws, cleans, finishes;
+
+static int
+boot_arg_int(const char *name, int fallback)
+{
+   char args[1024], key[64];
+   size_t size = sizeof(args);
+   const char *p;
+
+   if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || size == 0)
+      return fallback;
+   args[size < sizeof(args) ? size : sizeof(args) - 1] = '\0';
+   (void)snprintf(key, sizeof(key), "%s=", name);
+   for (p = strstr(args, key); p != NULL; p = strstr(p + 1, key)) {
+      if (p == args || p[-1] == ' ')
+         return atoi(p + strlen(key));
+   }
+   return fallback;
+}
+
+static int
+sync_mode(void)
+{
+   static int mode = -1;
+
+   if (mode < 0) {
+      mode = boot_arg_int("jtglsync", 1);
+      say("cache: jtglsync=%d (0 off, 1 clean before the GPU, 2 also after)", mode);
+   }
+   return mode;
+}
+
+static void
+clean_surface(unsigned i, const char *why)
+{
+   uint32_t seed = 0;
+   void *base;
+   size_t length;
+
+   if (IOSurfaceLock(shared[i].surface, SURFACE_LOCK_READ_ONLY, &seed) != 0) {
+      if (cleans < 40)
+         say("cache: surface %u could not be locked (%s)", shared[i].id, why);
+      return;
+   }
+   base = IOSurfaceGetBaseAddress(shared[i].surface);
+   length = IOSurfaceGetAllocSize(shared[i].surface);
+   if (base != NULL && length != 0)
+      sys_dcache_flush(base, length);
+   (void)IOSurfaceUnlock(shared[i].surface, SURFACE_LOCK_READ_ONLY, &seed);
+   cleans++;
+   if (cleans <= 40 || cleans % 500 == 0)
+      say("cache: cleaned surface %u, %zu bytes at %p (%s, %s), %lu cleans",
+          shared[i].id, length, base, why,
+          shared[i].target ? "render target" : "texture", cleans);
+}
+
+static void
+shared_note(IOSurfaceRef surface, int target)
+{
+   uint32_t id;
+   unsigned i;
+
+   if (sync_mode() == 0 || surface == NULL)
+      return;
+   id = (uint32_t)IOSurfaceGetID(surface);
+   for (i = 0; i < nshared; i++) {
+      if (shared[i].surface != NULL && shared[i].id == id) {
+         shared[i].target |= target;
+         return;
+      }
+   }
+   if (nshared < SHARED_MAX) {
+      i = nshared++;
+   } else {
+      i = shared_next++ % SHARED_MAX;
+      CFRelease(shared[i].surface);
+   }
+   shared[i].surface = (IOSurfaceRef)CFRetain(surface);
+   shared[i].id = id;
+   shared[i].seed = IOSurfaceGetSeed(surface);
+   shared[i].target = target;
+   clean_surface(i, target ? "new render target" : "new texture");
+}
+
+static void
+shared_sync(void)
+{
+   unsigned i;
+   int every = draws % SYNC_EVERY == 0;
+
+   for (i = 0; i < nshared; i++) {
+      uint32_t seed;
+
+      if (shared[i].surface == NULL)
+         continue;
+      seed = IOSurfaceGetSeed(shared[i].surface);
+      if (seed != shared[i].seed) {
+         shared[i].seed = seed;
+         clean_surface(i, "seed changed");
+      } else if (every) {
+         clean_surface(i, "periodic");
+      }
+   }
+}
+
+/*
+ * The dispatch table's drawing entries call this after the call is passed on.
+ * Apple's driver submits a draw to the GPU as it is made; the library behind
+ * this table keeps it in a batch until a flush, so a renderer that never
+ * flushes (the display server, jt60: a full first frame drawn, no job to the
+ * GPU) would leave its frame in the library's command stream forever.  One
+ * flush per draw is expensive and is exactly what a bring-up wants: a drawn
+ * frame becomes a real one, and the driver's own job log says so.
+ *
+ * a8-gpu-cache: the caches are cleaned first, because the GPU reads the
+ * surfaces only once the flush has submitted the batch.
+ */
 void
 jackpotlte_gl_after_draw(void)
 {
    void (*flush)(void) = (void (*)(void))jackpotlte_gl_proc("glFlush");
+   int mode = sync_mode();
 
+   draws++;
+   if (mode != 0)
+      shared_sync();
    if (flush != NULL)
       flush();
+   if (mode == 2) {
+      void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
+      unsigned i;
+
+      if (finish != NULL) {
+         finish();
+         finishes++;
+      }
+      for (i = 0; i < nshared; i++) {
+         if (shared[i].surface != NULL && shared[i].target)
+            clean_surface(i, "after the GPU");
+      }
+   }
+   if (draws <= 20 || draws % 300 == 0)
+      say("frames: %lu draws, %u surfaces remembered, %lu cleans, %lu GPU waits",
+          draws, nshared, cleans, finishes);
 }
 
 static struct jackpotlte_eagl *
@@ -756,6 +923,7 @@ surface_is_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
    }
    if (!jackpotlte_gl_surface_texture(e->gl, (uint32_t)IOSurfaceGetID(surface)))
       return NO;
+   shared_note(surface, strcmp(method, "-attachImage:") == 0);
    if (shown++ < 16) {
       say("%s: texture %d is surface %u, %zu x %zu, memory shared", method,
           texture, (unsigned)IOSurfaceGetID(surface), IOSurfaceGetWidth(surface),
