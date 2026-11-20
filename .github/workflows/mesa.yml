@@ -9,6 +9,8 @@ name: mesa
 # drawn on the GPU; that needs a boot and a photo (JACKPOTLTE_PROGRESS.md).
 
 on:
+  push:
+    branches: [a8-gpu]
   workflow_dispatch:
 
 concurrency:
@@ -17,7 +19,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
+    permissions:
+      contents: write
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -93,3 +97,18 @@ jobs:
             ${{ runner.temp }}/mesa-build/out/built-from
             ${{ runner.temp }}/mesa-build/meson-setup.log
             ${{ runner.temp }}/mesa-build/build.log
+
+      - name: Save the result to the mesa-out branch
+        if: success()
+        run: |
+          mkdir -p saveout
+          cp "$RUNNER_TEMP/mesa-build/out/libOSMesa.8.dylib" "$RUNNER_TEMP/mesa-build/out/built-from" saveout/
+          ls -la saveout
+          cd saveout
+          git init -q -b mesa-out
+          git config user.name "a8-gpu"
+          git config user.email "a8-gpu@users.noreply.github.com"
+          echo "built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})" > BUILD_INFO.txt
+          git add .
+          git commit -q -m "mesa-out from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" mesa-out

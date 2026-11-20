@@ -13,6 +13,8 @@ name: userspace
 # JACKPOTLTE_PROGRESS.md, "green is not a patch that applied").
 
 on:
+  push:
+    branches: [a8-gpu]
   workflow_dispatch:
 
 concurrency:
@@ -21,7 +23,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
+    permissions:
+      contents: write
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -89,3 +93,18 @@ jobs:
         with:
           name: userspace
           path: userspace/out/
+
+      - name: Save the result to the userspace-out branch
+        if: success()
+        run: |
+          mkdir -p saveout
+          cp userspace/out/* saveout/ 2>/dev/null || true
+          ls -la saveout
+          cd saveout
+          git init -q -b userspace-out
+          git config user.name "a8-gpu"
+          git config user.email "a8-gpu@users.noreply.github.com"
+          echo "built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})" > BUILD_INFO.txt
+          git add .
+          git commit -q -m "userspace-out from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" userspace-out
