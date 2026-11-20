@@ -74,6 +74,9 @@ size_t IOSurfaceGetAllocSize(struct __IOSurface *s) { return s->alloc; }
 size_t IOSurfaceGetWidth(struct __IOSurface *s) { return s->width; }
 size_t IOSurfaceGetHeight(struct __IOSurface *s) { return s->height; }
 void *IOSurfaceGetBaseAddress(struct __IOSurface *s) { return s->bytes; }
+uint32_t IOSurfaceGetSeed(struct __IOSurface *s) { (void)s; return 1; }
+const void *CFRetain(const void *p) { return p; }
+void CFRelease(const void *p) { (void)p; }
 int IOSurfaceLock(struct __IOSurface *s, uint32_t o, uint32_t *seed)
 { (void)s; (void)o; (void)seed; return 0; }
 int IOSurfaceUnlock(struct __IOSurface *s, uint32_t o, uint32_t *seed)
