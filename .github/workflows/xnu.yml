@@ -2,7 +2,7 @@ name: xnu
 
 on:
   push:
-    branches: [a8-build, a8-build-intel]
+    branches: [a8-build, a8-build-intel, a8-emmc]
   workflow_dispatch:
     inputs:
       macos_version:
@@ -303,10 +303,13 @@ jobs:
           cp out/SHA256SUMS kout/ 2>/dev/null || true
           ls -la kout
           cd kout
-          git init -q -b kernel-out
+          # Side branches keep their own output so kernel-out stays the main kernel.
+          out=kernel-out
+          if [ "${GITHUB_REF_NAME}" = a8-emmc ]; then out=kernel-out-emmc; fi
+          git init -q -b "$out"
           git config user.name "a8-build"
           git config user.email "a8-build@users.noreply.github.com"
           echo "built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})" > BUILD_INFO.txt
           git add .
           git commit -q -m "kernel from ${GITHUB_SHA}"
-          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" kernel-out
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" "$out"
