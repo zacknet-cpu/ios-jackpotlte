@@ -1,28 +1,31 @@
 diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
-index c99b503..83f1787 100644
+index c99b503..58f9f55 100644
 --- a/bsd/dev/a5xelte_emmc.c
 +++ b/bsd/dev/a5xelte_emmc.c
-@@ -24,6 +24,8 @@
+@@ -24,6 +24,7 @@
  #include <pexpert/device_tree.h>
  #include <libkern/libkern.h>
  #include <machine/atomic.h>
 +#include <kern/clock.h>
-+#include <kern/cpu_data.h>
  
  extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
-@@ -301,6 +303,455 @@ out:
+@@ -301,6 +302,532 @@ out:
  	return error;
  }
  
 +/*
-+ * Multi-block polled PIO. One CMD18/CMD25 moves up to EMMC_MULTI_MAX sectors
-+ * and the host sends CMD12 by itself once BYTCNT bytes have moved
-+ * (CMD_SEND_STOP, RINTSTS.ACD). The Galaxy A40 port (Exynos 7904) drives the
-+ * same dw_mmc at 0x13500000 this way: 64-bit FIFO, card left in 8-bit DDR by
-+ * S-Boot. The one-sector path above issues a command, resets the FIFO and
-+ * waits for the card for every 512 bytes, so the root volume ran at a few
-+ * MB/s at best.
++ * Multi-block polled PIO. CMD23 (SET_BLOCK_COUNT) then one CMD18/CMD25 moves
++ * up to EMMC_MULTI_MAX sectors; the card returns to the transfer state by
++ * itself after the last block, so no CMD12 is sent unless a command fails.
++ * The one-sector path above issues a command, resets the FIFO and waits for
++ * the card for every 512 bytes, so the root volume ran at a few MB/s.
++ * Same host as the Galaxy A40 port (Exynos 7904, dw_mmc at 0x13500000, 64-bit
++ * FIFO, card left in 8-bit DDR by S-Boot). The Galaxy A21s port (Exynos 850,
++ * CMD23 + CMD18 by PIO, about 42 MiB/s) found that HTO only means the FIFO
++ * sat full (read) or empty (write) and the card clock stopped: service the
++ * FIFO and the transfer goes on. A STOP sent in that state hung its command
++ * engine, which only a controller reset plus a clock update freed.
 + *
 + * Boot-arg emmcmulti: bit 0 reads, bit 1 writes, bit 2 reads every
 + * multi-block write back and compares it. 0 (the default) keeps one command
@@ -35,12 +38,18 @@ index c99b503..83f1787 100644
 +#define EMMC_MULTI_VERIFY 4u
 +#define EMMC_MULTI_MAX    128u /* 64 KiB a command */
 +#define EMMC_TEST_SECTORS 64u
-+#define CMD_SEND_STOP     (1u << 12)
++#define EMMC_RESP0        0x030u
++#define CTRL_RESET        (1u << 0)
++#define CTRL_DMA_RESET    (1u << 2)
++#define CMD_UPD_CLK       (1u << 21)
 +#define CMD_STOP_ABORT    (1u << 14)
-+#define INT_ACD           (1u << 14)
-+/* INT_ERRORS plus end-bit (15) and start-bit (13) errors, as Linux dw_mmc. */
-+#define INT_MULTI_ERRORS  (INT_ERRORS | (1u << 15) | (1u << 13))
++#define INT_HTO           (1u << 10)
++#define INT_CMD_ERRORS    ((1u << 12) | (1u << 8) | (1u << 6) | (1u << 1))
++/* Fatal data errors: INT_ERRORS without HTO, plus end-bit and start-bit errors. */
++#define INT_MULTI_ERRORS  ((INT_ERRORS & ~INT_HTO) | (1u << 15) | (1u << 13))
 +#define STATUS_DATA_BUSY  ((1u << 9) | (1u << 10)) /* card DAT0, data FSM */
++/* R1 card status error bits, not the current state or READY_FOR_DATA. */
++#define R1_ERRORS         0xffff8080u
 +
 +static uint32_t emmc_multi;
 +static uint32_t emmc_multi_errors;
@@ -52,7 +61,7 @@ index c99b503..83f1787 100644
 +	uint64_t mr_cmds, mr_sect, mr_ticks;
 +	uint64_t mw_cmds, mw_sect, mw_ticks;
 +	uint64_t sr_sect, sr_ticks, sw_sect, sw_ticks;
-+	uint64_t errors, redone, no_acd;
++	uint64_t errors, redone, hto, resets;
 +} emmc_stats;
 +
 +static uint64_t
@@ -72,10 +81,10 @@ index c99b503..83f1787 100644
 +}
 +
 +static bool
-+emmc_wait_idle(uint32_t ms)
++emmc_wait_clear(uint32_t off, uint32_t mask, uint32_t ms)
 +{
 +	uint64_t deadline = emmc_deadline(ms);
-+	while (emmc_rd(EMMC_STATUS) & STATUS_DATA_BUSY) {
++	while (emmc_rd(off) & mask) {
 +		if (mach_absolute_time() > deadline) {
 +			return false;
 +		}
@@ -89,37 +98,116 @@ index c99b503..83f1787 100644
 +	uint32_t ctrl = emmc_rd(EMMC_CTRL);
 +	emmc_wr(EMMC_CTRL, (ctrl & ~(CTRL_INT_ENABLE | CTRL_DMA_ENABLE |
 +	    CTRL_USE_IDMAC)) | CTRL_FIFO_RESET);
-+	uint64_t deadline = emmc_deadline(10);
-+	while (emmc_rd(EMMC_CTRL) & CTRL_FIFO_RESET) {
-+		if (mach_absolute_time() > deadline) {
-+			return false;
-+		}
-+	}
-+	return true;
++	return emmc_wait_clear(EMMC_CTRL, CTRL_FIFO_RESET, 10);
 +}
 +
-+/* After a failed multi-block command: stop the card and empty the FIFO. */
-+static void
-+emmc_multi_abort(void)
++static uint32_t
++emmc_hold(void)
 +{
-+	uint32_t command = CMD_START | CMD_STOP_ABORT | CMD_RESP_CRC | CMD_RESP | 12u;
-+	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
-+		command |= CMD_HOLD;
++	return ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) ? CMD_HOLD : 0;
++}
++
++/*
++ * A command without data and with an R1 answer (CMD23, CMD12). ILLEGAL_COMMAND
++ * and COM_CRC_ERROR in this answer describe the command before it (such as a
++ * CMD12 the abort path sent in the transfer state), so they are not counted.
++ */
++static int
++emmc_cmd_r1(uint32_t index, uint32_t arg, uint32_t flags, uint32_t *resp)
++{
++	uint32_t pending;
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_CMDARG, arg);
++	emmc_wr(EMMC_CMD, CMD_START | emmc_hold() | CMD_RESP_CRC | CMD_RESP |
++	    flags | index);
++	if (!emmc_wait_clear(EMMC_CMD, CMD_START, 100)) {
++		*resp = 0xdead0003u;
++		return ETIMEDOUT;
 +	}
-+	/* A full read FIFO stops the card clock, and CMD12 needs that clock. */
-+	(void)emmc_fifo_reset();
 +	uint64_t deadline = emmc_deadline(100);
-+	while ((emmc_rd(EMMC_CMD) & CMD_START) && mach_absolute_time() < deadline) {
++	while (!((pending = emmc_rd(EMMC_RINTSTS)) & (INT_CMD_DONE | INT_CMD_ERRORS))) {
++		if (mach_absolute_time() > deadline) {
++			*resp = 0xdead0004u;
++			return ETIMEDOUT;
++		}
 +	}
++	if (pending & INT_CMD_ERRORS) {
++		*resp = pending;
++		return EIO;
++	}
++	*resp = emmc_rd(EMMC_RESP0);
++	return (*resp & R1_ERRORS & ~((1u << 23) | (1u << 22))) ? EIO : 0;
++}
++
++/*
++ * Last resort, as Linux dw_mmc and the A21s port: reset the controller, FIFO
++ * and DMA interface (the clock, bus width and timing registers stay as S-Boot
++ * left them), tell the card clock unit to reload them, and STOP the card in
++ * case it was left in a data state. Nothing here writes card data.
++ */
++static void
++emmc_hard_recover(uint32_t why)
++{
++	uint32_t ctrl = emmc_rd(EMMC_CTRL) & ~(CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET);
++	uint32_t resp = 0;
++	emmc_stats.resets++;
++	emmc_wr(EMMC_CTRL, ctrl | CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET);
++	(void)emmc_wait_clear(EMMC_CTRL, CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET, 200);
++	emmc_wr(EMMC_CTRL, ctrl);
++	emmc_wr(EMMC_INTMASK, 0);
 +	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
 +	emmc_wr(EMMC_CMDARG, 0);
-+	emmc_wr(EMMC_CMD, command);
-+	deadline = emmc_deadline(100);
-+	while (!(emmc_rd(EMMC_RINTSTS) & (INT_CMD_DONE | (1u << 8))) &&
-+	    mach_absolute_time() < deadline) {
-+	}
-+	(void)emmc_wait_idle(2000);
++	emmc_wr(EMMC_CMD, CMD_START | CMD_UPD_CLK | CMD_WAIT_DATA);
++	bool clock = emmc_wait_clear(EMMC_CMD, CMD_START, 200);
++	(void)emmc_cmd_r1(12, 0, CMD_STOP_ABORT, &resp);
++	(void)emmc_wait_clear(EMMC_STATUS, STATUS_DATA_BUSY, 1000);
 +	(void)emmc_fifo_reset();
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	if (emmc_stats.resets <= 8) {
++		printf("A5XELTE eMMC: controller reset (%x): clock update %s, cmd=%x status=%x\n",
++		    why, clock ? "done" : "STUCK", emmc_rd(EMMC_CMD), emmc_rd(EMMC_STATUS));
++	}
++}
++
++/* After a failed CMD18/CMD25: stop the card, empty the FIFO, check the host. */
++static void
++emmc_multi_abort(uint32_t data_off)
++{
++	uint32_t why = 0;
++	/* A full read FIFO stops the card clock, and CMD12 needs that clock. */
++	(void)emmc_fifo_reset();
++	if (!emmc_wait_clear(EMMC_CMD, CMD_START, 100)) {
++		why = 0xdead0003u;
++	} else {
++		emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++		emmc_wr(EMMC_CMDARG, 0);
++		emmc_wr(EMMC_CMD, CMD_START | emmc_hold() | CMD_STOP_ABORT |
++		    CMD_RESP_CRC | CMD_RESP | 12u);
++		uint64_t deadline = emmc_deadline(100);
++		while (!(emmc_rd(EMMC_RINTSTS) & (INT_CMD_DONE | INT_CMD_ERRORS))) {
++			/* Keep room in the FIFO so the clock (and CMD12) can run. */
++			if ((emmc_rd(EMMC_STATUS) >> 17) & 0x1fffu) {
++				(void)emmc_rd(data_off);
++				(void)emmc_rd(data_off + 4);
++			}
++			if (mach_absolute_time() > deadline) {
++				why = 0xdead0012u;
++				break;
++			}
++		}
++	}
++	if (!emmc_wait_clear(EMMC_STATUS, STATUS_DATA_BUSY, 2000) && !why) {
++		why = 0xdead0009u;
++	}
++	if (!emmc_fifo_reset() && !why) {
++		why = 0xdead0001u;
++	}
++	if (!why && (emmc_rd(EMMC_CMD) & CMD_START)) {
++		why = 0xdead0003u;
++	}
++	if (why) {
++		emmc_hard_recover(why);
++	}
 +	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
 +}
 +
@@ -131,8 +219,9 @@ index c99b503..83f1787 100644
 +	uint32_t ver = emmc_rd(EMMC_VERID) & 0xffffu;
 +	uint32_t data_off = ver < 0x240au ? 0x100u : 0x200u;
 +	uint32_t ints = emmc_rd(EMMC_INTMASK);
-+	uint32_t words = nsect * 64u, done = 0, seen = 0;
++	uint32_t words = nsect * 64u, done = 0, seen = 0, resp = 0;
 +	uint32_t const need = INT_DATA_OVER | INT_CMD_DONE;
++	bool started = false;
 +	int error = 0;
 +
 +	/* Only the 64-bit FIFO (HCON H_DATA_WIDTH = 2) of the A8 and A40 is known. */
@@ -141,7 +230,7 @@ index c99b503..83f1787 100644
 +	    !(emmc_rd(EMMC_PWREN) & 1u) || !(emmc_rd(EMMC_CLKENA) & 1u)) {
 +		return ENXIO;
 +	}
-+	if (!emmc_wait_idle(2000)) {
++	if (!emmc_wait_clear(EMMC_STATUS, STATUS_DATA_BUSY, 2000)) {
 +		diag[2] = emmc_rd(EMMC_STATUS);
 +		return EBUSY;
 +	}
@@ -151,25 +240,26 @@ index c99b503..83f1787 100644
 +		goto out;
 +	}
 +	emmc_wr(EMMC_TMOUT, 0x573177ffu);
++	error = emmc_cmd_r1(23, nsect, CMD_WAIT_DATA, &resp);
++	if (error) {
++		diag[0] = resp;
++		diag[3] = 23;
++		if (resp == 0xdead0003u || resp == 0xdead0004u) {
++			emmc_hard_recover(resp);
++		}
++		goto out;
++	}
 +	emmc_wr(EMMC_BLKSIZ, 512);
 +	emmc_wr(EMMC_BYTCNT, nsect * 512u);
 +	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
 +	emmc_wr(EMMC_CMDARG, lba);
-+	uint32_t command = CMD_START | CMD_WAIT_DATA | CMD_DATA | CMD_RESP_CRC |
-+	    CMD_RESP | CMD_SEND_STOP | (write ? (CMD_WRITE | 25u) : 18u);
-+	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
-+		command |= CMD_HOLD;
-+	}
++	emmc_wr(EMMC_CMD, CMD_START | emmc_hold() | CMD_WAIT_DATA | CMD_DATA |
++	    CMD_RESP_CRC | CMD_RESP | (write ? (CMD_WRITE | 25u) : 18u));
++	started = true;
 +	uint64_t deadline = emmc_deadline(write ? 5000 : 2000);
-+	/*
-+	 * While the FIFO is full (read) or empty (write) the host stops the
-+	 * card clock and, after the data timeout, raises HTO. Do not get
-+	 * preempted while the FIFO needs service; 64 KiB takes a few ms.
-+	 */
-+	disable_preemption();
-+	emmc_wr(EMMC_CMD, command);
 +	for (;;) {
 +		uint32_t pending = emmc_rd(EMMC_RINTSTS);
++		uint32_t ack = pending & INT_HTO;
 +		seen |= pending;
 +		if (pending & INT_MULTI_ERRORS) {
 +			error = EIO;
@@ -186,9 +276,7 @@ index c99b503..83f1787 100644
 +				done++;
 +				fifo++;
 +			}
-+			if (pending & INT_TXDR) {
-+				emmc_wr(EMMC_RINTSTS, INT_TXDR);
-+			}
++			ack |= pending & INT_TXDR;
 +		} else {
 +			while (fifo && done < words) {
 +				uint32_t lo = emmc_rd(data_off);
@@ -198,9 +286,14 @@ index c99b503..83f1787 100644
 +				done++;
 +				fifo--;
 +			}
-+			if (pending & INT_RXDR) {
-+				emmc_wr(EMMC_RINTSTS, INT_RXDR);
-+			}
++			ack |= pending & INT_RXDR;
++		}
++		if (pending & INT_HTO) {
++			/* The FIFO sat full/empty and the card clock stopped; it runs again now. */
++			emmc_stats.hto++;
++		}
++		if (ack) {
++			emmc_wr(EMMC_RINTSTS, ack);
 +		}
 +		if (done == words && (seen & need) == need) {
 +			break;
@@ -210,28 +303,20 @@ index c99b503..83f1787 100644
 +			break;
 +		}
 +	}
-+	enable_preemption();
 +	if (!error) {
-+		/* The automatic CMD12 ends with ACD; then the card may stay busy. */
-+		uint64_t acd_deadline = emmc_deadline(100);
-+		while (!((seen |= emmc_rd(EMMC_RINTSTS)) & INT_ACD) &&
-+		    mach_absolute_time() < acd_deadline) {
-+		}
-+		if (!(seen & INT_ACD)) {
-+			emmc_stats.no_acd++;
-+		}
-+		if (seen & INT_MULTI_ERRORS) {
-+			error = EIO;
-+		} else if (!emmc_wait_idle(write ? 5000 : 1000)) {
++		/* CMD23 ends the transfer; a write then keeps the card busy while it programs. */
++		if (!emmc_wait_clear(EMMC_STATUS, STATUS_DATA_BUSY, write ? 5000 : 1000)) {
 +			error = ETIMEDOUT;
++		} else if ((resp = emmc_rd(EMMC_RESP0)) & R1_ERRORS) {
++			error = EIO;
 +		}
 +	}
 +	diag[0] = seen;
 +	diag[1] = done;
 +	diag[2] = emmc_rd(EMMC_STATUS);
-+	diag[3] = emmc_rd(EMMC_TCBCNT);
-+	if (error) {
-+		emmc_multi_abort();
++	diag[3] = resp;
++	if (error && started) {
++		emmc_multi_abort(data_off);
 +	}
 +out:
 +	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
@@ -285,7 +370,7 @@ index c99b503..83f1787 100644
 +		emmc_multi_errors++;
 +		if (emmc_multi_errors <= 16) {
 +			printf("A5XELTE eMMC: CMD%u lba=%u n=%u error %d rint=%x "
-+			    "words=%u/%u status=%x tcbc=%u\n", write ? 25u : 18u,
++			    "words=%u/%u status=%x resp=%x\n", write ? 25u : 18u,
 +			    lba, nsect, error, diag[0], diag[1], nsect * 64u,
 +			    diag[2], diag[3]);
 +		}
@@ -312,13 +397,13 @@ index c99b503..83f1787 100644
 +	}
 +	printf("A5XELTE eMMC: %llu s: multi read %llu cmds %llu KiB %llu ms, "
 +	    "multi write %llu cmds %llu KiB %llu ms, one-sector read %llu KiB %llu ms, "
-+	    "write %llu KiB %llu ms, errors %llu, redone %llu sectors, no ACD %llu, emmcmulti=%u\n",
++	    "write %llu KiB %llu ms, errors %llu, redone %llu sectors, HTO %llu, resets %llu, emmcmulti=%u\n",
 +	    emmc_us(now - emmc_stats.since) / USEC_PER_SEC,
 +	    emmc_stats.mr_cmds, emmc_stats.mr_sect / 2, emmc_us(emmc_stats.mr_ticks) / 1000,
 +	    emmc_stats.mw_cmds, emmc_stats.mw_sect / 2, emmc_us(emmc_stats.mw_ticks) / 1000,
 +	    emmc_stats.sr_sect / 2, emmc_us(emmc_stats.sr_ticks) / 1000,
 +	    emmc_stats.sw_sect / 2, emmc_us(emmc_stats.sw_ticks) / 1000,
-+	    emmc_stats.errors, emmc_stats.redone, emmc_stats.no_acd, emmc_multi);
++	    emmc_stats.errors, emmc_stats.redone, emmc_stats.hto, emmc_stats.resets, emmc_multi);
 +	memset(&emmc_stats, 0, sizeof(emmc_stats));
 +	emmc_stats.since = now;
 +}
@@ -343,7 +428,6 @@ index c99b503..83f1787 100644
 +	uint64_t const starts[3] = { 0, 1029, emmc_nsectors / 2 };
 +	uint32_t const counts[3] = { EMMC_MULTI_MAX, 37, 2 };
 +	uint64_t multi_ticks = 0, single_ticks = 0;
-+	uint64_t no_acd = emmc_stats.no_acd;
 +	int error = 0;
 +
 +	lck_mtx_lock(&a5xelte_emmc_lock);
@@ -382,13 +466,9 @@ index c99b503..83f1787 100644
 +		t++;
 +	}
 +	lck_mtx_unlock(&a5xelte_emmc_lock);
-+	if (!error && emmc_stats.no_acd != no_acd) {
-+		/* The automatic CMD12 never reported back: not the host we know. */
-+		error = ENOTSUP;
-+	}
 +	if (error) {
 +		printf("A5XELTE eMMC: multi-block read self-test failed (%d rint=%x words=%u "
-+		    "status=%x tcbc=%u); one sector a command\n",
++		    "status=%x resp=%x); one sector a command\n",
 +		    error, diag[0], diag[1], diag[2], diag[3]);
 +		emmc_multi = 0;
 +		return;
@@ -407,7 +487,6 @@ index c99b503..83f1787 100644
 +	uint32_t diag[4] = { 0 };
 +	uint32_t const n = EMMC_TEST_SECTORS;
 +	uint8_t *saved = emmc_test, *back = emmc_test + n * 512u;
-+	uint64_t no_acd = emmc_stats.no_acd;
 +	int error = 0;
 +
 +	if (!emmc_log_enabled) {
@@ -443,9 +522,6 @@ index c99b503..83f1787 100644
 +		werror = EIO;
 +		diag[0] = 0xd1ffu;
 +	}
-+	if (!werror && emmc_stats.no_acd != no_acd) {
-+		werror = ENOTSUP;
-+	}
 +	/* Put the sectors back one at a time (and time that path). */
 +	uint64_t t2 = mach_absolute_time();
 +	for (uint32_t i = 0; i < n && !error; i++) {
@@ -455,7 +531,7 @@ index c99b503..83f1787 100644
 +	lck_mtx_unlock(&a5xelte_emmc_lock);
 +	if (werror || error) {
 +		printf("A5XELTE eMMC: multi-block write self-test failed (%d/%d rint=%x words=%u "
-+		    "status=%x tcbc=%u); writes stay one sector a command\n",
++		    "status=%x resp=%x); writes stay one sector a command\n",
 +		    werror, error, diag[0], diag[1], diag[2], diag[3]);
 +		emmc_multi &= ~EMMC_MULTI_WRITE;
 +		return;
@@ -467,7 +543,7 @@ index c99b503..83f1787 100644
  static uint32_t
  emmc_le32(const uint8_t *p)
  {
-@@ -521,16 +972,33 @@ emmc_strategy(buf_t bp)
+@@ -521,16 +1048,33 @@ emmc_strategy(buf_t bp)
  		goto done;
  	}
  	lck_mtx_lock(&a5xelte_emmc_lock);
@@ -502,7 +578,7 @@ index c99b503..83f1787 100644
  		} else {
  			if (skip || take != 512u) {
  				error = emmc_read_sector(lba, emmc_bounce);
-@@ -539,6 +1007,8 @@ emmc_strategy(buf_t bp)
+@@ -539,6 +1083,8 @@ emmc_strategy(buf_t bp)
  				memcpy(emmc_bounce + skip, vaddr + n, take);
  				error = emmc_write_sector(lba, emmc_bounce);
  			}
@@ -511,7 +587,7 @@ index c99b503..83f1787 100644
  		}
  		if (error) {
  			break;
-@@ -546,6 +1016,7 @@ emmc_strategy(buf_t bp)
+@@ -546,6 +1092,7 @@ emmc_strategy(buf_t bp)
  		n += take;
  		buf_setresid(bp, count - n);
  	}
@@ -519,7 +595,7 @@ index c99b503..83f1787 100644
  	lck_mtx_unlock(&a5xelte_emmc_lock);
  	buf_unmap(bp);
  done:
-@@ -745,7 +1216,20 @@ a5xelte_emmc_rootdev(dev_t *dev)
+@@ -745,7 +1292,20 @@ a5xelte_emmc_rootdev(dev_t *dev)
  		emmc_ready = true;
  		printf("A5XELTE eMMC: /dev/emmcroot0 ready, GPT %s %s\n",
  		    emmc_partition_name, emmc_writable ? "writable" : "read-only");

@@ -27,15 +27,23 @@ static bool xfer_active, xfer_write, xfer_multi, xfer_stop;
 static uint64_t xfer_pos, xfer_end;   /* byte offsets in card */
 static uint32_t xfer_moved;           /* bytes moved card side */
 static int cmd_done_in, acd_in, busy_ticks;
+static const int f_no_acd = 0;
 static bool dto_set;
 static uint32_t fifo_stall;           /* ticks FIFO full (read) / empty (write) */
+static uint32_t pending_count;        /* blocks set by CMD23 for the next CMD18/25 */
+static bool card_in_data;             /* card in a data state: only CMD12 is legal */
+static bool illegal_pending;          /* report ILLEGAL_COMMAND in the next response */
+static bool engine_stuck;             /* START stays set until a controller reset */
+static uint32_t next_r1_error;
 
 /* fault injection */
 int f_crc_every;          /* set DCRC midway through every Nth multi command */
 int f_corrupt_reads;      /* swap halves of an entry in multi reads */
-int f_no_acd;             /* never set ACD */
 int f_drop_last_block;    /* multi writes lose their last block */
-int f_hto_every;          /* raise HTO midway through every Nth multi command */
+int f_hto_every;          /* benign HTO midway through every Nth multi command */
+int f_r1_every;           /* OUT_OF_RANGE in the R1 answer of every Nth multi command */
+int f_stuck_abort;        /* the next CMD12 hangs the command engine */
+uint64_t n_cmd23, n_resets;
 static int multi_count;
 static bool this_crc, this_hto;
 
@@ -63,7 +71,16 @@ tick(void)
 {
 	ticks++;
 	if (ctrl_reset_ticks > 0 && --ctrl_reset_ticks == 0) {
-		regs[0] &= ~2u;
+		if (regs[0] & 1u) {
+			/* controller reset: command and data engines idle */
+			n_resets++;
+			engine_stuck = false;
+			xfer_active = false;
+			cmd_done_in = 0;
+			busy_ticks = 0;
+			regs[0x2c / 4] &= ~(1u << 31);
+		}
+		regs[0] &= ~7u;
 		fifo_n = 0;
 		fifo_head = 0;
 		half_read = half_written = false;
@@ -85,11 +102,15 @@ tick(void)
 		return;
 	}
 	uint32_t total = (uint32_t)(xfer_end - xfer_pos);
-	if (xfer_multi && (this_crc || this_hto) && xfer_moved >= total / 2) {
-		rint |= this_crc ? (1u << 7) : (1u << 10);
-		this_crc = this_hto = false;
-		xfer_active = false; /* the data machine stops */
+	if (xfer_multi && this_crc && xfer_moved >= total / 2) {
+		rint |= 1u << 7;
+		this_crc = false;
+		xfer_active = false; /* the data machine stops; the card stays in data */
 		return;
+	}
+	if (xfer_multi && this_hto && xfer_moved >= total / 2) {
+		rint |= 1u << 10; /* starvation: benign, the transfer goes on */
+		this_hto = false;
 	}
 	for (int k = 0; k < 2; k++) {
 		if (!xfer_write) {
@@ -121,6 +142,7 @@ tick(void)
 		dto_set = true;
 		rint |= 1u << 3;
 		xfer_active = xfer_write ? false : true;
+		card_in_data = false; /* CMD23 count reached: back to transfer state */
 		if (xfer_stop) {
 			acd_in = 5;
 		}
@@ -163,6 +185,8 @@ sim_rd(uint32_t off)
 		return status();
 	case 0x05c:
 		return xfer_moved;
+	case 0x030:
+		return regs[0x30 / 4];
 	case 0x200:
 		if (!fifo_n) {
 			fprintf(stderr, "SIM: read of empty FIFO\n");
@@ -185,6 +209,13 @@ sim_rd(uint32_t off)
 }
 
 static void
+answer(uint32_t extra)
+{
+	regs[0x30 / 4] = (4u << 9) | (1u << 8) | (illegal_pending ? 1u << 22 : 0) | extra;
+	illegal_pending = false;
+}
+
+static void
 start_cmd(uint32_t v)
 {
 	uint32_t idx = v & 0x3f;
@@ -192,14 +223,45 @@ start_cmd(uint32_t v)
 	if (!(v & (1u << 31))) {
 		return;
 	}
+	if (engine_stuck) {
+		return; /* START stays set */
+	}
+	if (v & (1u << 21)) {
+		regs[0x2c / 4] &= ~(1u << 31); /* clock update, no answer */
+		return;
+	}
 	if (idx == 12) {
 		n_cmd12++;
+		if (f_stuck_abort) {
+			f_stuck_abort = 0;
+			engine_stuck = true;
+			return;
+		}
+		answer(0);
+		if (!card_in_data && !xfer_active) {
+			illegal_pending = true; /* CMD12 in the transfer state */
+		}
 		xfer_active = false;
+		card_in_data = false;
+		pending_count = 0;
 		cmd_done_in = 3;
 		busy_ticks = 10;
 		return;
 	}
+	if (card_in_data) {
+		fprintf(stderr, "SIM: CMD%u while the card is still in a data state\n", idx);
+		exit(3);
+	}
+	if (idx == 23) {
+		n_cmd23++;
+		answer(0);
+		pending_count = regs[0x28 / 4] & 0xffffu;
+		cmd_done_in = 3;
+		return;
+	}
 	if (!data) {
+		answer(0);
+		pending_count = 0;
 		cmd_done_in = 3;
 		return;
 	}
@@ -223,10 +285,12 @@ start_cmd(uint32_t v)
 		fprintf(stderr, "SIM: CMD%u with %u bytes\n", idx, bytcnt);
 		exit(3);
 	}
-	if (xfer_multi && !xfer_stop) {
-		fprintf(stderr, "SIM: open-ended multi-block command without auto stop\n");
+	if (xfer_multi && (xfer_stop || pending_count != bytcnt / 512)) {
+		fprintf(stderr, "SIM: CMD%u with auto stop %d, CMD23 count %u for %u blocks\n",
+		    idx, xfer_stop, pending_count, bytcnt / 512);
 		exit(3);
 	}
+	pending_count = 0; /* CMD23 only counts for the next CMD18/CMD25 */
 	if (xfer_write && (arg < UD_FIRST || arg + bytcnt / 512 > UD_FIRST + UD_COUNT) &&
 	    (arg < SYS_FIRST || arg + bytcnt / 512 > SYS_FIRST + 8193)) {
 		fprintf(stderr, "SIM: write outside USERDATA and the log area lba=%u\n", arg);
@@ -241,11 +305,17 @@ start_cmd(uint32_t v)
 		fprintf(stderr, "SIM: unexpected data CMD%u\n", idx);
 		exit(3);
 	}
+	uint32_t r1 = 0;
 	if (xfer_multi) {
 		multi_count++;
 		this_crc = f_crc_every && multi_count % f_crc_every == 0;
 		this_hto = f_hto_every && multi_count % f_hto_every == 0;
+		if (f_r1_every && multi_count % f_r1_every == 0) {
+			r1 = 1u << 31;
+		}
 	}
+	answer(r1);
+	card_in_data = true;
 	xfer_pos = (uint64_t)arg * 512u;
 	xfer_end = xfer_pos + bytcnt;
 	xfer_moved = 0;
@@ -482,7 +552,7 @@ reset_driver(uint32_t multi)
 	emmc_secsize = 512;
 	memset(&emmc_stats, 0, sizeof(emmc_stats));
 	ba_multi = multi;
-	n_cmd17 = n_cmd18 = n_cmd24 = n_cmd25 = n_cmd12 = 0;
+	n_cmd17 = n_cmd18 = n_cmd24 = n_cmd25 = n_cmd12 = n_cmd23 = n_resets = 0;
 	dev_t dev;
 	if (a5xelte_emmc_rootdev(&dev)) {
 		printf("FAIL: rootdev\n");
@@ -524,12 +594,31 @@ main(int argc, char **argv)
 	printf("   mode now %u, errors %u, cmd12 %llu\n", emmc_multi, emmc_multi_errors, n_cmd12);
 	f_crc_every = 0;
 
-	printf("== emmcmulti=3, HTO every 5th multi-block command\n");
-	f_hto_every = 5;
+	printf("== emmcmulti=3, benign HTO in every 3rd multi-block command\n");
+	f_hto_every = 3;
 	reset_driver(3);
-	random_io(100, 512);
-	printf("   mode now %u, errors %u\n", emmc_multi, emmc_multi_errors);
+	random_io(150, 512);
+	printf("   mode now %u, errors %u, HTO seen %llu\n", emmc_multi, emmc_multi_errors, emmc_stats.hto);
+	if (emmc_multi != 3 || emmc_multi_errors) { printf("FAIL: HTO treated as an error\n"); failures++; }
 	f_hto_every = 0;
+
+	printf("== emmcmulti=3, OUT_OF_RANGE in the R1 answer of every 9th multi-block command\n");
+	f_r1_every = 9;
+	reset_driver(3);
+	random_io(150, 512);
+	printf("   mode now %u, errors %u, cmd12 %llu\n", emmc_multi, emmc_multi_errors, n_cmd12);
+	f_r1_every = 0;
+
+	printf("== emmcmulti=3, a DCRC and then a command engine that hangs on CMD12\n");
+	reset_driver(3);
+	f_crc_every = 1;
+	f_stuck_abort = 1;
+	multi_count = 0;
+	random_io(3, 512);
+	f_crc_every = 0;
+	random_io(100, 512);
+	printf("   controller resets %llu, mode now %u, errors %u\n", n_resets, emmc_multi, emmc_multi_errors);
+	if (n_resets < 1) { printf("FAIL: no controller reset for a hung engine\n"); failures++; }
 
 	printf("== emmcmulti=7, corrupted multi-block reads (self-test must refuse)\n");
 	f_corrupt_reads = 1;
@@ -562,19 +651,11 @@ main(int argc, char **argv)
 	printf("   mode now %u\n", emmc_multi);
 	f_drop_last_block = 0;
 
-	printf("== emmcmulti=3, no ACD from the host (self-test must refuse)\n");
-	f_no_acd = 1;
-	reset_driver(3);
-	if (emmc_multi) { printf("FAIL: mode %u without ACD\n", emmc_multi); failures++; }
-	random_io(20, 512);
-	f_no_acd = 0;
-
-	printf("== emmcmulti=7, one HTO during the read self-test (one retry allowed)\n");
-	multi_count = 0;
-	f_hto_every = 1000000;
+	printf("== emmcmulti=7, one CRC error during the read self-test (one retry allowed)\n");
+	f_crc_every = 1000000;
 	multi_count = 1000000 - 1;
 	reset_driver(7);
-	f_hto_every = 0;
+	f_crc_every = 0;
 	if (emmc_multi != 7) { printf("FAIL: mode %u after one retried error\n", emmc_multi); failures++; }
 	random_io(50, 512);
 
