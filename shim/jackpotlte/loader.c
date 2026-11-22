@@ -260,6 +260,17 @@ static void zero(uintptr_t dst, uint64_t n)
 {
 	for (; n && (dst & 7); n--, dst++)
 		*(volatile uint8_t *)dst = 0;
+	for (; n >= 8 && (dst & 63); n -= 8, dst += 8)
+		*(volatile uint64_t *)dst = 0;
+	/* 64 bytes a loop in four aligned STPs: the window is now up to 2 GiB
+	 * and this runs with the MMU off (Device memory), one store at a time. */
+	for (; n >= 64; n -= 64, dst += 64)
+		__asm__ volatile(
+			"stp xzr, xzr, [%0]\n"
+			"stp xzr, xzr, [%0, #16]\n"
+			"stp xzr, xzr, [%0, #32]\n"
+			"stp xzr, xzr, [%0, #48]\n"
+			: : "r"(dst) : "memory");
 	for (; n >= 8; n -= 8, dst += 8)
 		*(volatile uint64_t *)dst = 0;
 	for (; n; n--, dst++)
@@ -493,15 +504,42 @@ uint64_t jt_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	kv("mem", p->mem_size);
 	kv("adt", p->adt_size);
 	out("\n");
+	/*
+	 * The window may not pass the end of the /memory bank S-Boot reports
+	 * for it: 2 GiB at 0x880000000 on the 4 GB SM-A530W (Android's
+	 * /proc/iomem: 880000000-8ffffffff System RAM), 1 GiB on 3 GB boards
+	 * (exynos7885-jackpotlte_common.dtsi). Clamp to the live bank, and to
+	 * the old 512 MiB if no bank holds the window at all.
+	 */
+	uint64_t mem_size = p->mem_size;
+	{
+		uint64_t mb[8], ms[8], bank_end = 0;
+		int nb = fdt_memory_all(dtb, mb, ms, 8);
+
+		for (int i = 0; i < nb; i++) {
+			if (p->phys_base >= mb[i] && p->phys_base - mb[i] < ms[i])
+				bank_end = mb[i] + ms[i];
+		}
+		if (bank_end == 0) {
+			if (mem_size > 0x20000000ULL)
+				mem_size = 0x20000000ULL;
+			out("no /memory bank holds the XNU window: 512 MiB\n");
+		} else if (mem_size > bank_end - p->phys_base) {
+			mem_size = (bank_end - p->phys_base) & ~0x1fffffULL;
+			out("XNU window clamped to its /memory bank\n");
+		}
+		kv("mem used", mem_size);
+		out("\n");
+	}
 	if (!nsegs || nsegs > 32 ||
 	    __builtin_offsetof(struct payload, segs) + nsegs * sizeof(struct payload_seg) > length ||
 	    p->adt_off > length || p->adt_size > length - p->adt_off)
 		return fail("bad payload header");
-	if (p->phys_base < XNU_RAM_BASE || p->phys_base >= XNU_RAM_END || !p->mem_size ||
-	    p->mem_size > XNU_RAM_END - p->phys_base ||
+	if (p->phys_base < XNU_RAM_BASE || p->phys_base >= XNU_RAM_END || !mem_size ||
+	    mem_size > XNU_RAM_END - p->phys_base ||
 	    p->entry_va < p->virt_base || p->kernel_end < p->virt_base)
 		return fail("payload RAM outside the XNU bank");
-	uintptr_t mem_end = p->phys_base + p->mem_size;
+	uintptr_t mem_end = p->phys_base + mem_size;
 	uintptr_t kernel_end = p->phys_base + (p->kernel_end - p->virt_base);
 	if (kernel_end >= mem_end)
 		return fail("kernel larger than RAM window");
@@ -509,14 +547,14 @@ uint64_t jt_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	/* iBoot hands XNU zeroed RAM; S-Boot leaves the previous OS's data.
 	 * (dreamlte boot 3-7: not zeroing made vm_mem_bootstrap hang.) */
 	out("zeroing XNU RAM...\n");
-	zero(p->phys_base, p->mem_size);
+	zero(p->phys_base, mem_size);
 	out("zeroed\n");
 
 	for (uint64_t i = 0; i < nsegs; i++) {
 		const volatile struct payload_seg *s = &p->segs[i];
 		if (s->vmaddr < p->virt_base || s->file_size > s->vmsize ||
 		    s->file_off > length || s->file_size > length - s->file_off ||
-		    s->vmsize > p->mem_size || s->vmaddr - p->virt_base > p->mem_size - s->vmsize)
+		    s->vmsize > mem_size || s->vmaddr - p->virt_base > mem_size - s->vmsize)
 			return fail("bad segment");
 		uintptr_t dst = p->phys_base + (s->vmaddr - p->virt_base);
 		copy(dst, rd_start + s->file_off, s->file_size);
@@ -542,13 +580,13 @@ uint64_t jt_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
 	ba->physBase = p->phys_base;
-	ba->memSize = p->mem_size;
+	ba->memSize = mem_size;
 	ba->topOfKernelData = ba_pa + PAGE_SIZE;
 	ba->deviceTreeP = p->virt_base + (adt_pa - p->phys_base);
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
+	ba->memSizeActual = mem_size;
 	clean(adt_pa, ba_pa + PAGE_SIZE);
 
 	uintptr_t entry_pa = p->phys_base + (p->entry_va - p->virt_base);

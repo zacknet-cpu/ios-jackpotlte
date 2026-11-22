@@ -21,9 +21,12 @@ import mkadt
 
 # MAINLINE exynos7885-jackpotlte.dts memory@80000000, high bank.
 DRAM_BASE = 0x880000000
-# 512 MiB, the size that boots on dreamlte/A5XELTE in the 39-bit 4K layout.
-# TODO(PHONE): grow once the kernel VA layout is proven on jackpotlte.
-DRAM_SIZE = 0x20000000
+# The whole high bank: 2 GiB on the 4 GB SM-A530W (Android /proc/iomem:
+# 880000000-8ffffffff System RAM). Was 512 MiB, which left iOS paging
+# ~1.3 GiB a minute from eMMC (a8log-6). The loader clamps the window to the
+# bank S-Boot reports (1 GiB on 3 GB boards). DRAM_SIZE=0x20000000 in the
+# environment gives the old window back.
+DRAM_SIZE = int(os.environ.get('DRAM_SIZE', '0x80000000'), 0)
 TIMEBASE = 26000000                      # Eureka/mainline oscclk 26 MHz
 GICD, GICC = 0x12301000, 0x12302000      # Eureka gic@123001000
 FB_PHYS = 0xec000000                     # Eureka fb_handover (exynos,dpu_fb_handover)

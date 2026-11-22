@@ -22,14 +22,17 @@
  *   low   0x80000000 + 0x3da00000  (ends 0xbda00000)
  *   mid   0xc0000000 + 0x40000000  (ends 0x100000000)
  *   high  0x880000000 + 0x40000000 (ends 0x8c0000000)
- * The mainline jackpotlte DTS lists the high bank as 0x80000000 (2 GiB); the
- * Samsung 4.4 tree for this board says 0x40000000 (1 GiB). The XNU window is
- * 512 MiB inside the bank either way, so both are safe.
+ * The SoC dtsi leaves the high bank's size 0 for S-Boot to fill in: 2 GiB on
+ * the 4 GB SM-A530W (Android's /proc/iomem in a8-dump: 880000000-8ffffffff
+ * System RAM; MemTotal 3812628 kB), 1 GiB on 3 GB boards. The XNU window is
+ * the whole high bank (mkadt_jackpotlte.py DRAM_SIZE 2 GiB, was 512 MiB);
+ * the loader clamps it to the bank S-Boot reports, so a 1 GiB board gets
+ * 1 GiB. No reserved-memory region lies above 4 GiB (exynos7885-rmem.dtsi).
  * S-Boot's own /chosen has linux,initrd = 0x84000000..0x840fffff. */
 #define JT_LOW_RAM_BASE		0x80000000UL
 #define JT_LOW_RAM_END		0xbda00000UL
 #define JT_XNU_RAM_BASE		0x880000000UL
-#define JT_XNU_RAM_END		0x8c0000000UL
+#define JT_XNU_RAM_END		0x900000000UL
 
 /* ---- CPU (SAM-K exynos7885.dtsi cpus: logical-id 0..7) ----
  * 6x Cortex-A53: MPIDR 0x100..0x103 (cluster 0) and 0x200..0x201 (cluster 1)
