@@ -2,7 +2,7 @@ name: xnu
 
 on:
   push:
-    branches: [a8-build, a8-build-intel, a8-emmc]
+    branches: [a8-build, a8-build-intel, a8-emmc, a8-usb]
   workflow_dispatch:
     inputs:
       macos_version:
@@ -306,6 +306,7 @@ jobs:
           # Side branches keep their own output so kernel-out stays the main kernel.
           out=kernel-out
           if [ "${GITHUB_REF_NAME}" = a8-emmc ]; then out=kernel-out-emmc; fi
+          if [ "${GITHUB_REF_NAME}" = a8-usb ]; then out=kernel-out-usb; fi
           git init -q -b "$out"
           git config user.name "a8-build"
           git config user.email "a8-build@users.noreply.github.com"

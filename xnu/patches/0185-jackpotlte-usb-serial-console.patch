@@ -1,0 +1,618 @@
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+index 58f9f55..46aea6e 100644
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -1192,6 +1192,45 @@ a5xelte_log_append(const char *c, int size)
+ 	}
+ }
+ 
++/*
++ * Readers of the console ring other than the SYSTEM log writer: the USB serial
++ * link (bsd/dev/a5xelte_usb.c). Positions count bytes since boot. A reader
++ * that fell more than the ring behind skips to the oldest byte still there.
++ * Bytes are only handed out up to `limit`, a total the caller saw a moment
++ * ago, so a writer that reserved its bytes but has not copied them yet is not
++ * read early.
++ */
++uint64_t a5xelte_log_position(void);
++uint32_t a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max);
++
++uint64_t
++a5xelte_log_position(void)
++{
++	return os_atomic_load(&emmc_log_total, relaxed);
++}
++
++uint32_t
++a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max)
++{
++	uint64_t total = os_atomic_load(&emmc_log_total, relaxed);
++	if (limit > total) {
++		limit = total;
++	}
++	if (limit > A5_LOG_SIZE && *pos < limit - A5_LOG_SIZE) {
++		*pos = limit - A5_LOG_SIZE;
++	}
++	if (*pos >= limit) {
++		return 0;
++	}
++	uint64_t avail = limit - *pos;
++	uint32_t n = avail < max ? (uint32_t)avail : max;
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = emmc_log_ring[(*pos + i) % A5_LOG_SIZE];
++	}
++	*pos += n;
++	return n;
++}
++
+ struct a5_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 8a2fae7..595d0f9 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -399,6 +399,19 @@ static struct {
+ 	    A8G_STATUS } state;
+ 	bool        data_in;
+ 	bool        configured;
++	/* a8usbmode=1: CDC-ACM serial link (see "Serial link" below) */
++	bool        serial;
++	bool        host_open;      /* DTR from the host's terminal */
++	bool        tx_busy;
++	bool        rewind;         /* resend the whole console ring */
++	uint64_t    log_pos;
++	uint64_t    log_limit;
++	uint8_t     line_coding[7];
++	char        line[256];
++	uint32_t    line_len;
++	char        cmd[256];
++	bool        cmd_ready;
++	uint64_t    rx_bytes, tx_bytes;
+ } a8g;
+ 
+ static inline void
+@@ -556,10 +569,40 @@ static const char *const a8g_strings[] = {
+ 	NULL, "Apple Inc.", "iPhone", "D22AP0000001",
+ };
+ 
++/*
++ * Serial identity (a8usbmode=1): one CDC-ACM function behind an interface
++ * association, which Windows 10/11 binds to its own usbser.sys (a COM port,
++ * no driver install), and Linux/macOS to cdc_acm / AppleUSBACM. pid.codes
++ * test VID/PID 1209:0001. Endpoints: 0x01 bulk OUT and 0x81 bulk IN on the
++ * vendor pair's physical endpoints 2/3, 0x82 interrupt IN on physical 5.
++ */
++static const uint8_t a8s_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0xef, 0x02, 0x01, 64,  /* misc class, IAD */
++	0x09, 0x12, 0x01, 0x00,                 /* 1209:0001 */
++	0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t a8s_cfg_desc[75] = {
++	9, 2, 75, 0, 2, 1, 0, 0x80, 250,
++	8, 11, 0, 2, 0x02, 0x02, 0x01, 0,       /* IAD: interfaces 0-1, CDC ACM */
++	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,     /* comm interface 0 */
++	5, 0x24, 0x00, 0x10, 0x01,              /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 1,                 /* call management: data iface 1 */
++	4, 0x24, 0x02, 0x02,                    /* ACM: line coding + state */
++	5, 0x24, 0x06, 0, 1,                    /* union: 0 controls 1 */
++	7, 5, 0x82, 0x03, 16, 0, 9,             /* ep 0x82 interrupt IN */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,     /* data interface 1 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,        /* ep 0x01 bulk OUT, 512 */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,        /* ep 0x81 bulk IN, 512 */
++};
++static const char *const a8s_strings[] = {
++	NULL, "jackpotlte", "A8 iOS kernel console", "A8IOS0001",
++};
++
+ static uint32_t
+ a8g_string(unsigned idx, uint8_t *out)
+ {
+ 	uint32_t n = 2;
++	const char *const *table = a8g.serial ? a8s_strings : a8g_strings;
+ 
+ 	if (idx == 0) {
+ 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;
+@@ -568,7 +611,7 @@ a8g_string(unsigned idx, uint8_t *out)
+ 	if (idx >= sizeof(a8g_strings) / sizeof(a8g_strings[0])) {
+ 		return 0;
+ 	}
+-	for (const char *s = a8g_strings[idx]; *s && n < 126; s++) {
++	for (const char *s = table[idx]; *s && n < 126; s++) {
+ 		out[n++] = (uint8_t)*s;
+ 		out[n++] = 0;
+ 	}
+@@ -585,6 +628,8 @@ a8g_rx_arm(void)
+ 
+ static void
+ mtp_rx_arm(void);
++static void a8s_rx_done(void);
++static void a8s_pump(void);
+ 
+ /*
+  * SET_CONFIGURATION(1): both interfaces' bulk pairs.  Interface 0 has nothing
+@@ -611,8 +656,24 @@ a8g_configure(void)
+ 	a8_dwc_wr(A8_DALEPENA, a8_usb_rd(a8g.dwc, A8_DALEPENA) |
+ 	    (1u << A8G_EP_RX) | (1u << A8G_EP_TX));
+ 	a8g.configured = true;
++	a8g.tx_busy = false;
+ 	a8g_rx_arm();
+-	printf("A5XELTE USB: configured, vendor 0x01/0x81 armed\n");
++	printf("A5XELTE USB: configured, %s 0x01/0x81 armed\n",
++	    a8g.serial ? "serial" : "vendor");
++
++	if (a8g.serial) {
++		/* The ACM notification endpoint: configured, never sent on. */
++		if (a8g_epcmd(A8G_EP_MTX, A8_DEPCMD_SETEPCONFIG,
++		    (3u << 1) | (16u << 3) | (2u << 17),
++		    (1u << 8) | (8u << 16) | ((uint32_t)A8G_EP_MTX << 25), 0) ||
++		    a8g_epcmd(A8G_EP_MTX, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++			printf("A5XELTE USB: serial notification endpoint failed\n");
++			return;
++		}
++		a8_dwc_wr(A8_DALEPENA, a8_usb_rd(a8g.dwc, A8_DALEPENA) |
++		    (1u << A8G_EP_MTX));
++		return;
++	}
+ 
+ 	/*
+ 	 * The PTP pair is best effort: if this core has fewer endpoints than
+@@ -651,16 +712,49 @@ a8g_setup(void)
+ 	printf("A5XELTE USB: setup %02x %02x %04x %04x len %u\n",
+ 	    type, req, value, index, length);
+ 	a8g.data_in = (type & 0x80) != 0;
+-	if ((type & 0x60) != 0) {               /* class/vendor: nothing yet */
++	if (a8g.serial && (type & 0x60) == 0x20) {      /* CDC class requests */
++		switch (req) {
++		case 0x20:                      /* SET_LINE_CODING: data ignored */
++			break;
++		case 0x21:                      /* GET_LINE_CODING */
++			memcpy(data, a8g.line_coding, sizeof(a8g.line_coding));
++			n = sizeof(a8g.line_coding);
++			break;
++		case 0x22: {                    /* SET_CONTROL_LINE_STATE */
++			bool open = (value & 1) != 0;
++			if (open && !a8g.host_open) {
++				a8g.rewind = true;      /* a new terminal: the whole log */
++			}
++			a8g.host_open = open;
++			break;
++		}
++		case 0x23:                      /* SEND_BREAK */
++			break;
++		default:
++			ok = false;
++			break;
++		}
++	} else if ((type & 0x60) != 0) {        /* class/vendor: nothing yet */
+ 		ok = false;
+ 	} else if (req == 6) {                  /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+ 		case 1:
++			if (a8g.serial) {
++				memcpy(data, a8s_dev_desc, sizeof(a8s_dev_desc));
++				n = sizeof(a8s_dev_desc);
++				break;
++			}
+ 			memcpy(data, a8g_dev_desc, sizeof(a8g_dev_desc));
+ 			n = sizeof(a8g_dev_desc);
+ 			break;
+ 		case 2:
+ 		case 7:                         /* other-speed configuration */
++			if (a8g.serial) {
++				memcpy(data, a8s_cfg_desc, sizeof(a8s_cfg_desc));
++				data[1] = (uint8_t)(value >> 8);
++				n = sizeof(a8s_cfg_desc);
++				break;
++			}
+ 			memcpy(data, a8g_cfg_desc, sizeof(a8g_cfg_desc));
+ 			n = sizeof(a8g_cfg_desc);
+ 			break;
+@@ -1013,6 +1107,258 @@ mtp_rx_done(void)
+ 	mtp_rx_arm();
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Serial link (a8usbmode=1)
++ * ---------------------------------------------------------------------------
++ *
++ * Phone to PC: the kernel's console ring (everything printf and the console
++ * print, bsd/dev/a5xelte_emmc.c) streams out on bulk IN 0x81 while a
++ * terminal holds the port open (DTR). Opening the port replays the ring from
++ * its oldest byte (up to 4 MiB), so the whole boot so far comes first.
++ *
++ * PC to phone: lines on bulk OUT 0x01 are commands for a small kernel shell
++ * (a8s_command); its answers are printf lines prefixed "A8SH:", so they reach
++ * the PC through the same stream and also land in the SYSTEM log.
++ *
++ * Everything but the commands runs on the gadget's polling thread, so the
++ * endpoint state needs no lock; commands run on their own thread because a
++ * reboot syncs the disks first.
++ */
++extern uint64_t a5xelte_log_position(void);
++extern uint32_t a5xelte_log_copy(uint64_t *pos, uint64_t limit, char *out, uint32_t max);
++extern int sync_internal(void);
++
++#define A8S_PMU_INFORM2   0x0808u
++#define A8S_PMU_INFORM3   0x080cu
++#define A8S_PMU_SWRESET   0x0400u
++#define A8S_POWER_RESET   0x12345678u  /* sec_reboot.c: INFORM2, a restart */
++#define A8S_REASON_NONE   0x12345670u  /* INFORM3: normal boot */
++#define A8S_REASON_DL     0x12345671u  /* INFORM3: download (Odin) mode */
++#define A8S_REASON_REC    0x12345674u  /* INFORM3: recovery (TWRP) */
++
++static void
++a8s_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(a8g.dma + A8G_TRB_RX);
++	uint32_t len;
++
++	a8g_sync(A8G_TRB_RX, 16);
++	len = A8G_RX_MAX - (t[2] & 0xffffffu);
++	a8g_sync(A8G_RX, A8G_RX_MAX);
++	a8g.rx_bytes += len;
++	for (uint32_t i = 0; i < len && i < A8G_RX_MAX; i++) {
++		char c = ((const char *)(a8g.dma + A8G_RX))[i];
++		if (c == '\r' || c == '\n') {
++			if (a8g.line_len == 0) {
++				continue;
++			}
++			a8g.line[a8g.line_len] = 0;
++			if (!a8g.cmd_ready) {
++				memcpy(a8g.cmd, a8g.line, a8g.line_len + 1);
++				__asm__ volatile ("dmb ish" ::: "memory");
++				a8g.cmd_ready = true;
++			}
++			a8g.line_len = 0;
++		} else if (a8g.line_len < sizeof(a8g.line) - 1) {
++			a8g.line[a8g.line_len++] = c;
++		}
++	}
++	a8g_rx_arm();
++}
++
++/* Next piece of the console ring to the host, if the IN endpoint is idle. */
++static void
++a8s_pump(void)
++{
++	uint64_t now = a5xelte_log_position();
++
++	if (!a8g.configured || !a8g.host_open || a8g.tx_busy) {
++		a8g.log_limit = now;
++		return;
++	}
++	if (a8g.rewind) {
++		a8g.rewind = false;
++		a8g.log_pos = 0;        /* a5xelte_log_copy clamps to the oldest */
++	}
++	/* Only bytes reserved one poll ago: their writers have finished. */
++	uint32_t n = a5xelte_log_copy(&a8g.log_pos, a8g.log_limit,
++	    (char *)(a8g.dma + A8G_TX), A8G_TX_MAX);
++	a8g.log_limit = now;
++	if (n == 0) {
++		return;
++	}
++	/* A transfer of a multiple of 512 would need a zero-length packet to
++	 * end it on the host; hold its last byte back for the next one. */
++	if ((n % 512u) == 0) {
++		n--;
++		a8g.log_pos--;
++	}
++	a8g.tx_busy = true;
++	a8g.tx_bytes += n;
++	a8g_start_trb(A8G_EP_TX, A8G_TRB_TX, A8G_TX, n, A8_TRBCTL_NORMAL);
++}
++
++static uint64_t
++a8s_hex(const char **p, bool *ok)
++{
++	uint64_t v = 0;
++	int digits = 0;
++
++	while (**p == ' ') {
++		(*p)++;
++	}
++	if ((*p)[0] == '0' && ((*p)[1] == 'x' || (*p)[1] == 'X')) {
++		*p += 2;
++	}
++	for (;; (*p)++, digits++) {
++		char c = **p;
++		uint32_t d;
++		if (c >= '0' && c <= '9') {
++			d = (uint32_t)(c - '0');
++		} else if (c >= 'a' && c <= 'f') {
++			d = (uint32_t)(c - 'a' + 10);
++		} else if (c >= 'A' && c <= 'F') {
++			d = (uint32_t)(c - 'A' + 10);
++		} else {
++			break;
++		}
++		v = (v << 4) | d;
++	}
++	*ok = digits > 0 && digits <= 16;
++	return v;
++}
++
++static bool
++a8s_word(const char *s, const char *w, const char **rest)
++{
++	size_t n = strlen(w);
++	if (strncmp(s, w, n) != 0 || (s[n] != 0 && s[n] != ' ')) {
++		return false;
++	}
++	*rest = s + n;
++	return true;
++}
++
++static void
++a8s_reboot(uint32_t reason, const char *what)
++{
++	vm_offset_t pmu = ml_io_map(A8_PMU_PA, A8_PMU_SIZE);
++
++	printf("A8SH: sync, then restart into %s\n", what);
++	(void)sync_internal();
++	delay(500 * 1000);              /* let the line reach the PC */
++	if (pmu == 0) {
++		printf("A8SH: PMU map failed\n");
++		return;
++	}
++	/* sec_reboot.c sec_reboot(), then exynos-reboot.c's SWRESET. */
++	a8_usb_wr(pmu, A8S_PMU_INFORM2, A8S_POWER_RESET);
++	a8_usb_wr(pmu, A8S_PMU_INFORM3, reason);
++	a8_usb_wr(pmu, A8S_PMU_SWRESET, 1u);
++	for (;;) {
++		delay(1000);
++	}
++}
++
++static void
++a8s_command(const char *line)
++{
++	const char *rest;
++	bool ok = true;
++
++	printf("A8SH> %s\n", line);
++	if (a8s_word(line, "help", &rest)) {
++		printf("A8SH: help | ping | stat | log (resend the ring) | "
++		    "peek ADDR [WORDS] | poke ADDR VALUE | "
++		    "reboot [recovery|download]\n");
++	} else if (a8s_word(line, "ping", &rest)) {
++		printf("A8SH: pong\n");
++	} else if (a8s_word(line, "stat", &rest)) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		printf("A8SH: up %llu s, log %llu bytes, usb rx %llu tx %llu, "
++		    "events %u\n", ns / NSEC_PER_SEC, a5xelte_log_position(),
++		    a8g.rx_bytes, a8g.tx_bytes, a8g.events);
++	} else if (a8s_word(line, "log", &rest)) {
++		a8g.rewind = true;
++	} else if (a8s_word(line, "peek", &rest)) {
++		uint64_t pa = a8s_hex(&rest, &ok);
++		bool okn = true;
++		uint64_t words = *rest ? a8s_hex(&rest, &okn) : 1;
++		if (!ok || !okn || (pa & 3) || words == 0 || words > 64 ||
++		    ((pa & 0xfffu) + words * 4) > 0x1000u) {
++			printf("A8SH: peek ADDR [WORDS]: hex, 4-byte aligned, "
++			    "1-64 words inside one 4 KiB page\n");
++			return;
++		}
++		vm_offset_t va = ml_io_map((vm_offset_t)(pa & ~0xfffull), 0x1000);
++		if (va == 0) {
++			printf("A8SH: map failed\n");
++			return;
++		}
++		for (uint64_t i = 0; i < words; i += 4) {
++			char out[96];
++			int len = snprintf(out, sizeof(out), "A8SH: %09llx:", pa + i * 4);
++			for (uint64_t j = i; j < words && j < i + 4; j++) {
++				len += snprintf(out + len, sizeof(out) - (size_t)len, " %08x",
++				    a8_usb_rd(va, (uint32_t)((pa & 0xfffu) + j * 4)));
++			}
++			printf("%s\n", out);
++		}
++	} else if (a8s_word(line, "poke", &rest)) {
++		uint64_t pa = a8s_hex(&rest, &ok);
++		bool okv = true;
++		uint64_t val = a8s_hex(&rest, &okv);
++		if (!ok || !okv || (pa & 3) || val > 0xffffffffull) {
++			printf("A8SH: poke ADDR VALUE (hex, 32-bit)\n");
++			return;
++		}
++		vm_offset_t va = ml_io_map((vm_offset_t)(pa & ~0xfffull), 0x1000);
++		if (va == 0) {
++			printf("A8SH: map failed\n");
++			return;
++		}
++		uint32_t off = (uint32_t)(pa & 0xfffu);
++		uint32_t before = a8_usb_rd(va, off);
++		a8_usb_wr(va, off, (uint32_t)val);
++		printf("A8SH: %09llx: %08x -> %08x (reads %08x)\n", pa, before,
++		    (uint32_t)val, a8_usb_rd(va, off));
++	} else if (a8s_word(line, "reboot", &rest)) {
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest == 0) {
++			a8s_reboot(A8S_REASON_NONE, "iOS");
++		} else if (strcmp(rest, "recovery") == 0) {
++			a8s_reboot(A8S_REASON_REC, "recovery");
++		} else if (strcmp(rest, "download") == 0) {
++			a8s_reboot(A8S_REASON_DL, "download mode");
++		} else {
++			printf("A8SH: reboot [recovery|download]\n");
++		}
++	} else {
++		printf("A8SH: unknown command; try help\n");
++	}
++}
++
++static void
++a8s_cmd_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	char line[256];
++
++	for (;;) {
++		if (!a8g.cmd_ready) {
++			a8g_sleep_ms(20);
++			continue;
++		}
++		__asm__ volatile ("dmb ish" ::: "memory");
++		strlcpy(line, a8g.cmd, sizeof(line));
++		__asm__ volatile ("dmb ish" ::: "memory");
++		a8g.cmd_ready = false;
++		a8s_command(line);
++	}
++}
++
+ static void
+ a8g_event(uint32_t ev)
+ {
+@@ -1023,6 +1369,8 @@ a8g_event(uint32_t ev)
+ 			a8_dwc_wr(A8_DCFG,
+ 			    a8_usb_rd(a8g.dwc, A8_DCFG) & ~(0x7fu << 3));
+ 			a8g.configured = false;
++			a8g.host_open = false;
++			a8g.tx_busy = false;
+ 			mtp_open = false;
+ 			printf("A5XELTE USB: bus reset\n");
+ 		} else if (type == 2) {         /* connect done */
+@@ -1045,9 +1393,17 @@ a8g_event(uint32_t ev)
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
+ 	if (ep == A8G_EP_RX && type == 1) {
++		if (a8g.serial) {
++			a8s_rx_done();
++			return;
++		}
+ 		a8g_rx_arm();           /* drop whatever the host sent */
+ 		return;
+ 	}
++	if (a8g.serial && ep == A8G_EP_TX && type == 1) {
++		a8g.tx_busy = false;
++		return;
++	}
+ 	if (ep == A8G_EP_MRX && type == 1) {
+ 		mtp_rx_done();
+ 		return;
+@@ -1109,6 +1465,9 @@ a8g_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			a8_dwc_wr(A8_GEVNTCOUNT, count);
+ 		}
++		if (a8g.serial) {
++			a8s_pump();
++		}
+ 		if ((++ticks % 60000) == 0 && a8g.events == 0) {
+ 			printf("A5XELTE USB: no events yet (DSTS 0x%08x)\n",
+ 			    a8_usb_rd(a8g.dwc, A8_DSTS));
+@@ -1141,11 +1500,48 @@ a8g_phy_bringup(vm_offset_t phy)
+ 	    a8_usb_rd(phy, A8_PHY_CLKRST), a8_usb_rd(phy, A8_PHY_UTMI),
+ 	    a8_usb_rd(phy, A8_PHY_HSP), a8_usb_rd(phy, A8_PHY_HSP_TEST));
+ 
+-	if ((version & 0xff00u) != A8_PHY_VER_03_0_0) {
+-		printf("A5XELTE USB: PHY version 0x%08x is not the 03.0.0 map; "
+-		    "sequence skipped\n", version);
+-		return;
++	/*
++	 * CTRL_VER reads 0x00020000 on the phone (jt logs a8log-3..5), but the
++	 * vendor driver never reads it: the CAL version comes from the device
++	 * tree, phy_version = <0x300> on jackpotlte (a8-dump fdt.dtb), and that
++	 * selects this 03.0.0 sequence (phy-exynos-usbdrd3.c:956,1116). Gating on
++	 * the register skipped the whole bring-up, which left HSP_TEST.SIDDQ set
++	 * and every DEPCMD stuck (a8log-5 lines 207-217).
++	 */
++
++	/*
++	 * PMU USB PHY isolation: the 7885 PHY node has pmu_offset = <0x674> and
++	 * pmu_mask = <0x0>, which the driver turns into BIT(0)
++	 * (phy-exynos-usbdrd3.c:1449-1455); utmi_phy_isol(inst, 0, mask) then
++	 * writes the bit to 1 before the PHY is touched (:398-409, :1108). The
++	 * log shows 0x00000000 there: the PHY was still isolated.
++	 */
++	vm_offset_t pmu = ml_io_map(A8_PMU_PA, A8_PMU_SIZE);
++	vm_offset_t fsys = ml_io_map(A8_FSYS_PA, A8_FSYS_SIZE);
++	if (pmu != 0) {
++		v = a8_usb_rd(pmu, A8_PMU_PHY_CTRL);
++		a8_usb_wr(pmu, A8_PMU_PHY_CTRL, v | 1u);
++		printf("A5XELTE USB: PMU PHY ctrl 0x%08x -> 0x%08x\n", v,
++		    a8_usb_rd(pmu, A8_PMU_PHY_CTRL));
++	}
++	/*
++	 * FSYS clock gates of the USB block (cmucal-sfr.c:649,665-666,688):
++	 * USB20PHY clkcore, USB30DRD bus_clk_early, aclk_20phyctrl, ref_clk.
++	 * MANUAL (bit 20) + CG_VAL (bit 21) passes the clock, as the Mali
++	 * bring-up does for G3D (jackpotlte_mali.c, JT_G3D_GATE_ON).
++	 */
++	if (fsys != 0) {
++		static const uint32_t gates[] = { 0x200cu, 0x2074u, 0x2068u, 0x2078u };
++		for (unsigned g = 0; g < sizeof(gates) / sizeof(gates[0]); g++) {
++			a8_usb_wr(fsys, gates[g], a8_usb_rd(fsys, gates[g]) | 0x00300000u);
++		}
++		printf("A5XELTE USB: FSYS gates 0x%08x 0x%08x 0x%08x 0x%08x, PLL_USB 0x%08x, "
++		    "USB30DRD_USER 0x%08x\n", a8_usb_rd(fsys, 0x200cu),
++		    a8_usb_rd(fsys, 0x2074u), a8_usb_rd(fsys, 0x2068u),
++		    a8_usb_rd(fsys, 0x2078u), a8_usb_rd(fsys, 0x01a0u),
++		    a8_usb_rd(fsys, 0x0180u));
+ 	}
++	delay(10);
+ 
+ 	/* exynos_cal_usbphy_q_ch(regs_base, 1): stop the link's q-channel
+ 	 * activations, then force one. */
+@@ -1216,6 +1612,20 @@ a8g_phy_bringup(vm_offset_t phy)
+ 	v |= A8_LINKPORT_HUB_PORT_SEL_OCD_U3 | A8_LINKPORT_HUB_PORT_SEL_OCD_U2;
+ 	a8_usb_wr(phy, A8_PHY_LINK_PORT, v);
+ 
++	/*
++	 * phy_exynos_usb_v3p1_pipe_ovrd (phy-exynos-usb3p1.c:196-212, called
++	 * right after the enable for this board, phy-exynos-usbdrd3.c:1118):
++	 * the board is high speed only, so the PIPE3 side is forced idle and
++	 * the SuperSpeed PMA kept in low power; otherwise the link waits on a
++	 * PHY status that never comes.
++	 */
++	v = a8_usb_rd(phy, A8_PHY_LINK_CTRL);
++	v |= (1u << 16) | (1u << 18);   /* PIPE3_FORCE_EN, FORCE_RX_ELEC_IDLE */
++	v &= ~(1u << 17);               /* PIPE3_FORCE_PHY_STATUS */
++	a8_usb_wr(phy, A8_PHY_LINK_CTRL, v);
++	v = a8_usb_rd(phy, A8_PHY_COMBO_PMA);
++	a8_usb_wr(phy, A8_PHY_COMBO_PMA, v | (1u << 4));        /* PMA_LOW_PWRN */
++
+ 	printf("A5XELTE USB: PHY after bringup CLKRST 0x%08x UTMI 0x%08x "
+ 	    "HSP 0x%08x HSP_TEST 0x%08x LINK_CTRL 0x%08x\n",
+ 	    a8_usb_rd(phy, A8_PHY_CLKRST), a8_usb_rd(phy, A8_PHY_UTMI),
+@@ -1240,6 +1650,14 @@ a8_usb_gadget_start(vm_offset_t dwc, vm_offset_t phy)
+ 	if (!enable) {
+ 		return;
+ 	}
++	int mode = 0;
++	PE_parse_boot_argn("a8usbmode", &mode, sizeof(mode));
++	a8g.serial = mode == 1;
++	/* 115200 8N1, only reported back: the link runs at USB speed anyway. */
++	static const uint8_t coding[7] = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 };
++	memcpy(a8g.line_coding, coding, sizeof(coding));
++	printf("A5XELTE USB: gadget as %s (a8usbmode=%d)\n",
++	    a8g.serial ? "CDC-ACM serial console" : "iPhone + MTP", mode);
+ 
+ 	/*
+ 	 * PHY first: the vendor brings it up before it touches the core
+@@ -1287,6 +1705,11 @@ a8_usb_gadget_start(vm_offset_t dwc, vm_offset_t phy)
+ 		    a8_usb_rd(a8g.dwc, A8_GCTL));
+ 	}
+ 
++	/* High speed only: let the core suspend its USB3 PIPE side, as Linux
++	 * dwc3_phy_setup() does by default (GUSB3PIPECTL.SUSPHY, bit 17). */
++	v = a8_usb_rd(a8g.dwc, 0xc2c0u);
++	a8_dwc_wr(0xc2c0u, v | (1u << 17));
++
+ 	a8_dwc_wr(A8_DCTL, A8_DCTL_CSFTRST);
+ 	for (i = 0; i < 500 &&
+ 	    (a8_usb_rd(a8g.dwc, A8_DCTL) & A8_DCTL_CSFTRST); i++) {
+@@ -1346,6 +1769,10 @@ a8_usb_gadget_start(vm_offset_t dwc, vm_offset_t phy)
+ 	if (kernel_thread_start(a8g_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (a8g.serial &&
++	    kernel_thread_start(a8s_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ #else  /* ARM64_BOARD_CONFIG_A5XELTE && !JACKPOTLTE */
