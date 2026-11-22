@@ -1,0 +1,598 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index b6dd689..f420e0b 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -43,6 +43,12 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <sys/sysctl.h>         /* averunnable */
++#include <sys/proc.h>
++#include <sys/proc_internal.h>  /* proc_iterate */
++#include <sys/signalvar.h>      /* psignal */
++#include <mach/task_info.h>
++#include <kern/task.h>
++#include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -227,20 +233,171 @@ a8_stat_line(void)
+ 	    nprocs, sweet_fb_requested_off() ? "off (iOS asked)" : "on");
+ }
+ 
++/*
++ * Where the CPU went (after the Galaxy S7 port's sweettop, patch 0251 of
++ * theasianviet-lab/hackios-s7-kernel): each pass reads every process's CPU
++ * time (TASK_ABSOLUTETIME_INFO, its live and dead threads) and prints the
++ * ten that used the most since the last pass, as a share of one core:
++ * "A8 TOP 60 s: backboardd 85% SpringBoard 40% ... | all 160% of 800%".
++ * The stat thread runs a pass after each stat line (a8top=0: never), the
++ * console's "top" command runs one on demand. Processes not seen in a pass
++ * leave the table, so the xpcproxy and fairplayd respawns do not fill it.
++ */
++#define A8_TOP_PROCS    384
++static struct a8_top_ent {
++	int      pid;
++	uint32_t gen;
++	uint64_t abs;
++	uint64_t delta;
++	char     name[20];
++} a8_top[A8_TOP_PROCS];
++static unsigned a8_top_n;
++static uint32_t a8_top_gen;
++static uint64_t a8_top_last;            /* mach time of the last pass */
++static LCK_GRP_DECLARE(a8_top_grp, "a8top");
++static LCK_MTX_DECLARE(a8_top_lock, &a8_top_grp);
++extern task_t proc_task(proc_t);
++
++static int
++a8_top_proc(proc_t p, void *arg __unused)
++{
++	task_t task = proc_task(p);
++	task_absolutetime_info_data_t ti;
++	mach_msg_type_number_t count = TASK_ABSOLUTETIME_INFO_COUNT;
++	int pid = proc_pid(p);
++	unsigned i;
++
++	if (task == TASK_NULL ||
++	    task_info(task, TASK_ABSOLUTETIME_INFO, (task_info_t)&ti, &count) != KERN_SUCCESS) {
++		return PROC_RETURNED;
++	}
++	uint64_t abs = ti.total_user + ti.total_system + ti.threads_user + ti.threads_system;
++	for (i = 0; i < a8_top_n && a8_top[i].pid != pid; i++) {
++	}
++	if (i == a8_top_n) {
++		if (a8_top_n == A8_TOP_PROCS) {
++			return PROC_RETURNED;
++		}
++		a8_top_n++;
++		a8_top[i].pid = pid;
++		a8_top[i].abs = abs;            /* first sight: its time before now is not counted */
++		proc_name(pid, a8_top[i].name, sizeof(a8_top[i].name));
++	}
++	a8_top[i].delta = abs > a8_top[i].abs ? abs - a8_top[i].abs : 0;
++	a8_top[i].abs = abs;
++	a8_top[i].gen = a8_top_gen;
++	return PROC_RETURNED;
++}
++
++static void
++a8_top_pass(const char *why)
++{
++	uint64_t now, span_ns, total = 0;
++	char line[480];
++	int len;
++
++	lck_mtx_lock(&a8_top_lock);
++	a8_top_gen++;
++	proc_iterate(PROC_ALLPROCLIST, a8_top_proc, NULL, NULL, NULL);
++	now = mach_absolute_time();
++	absolutetime_to_nanoseconds(now - a8_top_last, &span_ns);
++	/* Drop the processes this pass did not see (exited). */
++	for (unsigned i = 0; i < a8_top_n;) {
++		if (a8_top[i].gen != a8_top_gen) {
++			a8_top[i] = a8_top[--a8_top_n];
++		} else {
++			total += a8_top[i].delta;
++			i++;
++		}
++	}
++	if (a8_top_last == 0 || span_ns < 500 * NSEC_PER_MSEC) {
++		a8_top_last = now;
++		lck_mtx_unlock(&a8_top_lock);
++		printf("A8 TOP: baseline taken (%s); the next pass shows the CPU since now\n", why);
++		return;
++	}
++	a8_top_last = now;
++	len = snprintf(line, sizeof(line), "A8 TOP %llu s (%s):", span_ns / NSEC_PER_SEC, why);
++	for (int k = 0; k < 10 && len < (int)sizeof(line) - 48; k++) {
++		unsigned best = A8_TOP_PROCS;
++		uint64_t ns;
++
++		for (unsigned i = 0; i < a8_top_n; i++) {
++			if (a8_top[i].delta != 0 && (best == A8_TOP_PROCS || a8_top[i].delta > a8_top[best].delta)) {
++				best = i;
++			}
++		}
++		if (best == A8_TOP_PROCS) {
++			break;
++		}
++		absolutetime_to_nanoseconds(a8_top[best].delta, &ns);
++		len += snprintf(line + len, sizeof(line) - len, " %s[%d] %llu%%", a8_top[best].name,
++		    a8_top[best].pid, ns * 100 / span_ns);
++		a8_top[best].delta = 0;
++	}
++	absolutetime_to_nanoseconds(total, &total);
++	lck_mtx_unlock(&a8_top_lock);
++	printf("%s | all %llu%% of %u%%\n", line, total * 100 / span_ns, (unsigned)ml_get_max_cpu_number() * 100 + 100);
++}
++
+ static int a8_stat_chan;
++static uint32_t a8_top_on = 1;
+ 
+ static void
+ a8_stat_thread(void *arg, wait_result_t wr __unused)
+ {
+ 	uint32_t secs = (uint32_t)(uintptr_t)arg;
+ 
++	if (a8_top_on) {
++		a8_top_pass("start");
++	}
+ 	for (;;) {
+ 		uint64_t deadline;
+ 		clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
+ 		(void)assert_wait_deadline(&a8_stat_chan, THREAD_UNINT, deadline);
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 		a8_stat_line();
++		if (a8_top_on) {
++			a8_top_pass("every a8stat");
++		}
++	}
++}
++
++/* "ps": every process, pid and name, eight to a line. */
++static char a8_ps_line[200];
++static int a8_ps_count;
++
++static int
++a8_ps_proc(proc_t p, void *arg __unused)
++{
++	char name[20];
++	size_t len = strlen(a8_ps_line);
++
++	proc_name(proc_pid(p), name, sizeof(name));
++	snprintf(a8_ps_line + len, sizeof(a8_ps_line) - len, " %d:%s", proc_pid(p), name);
++	if (++a8_ps_count % 8 == 0) {
++		printf("A8SH: ps%s\n", a8_ps_line);
++		a8_ps_line[0] = 0;
++	}
++	return PROC_RETURNED;
++}
++
++/* "kill NAME|PID [SIG]": SIGKILL unless SIG is given; NAME matches every process of that name. */
++static const char *a8_kill_name;
++static int a8_kill_sig, a8_kill_hits;
++
++static int
++a8_kill_proc(proc_t p, void *arg __unused)
++{
++	char name[20];
++
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (proc_pid(p) > 1 && strcmp(name, a8_kill_name) == 0) {
++		printf("A8SH: kill %s[%d] with signal %d\n", name, proc_pid(p), a8_kill_sig);
++		psignal(p, a8_kill_sig);
++		a8_kill_hits++;
+ 	}
++	return PROC_RETURNED;
+ }
+ 
+ void
+@@ -249,6 +406,7 @@ a5xelte_usb_probe(void)
+ 	int enabled = 1;
+ 	uint32_t statsecs = 0;
+ 
++	PE_parse_boot_argn("a8top", &a8_top_on, sizeof(a8_top_on));
+ 	if (PE_parse_boot_argn("a8stat", &statsecs, sizeof(statsecs)) && statsecs > 0) {
+ 		thread_t st;
+ 		if (statsecs < 5) {
+@@ -1432,7 +1590,7 @@ a8s_command(const char *line)
+ 
+ 	printf("A8SH> %s\n", line);
+ 	if (a8s_word(line, "help", &rest)) {
+-		printf("A8SH: help | ping | stat | log (resend the ring) | "
++		printf("A8SH: help | ping | stat | top | ps | kill NAME|PID [SIG] | log (resend the ring) | "
+ 		    "shot [SCALE] | tap X Y | swipe X1 Y1 X2 Y2 [MS] | "
+ 		    "key power|up|down|home [MS] | wake | "
+ 		    "peek ADDR [WORDS] | poke ADDR VALUE | "
+@@ -1445,6 +1603,58 @@ a8s_command(const char *line)
+ 		printf("A8SH: log %llu bytes, usb rx %llu tx %llu, events %u\n",
+ 		    a5xelte_log_position(), a8g.rx_bytes, a8g.tx_bytes, a8g.events);
+ 		a8_stat_line();
++	} else if (a8s_word(line, "top", &rest)) {
++		a8_top_pass("asked");
++	} else if (a8s_word(line, "ps", &rest)) {
++		a8_ps_line[0] = 0;
++		a8_ps_count = 0;
++		proc_iterate(PROC_ALLPROCLIST, a8_ps_proc, NULL, NULL, NULL);
++		printf("A8SH: ps%s (%d processes)\n", a8_ps_line, a8_ps_count);
++	} else if (a8s_word(line, "kill", &rest)) {
++		char name[20];
++		size_t n = 0;
++		long sig = SIGKILL;
++		bool sig_ok = false;
++
++		while (*rest == ' ') {
++			rest++;
++		}
++		while (rest[n] != 0 && rest[n] != ' ' && n < sizeof(name) - 1) {
++			name[n] = rest[n];
++			n++;
++		}
++		name[n] = 0;
++		if (rest[n] == ' ') {
++			const char *q = rest + n;
++			sig = a8s_dec(&q, &sig_ok);
++			if (!sig_ok || sig <= 0 || sig >= NSIG) {
++				sig = SIGKILL;
++			}
++		}
++		if (n == 0) {
++			printf("A8SH: kill NAME|PID [SIG] (SpringBoard restarts the home screen, backboardd all of the UI)\n");
++		} else if (name[0] >= '0' && name[0] <= '9') {
++			int pid = 0;
++			for (size_t i = 0; i < n && name[i] >= '0' && name[i] <= '9'; i++) {
++				pid = pid * 10 + (name[i] - '0');
++			}
++			proc_t pp = pid > 1 ? proc_find(pid) : PROC_NULL;
++			if (pp == PROC_NULL) {
++				printf("A8SH: kill: no process %d (or it is launchd/kernel)\n", pid);
++			} else {
++				printf("A8SH: kill %d with signal %d\n", pid, (int)sig);
++				psignal(pp, (int)sig);
++				proc_rele(pp);
++			}
++		} else {
++			a8_kill_name = name;
++			a8_kill_sig = (int)sig;
++			a8_kill_hits = 0;
++			proc_iterate(PROC_ALLPROCLIST, a8_kill_proc, NULL, NULL, NULL);
++			if (a8_kill_hits == 0) {
++				printf("A8SH: kill: no process named %s\n", name);
++			}
++		}
+ 	} else if (a8s_word(line, "shot", &rest)) {
+ 		long scale = 6;
+ 		if (*rest) {
+diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
+index 4a06407..35cf698 100644
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -1592,6 +1592,23 @@ IOPMrootDomain::start( IOService * nub )
+ 	PE_parse_boot_argn("swd_timeout", &gSwdSleepWakeTimeout, sizeof(gSwdSleepWakeTimeout));
+ 	PE_parse_boot_argn("haltmspanic", &gHaltTimeMaxPanic, sizeof(gHaltTimeMaxPanic));
+ 	PE_parse_boot_argn("haltmslog", &gHaltTimeMaxLog, sizeof(gHaltTimeMaxLog));
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/*
++	 * No system sleep on the A5/A8 ports: there is nothing to sleep into and
++	 * nothing to wake from, and on the Galaxy S9 (Scion, docs/screen-off-power.md)
++	 * powerd's sleep request ended in IOCPUSleepKernel() and never came back:
++	 * a black screen no button wakes. The phone stays awake with the screen
++	 * off. a8syssleep=1 gives Apple's behaviour back.
++	 */
++	{
++		uint32_t allow = 0;
++		PE_parse_boot_argn("a8syssleep", &allow, sizeof(allow));
++		if (!allow) {
++			gSleepDisabledFlag = 1;
++		}
++		IOLog("PMRD: system sleep %s (a8syssleep)\n", gSleepDisabledFlag ? "disabled" : "allowed");
++	}
++#endif
+ 
+ 	// read noidle setting from Device Tree
+ 	if (PE_get_default("no-idle", &gNoIdleFlag, sizeof(gNoIdleFlag))) {
+@@ -7925,6 +7942,15 @@ IOPMrootDomain::dispatchPowerEvent(
+ 			if (PE_get_default("sleep-disabled", &gSleepDisabledFlag, sizeof(gSleepDisabledFlag))) {
+ 				DLOG("Setting gSleepDisabledFlag to %u from device tree\n", gSleepDisabledFlag);
+ 			}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			{
++				uint32_t allow = 0;
++				PE_parse_boot_argn("a8syssleep", &allow, sizeof(allow));
++				if (!allow) {
++					gSleepDisabledFlag = 1;         /* the device tree's default may not clear it */
++				}
++			}
++#endif
+ 			if (lowBatteryCondition || thermalEmergencyState) {
+ 				if (lowBatteryCondition) {
+ 					privateSleepSystem(kIOPMSleepReasonLowPower);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9a8e603..1ea5b6b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,9 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <pexpert/arm64/board_config.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c */
++#endif
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -285,6 +288,50 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	{
++		/*
++		 * From the Galaxy S7 port's 0323, after Scion's MiniIOMobileFramebuffer
++		 * (Galaxy S9): CoreAnimation starts a frame from a timer of its own, and
++		 * with the kernel's timer coalescing on, the timer of a thread that is not
++		 * real-time may fire up to 100 ms late; on the S9 the frames came exactly
++		 * 100 ms apart. Off here (sweetfb_tcoal=1 leaves it on).
++		 * sweetfb_cahz=N (30-240, default 0: left out as before) publishes
++		 * IOMFBDisplayRefresh, the refresh CoreAnimation paces its frames by; the
++		 * S7 and S9 ports tell it 120 on a 60 Hz panel.
++		 */
++		uint32_t keep = 0, told = 0;
++		PE_parse_boot_argn("sweetfb_tcoal", &keep, sizeof(keep));
++		if (!keep) {
++			mach_timer_coalescing_enabled = FALSE;
++		}
++		PE_parse_boot_argn("sweetfb_cahz", &told, sizeof(told));
++		OSDictionary *refresh = (told >= 30 && told <= 240) ? OSDictionary::withCapacity(4) : NULL;
++		if (refresh != NULL) {
++			uint64_t interval = (1ULL << 32) / told, ticks = 0;
++			static const char *const keys[] = {
++				"displayMinRefreshInterval", "displayMaxRefreshInterval", "displayRefreshStep"
++			};
++			nanoseconds_to_absolutetime(NSEC_PER_SEC / told, &ticks);
++			for (unsigned k = 0; k < 3; k++) {
++				OSNumber *n = OSNumber::withNumber(interval, 64);
++				if (n != NULL) {
++					refresh->setObject(keys[k], n);
++					n->release();
++				}
++			}
++			OSNumber *t = OSNumber::withNumber(ticks, 64);
++			if (t != NULL) {
++				refresh->setObject("displayRefreshStepMachTime", t);
++				t->release();
++			}
++			setProperty("IOMFBDisplayRefresh", refresh);
++			refresh->release();
++		}
++		IOLog("SWEET FB: timer coalescing %s; IOMFBDisplayRefresh %u Hz (0: not published)\n",
++		    mach_timer_coalescing_enabled ? "on" : "off", refresh != NULL ? told : 0);
++	}
++#endif
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..1a48831 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -135,8 +135,79 @@
+ #endif
+ 
+ struct sched_statistics PERCPU_DATA(sched_stats);
++
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || (defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE))
++#define SWEET_FAST_SCHED 1
++#else
++#define SWEET_FAST_SCHED 0
++#endif
+ bool sched_stats_active;
+ 
++#if SWEET_FAST_SCHED
++/*
++ * From syncmodz/ios-s9 (Galaxy S9). Galaxy S7 (Exynos 8890): XNU sees the
++ * eight cores as one homogeneous cluster, but cpus 4-7 are Mongoose M1 at
++ * 2.6 GHz, roughly twice as fast as the Cortex-A53s at 1.59 GHz (cpus 0-3,
++ * mkadt_herolte.py). Stock XNU takes the lowest numbered idle CPU, so CoreAnimation's
++ * single render thread in backboardd, the UI threads and every realtime
++ * thread kept landing on slow cores while the fast ones idled. Boot-arg
++ * sweetfast=MASK names the fast cores (default 0xf0, 0 = stock behaviour):
++ * realtime threads and threads at BASEPRI_DEFAULT or above take an idle fast
++ * core first and may preempt a background thread there; threads below take
++ * an idle slow core first, keeping the fast ones free.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++/*
++ * Galaxy A8 2018 (Exynos 7885): logical cpus 0-5 are Cortex-A53s, 6-7 the
++ * two Cortex-A73s (tools/mkadt_jackpotlte.py), so the default is 0xc0.
++ * Ported from the Galaxy S7 port (theasianviet-lab/hackios-s7-kernel 0238,
++ * 0274, 0275, 0321), itself after Scion's sched_slow_secondaries.
++ */
++static cpumap_t sweet_fast_map = 0xc0;
++#else
++static cpumap_t sweet_fast_map = 0xf0;
++#endif
++
++/*
++ * Herolte: Mongoose is three or four times an A53 here. launchd and mediaserverd alone use up to three CPUs, with
++ * nothing on the screen to show for it, and at BASEPRI_DEFAULT they had the fast cores before the UI.
++ */
++extern char *proc_name_address(void *p);
++
++static inline bool
++sweet_is_hog(thread_t thread)
++{
++	static const char *const hogs[] = { "launchd", "mediaserverd", "logd", "kernel_task", "xpcproxy", "cfprefsd", "fairplayd.H2" };
++	void *proc = get_bsdtask_info(get_threadtask(thread));
++	if (proc == NULL) {
++		return false;
++	}
++	const char *name = proc_name_address(proc);
++	for (unsigned i = 0; i < sizeof(hogs) / sizeof(hogs[0]); i++) {
++		if (strncmp(name, hogs[i], 17) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static inline bool
++sweet_wants_fast(thread_t thread)
++{
++	return thread->sched_pri >= BASEPRI_USER_INITIATED && !sweet_is_hog(thread);
++}
++
++/* Idle CPU from idle_map in the thread's preferred class, else any; -1 if none. */
++static int
++sweet_pick_idle(cpumap_t idle_map, thread_t thread)
++{
++	cpumap_t fast = idle_map & sweet_fast_map;
++	cpumap_t slow = idle_map & ~sweet_fast_map;
++	cpumap_t first = sweet_wants_fast(thread) ? fast : slow;
++	return lsb_first(first ? first : idle_map);
++}
++#endif /* SWEET_FAST_SCHED */
++
+ static uint64_t
+ deadline_add(uint64_t d, uint64_t e)
+ {
+@@ -347,7 +418,7 @@ static void sched_update_powered_cores(uint64_t reqested_powered_cores, processo
+ #if __arm64__
+ static void sched_recommended_cores_maintenance(void);
+ uint64_t    perfcontrol_failsafe_starvation_threshold;
+-extern char *proc_name_address(struct proc *p);
++extern char *proc_name_address(void *p);
+ #endif /* __arm64__ */
+ 
+ uint64_t        sched_one_second_interval;
+@@ -468,6 +539,10 @@ sched_init(void)
+ 	if (PE_parse_boot_argn("direct_handoff", &direct_handoff, sizeof(direct_handoff))) {
+ 		allow_direct_handoff = direct_handoff;
+ 	}
++#if SWEET_FAST_SCHED
++	PE_parse_boot_argn("sweetfast", &sweet_fast_map, sizeof(sweet_fast_map));
++	kprintf("Scheduler: SWEET fast cores 0x%llx\n", (unsigned long long)sweet_fast_map);
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 	if (PE_parse_boot_argn("enable_skstsct", &enable_task_set_cluster_type, sizeof(enable_task_set_cluster_type))) {
+@@ -2105,6 +2180,36 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ #endif
+ 
+ 	assert(cprocessor == current_processor());
++#if SWEET_FAST_SCHED
++	/*
++	 * A fast core goes idle (after Scion's sched_slow_secondaries, Galaxy S9, ported to sweet_fast_map): of the slow
++	 * cores that run something at a UI priority, the one with the highest is told to reschedule. thread_select there
++	 * sends the thread back with AST_REBALANCE (below) and choose_processor puts it on this core. Before, a UI thread
++	 * that had landed on an A53 stayed there for its whole quantum, a Mongoose idling beside it.
++	 */
++	if (sweet_fast_map != 0 && bit_test(sweet_fast_map, cprocessor->cpu_id)) {
++		processor_t slow = PROCESSOR_NULL;
++		integer_t highest = BASEPRI_USER_INITIATED - 1;
++		sched_ipi_type_t slow_ipi = SCHED_IPI_NONE;
++		uint64_t running_slow = cpset->cpu_state_map[PROCESSOR_RUNNING] & ~sweet_fast_map &
++		    ~cpset->pending_AST_URGENT_cpu_mask & cpset->recommended_bitmask;
++		for (int cpuid = lsb_first(running_slow); cpuid >= 0; cpuid = lsb_next(running_slow, cpuid)) {
++			processor_t sp = processor_array[cpuid];
++			if (sp != cprocessor && sp->current_pri < BASEPRI_RTQUEUES && sp->current_pri > highest) {
++				highest = sp->current_pri;
++				slow = sp;
++			}
++		}
++		if (slow != PROCESSOR_NULL) {
++			slow_ipi = sched_ipi_action(slow, NULL, SCHED_IPI_EVENT_SMT_REBAL);
++		}
++		pset_unlock(cpset);
++		if (slow != PROCESSOR_NULL && slow_ipi != SCHED_IPI_NONE) {
++			sched_ipi_perform(slow, slow_ipi);
++		}
++		return;
++	}
++#endif
+ 	if (cprocessor->is_SMT == FALSE) {
+ 		goto smt_balance_exit;
+ 	}
+@@ -2581,6 +2686,15 @@ restart:
+ 		bool is_yielding         = (*reason & AST_YIELD) == AST_YIELD;
+ 
+ 		bool needs_smt_rebalance = !is_yielding && thread->sched_pri < BASEPRI_RTQUEUES && processor->processor_primary != processor;
++#if SWEET_FAST_SCHED
++		/* A thread that wants a fast core, on a slow one, while a fast one is idle: it moves (sched_SMT_balance above). */
++		if (!needs_smt_rebalance && !is_yielding && sweet_fast_map != 0 && thread->sched_pri < BASEPRI_RTQUEUES &&
++		    thread->bound_processor == PROCESSOR_NULL && !bit_test(sweet_fast_map, processor->cpu_id) &&
++		    (pset->recommended_bitmask & pset->primary_map & sweet_fast_map & pset->cpu_state_map[PROCESSOR_IDLE]) != 0 &&
++		    sweet_wants_fast(thread)) {
++			needs_smt_rebalance = true;
++		}
++#endif
+ 
+ 		bool affinity_mismatch   = thread->affinity_set != AFFINITY_SET_NULL && thread->affinity_set->aset_pset != pset;
+ 
+@@ -5083,6 +5197,19 @@ choose_processor(
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if SWEET_FAST_SCHED
++				/* ...unless it is of the wrong speed class and the right one has an idle CPU. */
++				if (sweet_fast_map != 0) {
++					cpumap_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map &
++					    pset->recommended_bitmask;
++					bool fast = bit_test(sweet_fast_map, processor->cpu_id);
++					bool want = sweet_wants_fast(thread);
++					if (fast != want && (idle & (want ? sweet_fast_map : ~sweet_fast_map)) != 0) {
++						processor = PROCESSOR_NULL;
++						break;
++					}
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					return processor;
+ 				}
+@@ -5246,7 +5373,33 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if SWEET_FAST_SCHED
++		int cpuid = sweet_fast_map != 0 ? sweet_pick_idle(idle_primary_map, thread) : lsb_first(idle_primary_map);
++		if (cpuid >= 0 && sweet_fast_map != 0 && sweet_wants_fast(thread) &&
++		    !bit_test(sweet_fast_map, cpuid)) {
++			/*
++			 * Only slow cores are idle: rather take a fast core from a
++			 * background (below utility) thread, which then moves to the
++			 * idle slow core when it is put back on the run queue.
++			 */
++			cpumap_t busy_fast = (pset->cpu_state_map[PROCESSOR_RUNNING] & sweet_fast_map &
++			    pset->primary_map & pset->recommended_bitmask &
++			    ~pset->pending_AST_URGENT_cpu_mask & ~pset->pending_AST_PREEMPT_cpu_mask);
++			processor_t victim = PROCESSOR_NULL;
++			for (int id = lsb_first(busy_fast); id >= 0; id = lsb_next(busy_fast, id)) {
++				processor_t p = processor_array[id];
++				if (p->current_pri < BASEPRI_UTILITY && p->current_pri < thread->sched_pri &&
++				    (victim == PROCESSOR_NULL || p->current_pri < victim->current_pri)) {
++					victim = p;
++				}
++			}
++			if (victim != PROCESSOR_NULL) {
++				return victim;
++			}
++		}
++#else
+ 		int cpuid = lsb_first(idle_primary_map);
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;
+@@ -8307,6 +8460,12 @@ try_again:
+ 	if (avoid_cpu0) {
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
++#if SWEET_FAST_SCHED
++	/* Realtime threads (touch, audio, CoreAnimation) on a fast core when one is free. */
++	if ((primary_map & sweet_fast_map) != 0) {
++		primary_map &= sweet_fast_map;
++	}
++#endif
+ 
+ 	int rotid = lsb_first(primary_map);
+ 	if (rotid >= 0) {

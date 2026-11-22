@@ -195,6 +195,33 @@ else
 	echo "         its fallback status bar for the 1080x2220 mode" >&2
 fi
 
+# The status bar layout by name.  UIKit takes a _UIStatusBarVisualProvider_SplitNNNN
+# only for a screen exactly NNNN pixels wide whose notch matches the artwork
+# subtype, so the A8's 1080x2220 gets the pink rdar://45025538 strip even with
+# the bounding path above.  Before that table UIKit reads
+# UIStatusBarVisualProviderClassName from the defaults (the global domain
+# included) and uses the class as it is (Scion-Project/scion-kernel,
+# userland/src/inject_sb.c, status_bar_provider()).  Split1080 is the 12/13
+# mini's layout, which UIKit draws at 0.96 and so spans 360 points: exactly a
+# 1080-pixel screen at 3x.  Written for mobile, merged into what is there.
+python3 - "$mnt" <<'PY'
+import os, plistlib, sys
+path = os.path.join(sys.argv[1], 'private/var/mobile/Library/Preferences/.GlobalPreferences.plist')
+data = {}
+if os.path.exists(path):
+    with open(path, 'rb') as f:
+        data = plistlib.load(f)
+data['UIStatusBarVisualProviderClassName'] = '_UIStatusBarVisualProvider_Split1080'
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'wb') as f:
+    plistlib.dump(data, f, fmt=plistlib.FMT_BINARY)
+os.chown(path, 501, 501)
+os.chmod(path, 0o600)
+with open(path, 'rb') as f:
+    assert plistlib.load(f)['UIStatusBarVisualProviderClassName'] == '_UIStatusBarVisualProvider_Split1080'
+print('pref .GlobalPreferences UIStatusBarVisualProviderClassName = _UIStatusBarVisualProvider_Split1080')
+PY
+
 # Present the apps iOS 16 leaves staged for the App cryptex (see the header).
 if [ -d "$mnt/private/var/staged_system_apps" ]; then
 	promoted=0
