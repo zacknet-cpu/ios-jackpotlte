@@ -1,0 +1,155 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index f420e0b..985331f 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1800,6 +1800,9 @@ a8s_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++/* How the link is doing, said every 30 s while it changes (a8g_thread). */
++static uint32_t a8g_resets, a8g_conns, a8g_ep0_events;
++
+ static void
+ a8g_event(uint32_t ev)
+ {
+@@ -1813,7 +1816,9 @@ a8g_event(uint32_t ev)
+ 			a8g.host_open = false;
+ 			a8g.tx_busy = false;
+ 			mtp_open = false;
+-			printf("A5XELTE USB: bus reset\n");
++			if (a8g_resets++ < 20) {
++				printf("A5XELTE USB: bus reset\n");
++			}
+ 		} else if (type == 2) {         /* connect done */
+ 			uint32_t speed = a8_usb_rd(a8g.dwc, A8_DSTS) & 7;
+ 
+@@ -1823,7 +1828,9 @@ a8g_event(uint32_t ev)
+ 			a8g_epcmd(1, A8_DEPCMD_SETEPCONFIG,
+ 			    (0u << 1) | (64u << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+-			printf("A5XELTE USB: connected, speed %u\n", speed);
++			if (a8g_conns++ < 20) {
++				printf("A5XELTE USB: connected, speed %u\n", speed);
++			}
+ 		} else if (type == 0) {
+ 			printf("A5XELTE USB: disconnect\n");
+ 		}
+@@ -1855,6 +1862,7 @@ a8g_event(uint32_t ev)
+ 	if (ep > 1) {
+ 		return;
+ 	}
++	a8g_ep0_events++;
+ 	if (type == 1) {                        /* XferComplete */
+ 		switch (a8g.state) {
+ 		case A8G_SETUP:
+@@ -1913,6 +1921,19 @@ a8g_thread(void *arg __unused, wait_result_t wr __unused)
+ 			printf("A5XELTE USB: no events yet (DSTS 0x%08x)\n",
+ 			    a8_usb_rd(a8g.dwc, A8_DSTS));
+ 		}
++		if ((ticks % 30000) == 0) {
++			static uint32_t said;
++			uint32_t now = a8g_resets + a8g_conns + a8g_ep0_events + (a8g.configured ? 1u : 0u);
++
++			if (now != said) {
++				said = now;
++				printf("A5XELTE USB: link: %u resets, %u connects, %u ep0 events, %s, "
++				    "host %s (DSTS 0x%08x)\n", a8g_resets, a8g_conns, a8g_ep0_events,
++				    a8g.configured ? "configured" : "not configured",
++				    a8g.host_open ? "has the port open" : "has not opened the port",
++				    a8_usb_rd(a8g.dwc, A8_DSTS));
++			}
++		}
+ 		a8g_sleep_ms(1);
+ 	}
+ }
+@@ -1930,6 +1951,82 @@ a8g_thread(void *arg __unused, wait_result_t wr __unused)
+  * assert PHY reset, release deep sleep, clear the 2.0 pulls, wait, release
+  * PHY reset, then force the VBUS/BVALID this board has no pad for.
+  */
++/*
++ * PLL_USB, the USB 2.0 PHY's reference clock (CLKCORE, the clock that the
++ * gate at FSYS+0x200c passes). a8log-6: the PHY now answers and the host
++ * sees the phone (3826 "bus reset" + "connected, speed 0" pairs), but no
++ * control transfer ever arrived and PLL_USB read 0x00000000: off, so the
++ * PHY ran from the 26 MHz oscillator while it expects 50 MHz. Line states
++ * (reset, chirp) still pass; packets at 480 Mbit/s do not, and the host
++ * resets the port again and again.
++ *
++ * Samsung's driver sets this clock to 50 MHz on the 7885 before every PHY
++ * init (phy-exynos-usbdrd3.c:346-348, CONFIG_SOC_EXYNOS7885), from the one
++ * entry of pll_usb_rate_table: M 400, P 13, S 4 (cmucal-node.c:45-47), a
++ * PLL_1418X (cmucal-node.c:76) with lock time P x 150 (pll_spec.c:26-34).
++ * PLL_CON0 at FSYS+0x1a0: ENABLE 31, STABLE 29, M 25:16, P 13:8, S 2:0,
++ * and MUX_SEL 4 (the PLL's output rather than its input); LOCKTIME at
++ * FSYS+0x000 (cmucal-sfr.c:690-691, 2946-2951; ra.c ra_pll_set_pmsk()).
++ * a8usbpll=0 leaves the PLL as the boot loader left it.
++ */
++#define A8_PLL_USB_CON0         0x01a0u
++#define A8_PLL_USB_LOCKTIME     0x0000u
++#define A8_PLL_ENABLE           (1u << 31)
++#define A8_PLL_STABLE           (1u << 29)
++#define A8_PLL_MUX_SEL          (1u << 4)
++#define A8_PLL_MUX_BUSY         (1u << 7)
++#define A8_PLL_PMS_MASK         ((0x3ffu << 16) | (0x3fu << 8) | 7u)
++#define A8_PLL_USB_M            400u
++#define A8_PLL_USB_P            13u
++#define A8_PLL_USB_S            4u
++
++static void
++a8g_pll_usb(vm_offset_t fsys)
++{
++	uint32_t want = (A8_PLL_USB_M << 16) | (A8_PLL_USB_P << 8) | A8_PLL_USB_S;
++	uint32_t before = a8_usb_rd(fsys, A8_PLL_USB_CON0);
++	uint32_t use = 1, v;
++	int i;
++
++	PE_parse_boot_argn("a8usbpll", &use, sizeof(use));
++	if (!use) {
++		printf("A5XELTE USB: PLL_USB left as found, 0x%08x (a8usbpll=0)\n", before);
++		return;
++	}
++	if ((before & (A8_PLL_PMS_MASK | A8_PLL_ENABLE | A8_PLL_STABLE | A8_PLL_MUX_SEL)) ==
++	    (want | A8_PLL_ENABLE | A8_PLL_STABLE | A8_PLL_MUX_SEL)) {
++		printf("A5XELTE USB: PLL_USB already 50 MHz (0x%08x)\n", before);
++		return;
++	}
++	/* Off the PLL first if it runs at something else (ra_enable_pll(0)). */
++	if (before & A8_PLL_ENABLE) {
++		v = before & ~A8_PLL_MUX_SEL;
++		a8_usb_wr(fsys, A8_PLL_USB_CON0, v);
++		for (i = 0; i < 100 && (a8_usb_rd(fsys, A8_PLL_USB_CON0) & A8_PLL_MUX_BUSY); i++) {
++			delay(1);
++		}
++		a8_usb_wr(fsys, A8_PLL_USB_CON0, v & ~A8_PLL_ENABLE);
++	}
++	a8_usb_wr(fsys, A8_PLL_USB_LOCKTIME, A8_PLL_USB_P * 150u);
++	v = (a8_usb_rd(fsys, A8_PLL_USB_CON0) & ~(A8_PLL_PMS_MASK | A8_PLL_MUX_SEL)) | want;
++	a8_usb_wr(fsys, A8_PLL_USB_CON0, v | A8_PLL_ENABLE);
++	for (i = 0; i < 2000 && !(a8_usb_rd(fsys, A8_PLL_USB_CON0) & A8_PLL_STABLE); i++) {
++		delay(1);
++	}
++	if (!(a8_usb_rd(fsys, A8_PLL_USB_CON0) & A8_PLL_STABLE)) {
++		printf("A5XELTE USB: PLL_USB did NOT lock (0x%08x after %d us); left on the oscillator\n",
++		    a8_usb_rd(fsys, A8_PLL_USB_CON0), i);
++		return;
++	}
++	a8_usb_wr(fsys, A8_PLL_USB_CON0, a8_usb_rd(fsys, A8_PLL_USB_CON0) | A8_PLL_MUX_SEL);
++	for (i = 0; i < 100 && (a8_usb_rd(fsys, A8_PLL_USB_CON0) & A8_PLL_MUX_BUSY); i++) {
++		delay(1);
++	}
++	printf("A5XELTE USB: PLL_USB 0x%08x -> 0x%08x: 26 MHz x %u / (%u x 2^%u) = 50 MHz, locktime %u\n",
++	    before, a8_usb_rd(fsys, A8_PLL_USB_CON0), A8_PLL_USB_M, A8_PLL_USB_P, A8_PLL_USB_S,
++	    a8_usb_rd(fsys, A8_PLL_USB_LOCKTIME));
++}
++
+ static void
+ a8g_phy_bringup(vm_offset_t phy)
+ {
+@@ -1981,6 +2078,7 @@ a8g_phy_bringup(vm_offset_t phy)
+ 		    a8_usb_rd(fsys, 0x2074u), a8_usb_rd(fsys, 0x2068u),
+ 		    a8_usb_rd(fsys, 0x2078u), a8_usb_rd(fsys, 0x01a0u),
+ 		    a8_usb_rd(fsys, 0x0180u));
++		a8g_pll_usb(fsys);
+ 	}
+ 	delay(10);
+ 
