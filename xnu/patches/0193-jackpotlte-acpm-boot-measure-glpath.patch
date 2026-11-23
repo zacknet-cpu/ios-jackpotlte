@@ -26,7 +26,7 @@ index dcfe453..d89d06f 100644
 - * a8_probe_read32).  CPU rates come from FREQ_GET.
 + * a8_probe_read32).  FREQ_GET returns 0 on this phone's FVP plug-in (probed
 + * 2026-11-23); CPU rates in "dvfs" are measured with PMCCNTR_EL0 on a pinned
-+ * A53 (cpu 0) and A73 (cpu 6) for 100 ms instead.
++ * A53 (cpu 0) and A73 (cpu 6) for 10 ms instead.
   */
  #include <pexpert/arm64/board_config.h>
  
@@ -74,7 +74,7 @@ index dcfe453..d89d06f 100644
 +#define A8A_FVP_PATH            "/private/var/root/a8-acpm-fvp.fw"
 +#define A8A_CPU_LITTLE          0               /* A53 */
 +#define A8A_CPU_BIG             6               /* A73; logical CPUs 6-7 */
-+#define A8A_MEASURE_MS          100u
++#define A8A_MEASURE_MS          10u
 +
 +static void a8a_watch_thread(void *arg, wait_result_t wr);
 +static void a8a_dvfs_set(uint32_t d, uint32_t khz);
@@ -466,7 +466,7 @@ index dcfe453..d89d06f 100644
 + * dvfs table [DOMAIN]      the firmware's frequency/voltage table
   * dvfs DOMAIN KHZ          ask for a rate: big | little | g3d (a8dvfs=1)
   * dvfs boot                every raised domain back to its boot rate
-+ * dvfs measure             PMCCNTR_EL0 on cpu0 (A53) and cpu6 (A73) for 100 ms
++ * dvfs measure             PMCCNTR_EL0 on cpu0 (A53) and cpu6 (A73) for 10 ms
   */
  void
  a8_dvfs_command(const char *args)
