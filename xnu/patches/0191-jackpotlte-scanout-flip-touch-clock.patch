@@ -1,0 +1,433 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index c3113f8..0e1598c 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1017,7 +1017,29 @@ dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+ #define JTTS_IICSTAT_START	0x20u	/* also BUSBUSY when read */
+ #define JTTS_IICSTAT_LASTBIT	0x01u	/* 0 = ACK, 1 = NACK */
+ #define JTTS_IICSTAT_TXRXEN	0x10u	/* cleared to release a stuck bus */
+-#define JTTS_IICCON_INIT	0xe3u	/* ACKEN|TXDIV_512|IRQEN|scale 3 */
++#define JTTS_IICCON_SLOW	0xe3u	/* ACKEN|TXDIV_512|IRQEN|scale 3 */
++/*
++ * 0191: the bus clock.  0xe3 measured ~27 kHz on the phone ("i2c4 8-byte read
++ * took 3663 us"), so PCLK is about 55 MHz and every touch event cost ~3.7 ms
++ * of busy-waiting.  Default 0xe0 (scale 0: PCLK/512, about 110 kHz, still
++ * standard mode); boot-arg a8tsiiccon=0xNN picks another value (0xaf =
++ * TXDIV_16 scale 15, about 215 kHz).  32 failed reads in a row go back to
++ * 0xe3, like the repeated START does.
++ */
++static uint32_t jtts_iiccon = 0;
++
++static uint32_t
++jtts_iiccon_value(void)
++{
++	if (jtts_iiccon == 0) {
++		uint32_t value = 0xe0u;
++		(void)PE_parse_boot_argn("a8tsiiccon", &value, sizeof(value));
++		/* ACK, interrupt enable and pending-clear stay as the driver needs */
++		jtts_iiccon = (value & 0x4fu) | 0xa0u;
++	}
++	return jtts_iiccon;
++}
++#define JTTS_IICCON_INIT	jtts_iiccon_value()
+ #define JTTS_IICLC_VALUE	0x7u	/* SDA delay, samsung,i2c-sda-delay */
+ 
+ /* sec_ts register map: Eureka
+@@ -1494,6 +1516,11 @@ jtts_read_retry(uint8_t reg, uint8_t *data, unsigned count)
+ 			jtts_restart_new = 0;
+ 			printf("A8 TOUCH: 32 reads failed in a row with the new repeated START; "
+ 			    "back to the old order\n");
++		} else if (jtts_fail_run == 64u && jtts_iiccon != JTTS_IICCON_SLOW) {
++			/* And then the old, slow clock. */
++			printf("A8 TOUCH: still failing at IICCON %#x; back to %#x\n",
++			    jtts_iiccon, JTTS_IICCON_SLOW);
++			jtts_iiccon = JTTS_IICCON_SLOW;
+ 		}
+ 	}
+ 	jt_ts_lost++;
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 32c2cd9..bf9bc85 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1598,6 +1598,7 @@ extern void a8f_data(const char *b64);
+ extern void a8f_end(void);
+ extern void a8f_ls(const char *args);
+ extern void a8f_date(const char *args);
++extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
+ 
+ static void
+ a8s_command(const char *line)
+@@ -1619,7 +1620,7 @@ a8s_command(const char *line)
+ 		    "reboot [recovery|download]\n");
+ 		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | "
+ 		    "fput PATH SIZE CRC32 [MODE UID GID], fd BASE64..., fend "
+-		    "(only under /private/var/) | date [SECONDS]\n");
++		    "(only under /private/var/) | date [SECONDS] | flip [0|1]\n");
+ 		printf("A8SH: X Y are panel pixels (1080x2220, as in shot x SCALE); "
+ 		    "numbers after tap/swipe/key/shot are decimal, peek/poke hex\n");
+ 	} else if (a8s_word(line, "ping", &rest)) {
+@@ -1797,6 +1798,12 @@ a8s_command(const char *line)
+ 		a8f_end();
+ 	} else if (a8s_word(line, "fls", &rest)) {
+ 		a8f_ls(rest);
++	} else if (a8s_word(line, "flip", &rest)) {
++		while (*rest == ' ') {
++			rest++;
++		}
++		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : -1;
++		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
+ 	} else if (a8s_word(line, "date", &rest)) {
+ 		while (*rest == ' ') {
+ 			rest++;
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+index cca74f3..dcbb4c6 100644
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -313,8 +313,11 @@ JackpotlteMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	/* Bring-up aid: a create-BO that lands here is the last thing Mesa did
+ 	 * before the GPU address space is walked, so its presence or absence in
+ 	 * the log says whether a later failure is inside this request. */
+-	IOLog("JackpotlteMali: buffer %u: %llu bytes at %#llx\n",
+-	    request->handle, size, b->address);
++	static uint32_t jm_buffers_logged;     /* 0191: one line a texture was ~100 lines a minute */
++	if (jm_buffers_logged++ < 64 || (jm_buffers_logged & 1023) == 0) {
++		IOLog("JackpotlteMali: buffer %u: %llu bytes at %#llx\n",
++		    request->handle, size, b->address);
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -447,7 +450,10 @@ JackpotlteMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * option
+ 	 * is that handle, so this says whether the request arrived and whether
+ 	 * the buffer was still there -- a "not found" here and "ok" everywhere
+ 	 * else puts the failure on the userspace side of the mapping. */
+-	IOLog("JackpotlteMali: map %u: %s\n", type, b != NULL ? "ok" : "not found");
++	static uint32_t jm_maps_logged;
++	if (b == NULL || jm_maps_logged++ < 64 || (jm_maps_logged & 1023) == 0) {
++		IOLog("JackpotlteMali: map %u: %s\n", type, b != NULL ? "ok" : "not found");
++	}
+ 	return ret;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1ea5b6b..387324f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,8 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <pexpert/arm64/board_config.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <libkern/OSAtomic.h>
++#include <string.h>
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c */
+ #endif
+@@ -385,6 +387,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		/* Fade out: halve every channel each vsync, then black (step 6),
+ 		 * then idle; a5fb_offdim stops it after that many steps. */
+ 		uint32_t step = fb->fFadeStep;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++		if (step == 0 && a8_idma != 0 && a8_shown_addr != (uint32_t)fb->fPhys) {
++			/* The fade works on the panel memory: show it, with the
++			 * picture that was on the second buffer. */
++			IOLockUnlock(fb->fLock);
++			IOLockLock(fb->fPresentLock);
++			a8_scan_to_panel(fb, true);
++			IOLockUnlock(fb->fPresentLock);
++			IOLockLock(fb->fLock);
++		}
++#endif
+ 		bool fade = step <= 6 && step < sweet_fb_off_dim;
+ 		if (fade) {
+ 			fb->fFadeStep = step + 1;
+@@ -475,6 +488,187 @@ sweet_fb_wait_frame_done(void)
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++/*
++ * 0191: scan-out flip instead of a CPU copy a frame (boot-arg a8flip,
++ * default 1; console "flip 0|1").
++ *
++ * Every swap of CoreAnimation's second render target used to be memcpy'd
++ * into the panel memory: 9.6 MB a frame, in backboardd's SwapEnd.  The
++ * DT's reserved framebuffer@0xEC000000 is 20 MiB, enough for two
++ * 1080x2220 buffers, so backboardd's panel-sized BGRA render target (the
++ * one that is not the panel memory itself) gets the second half of it
++ * (sweet_fb_scanout_claim, from SweetSurface's create), and a swap just
++ * points DPP0's IDMA at whichever buffer was presented.  Registers, read
++ * live over the USB console on 2026-11-22 and moved by hand while the user
++ * watched the picture jump: IDMA G0 at 0x148b1000 (+0x10 SRC_SIZE =
++ * height << 16 | full width in pixels, +0x40 IN_BASE_ADDR_Y8 = 0xec000000),
++ * DECON_F 0x14860000 +0x60 SHADOW_REG_UPDATE_REQ (bit 31 global, bit 3 =
++ * window 3, the DT's default_win; the bit clears when the next frame takes
++ * the new values).  The swap waits for that, at most 20 ms: CoreAnimation
++ * draws its next frame into the buffer that is no longer shown.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" IOMemoryDescriptor *sweet_fb_scanout_claim(SweetSurface *s);
++extern "C" void sweet_fb_scanout_release(SweetSurface *s);
++extern "C" int sweet_fb_flip_set(int on);
++
++#define A8_FB_RESERVED          0x1400000ull    /* reserved-memory framebuffer@0xEC000000 */
++#define A8_IDMA0                0x148b1000ul
++#define A8_IDMA_SRC_SIZE        0x10u
++#define A8_IDMA_ADDR_Y8         0x40u
++#define A8_DECON                0x14860000ul
++#define A8_DECON_SHADOW_REQ     0x60u
++#define A8_DECON_UPDATE         0x80000008u
++
++static int           a8_flip = -1;              /* -1: boot-arg not read yet */
++static vm_offset_t   a8_idma, a8_decon;
++static SweetSurface *volatile a8_scan_owner;    /* weak: cleared by its free() */
++static uint64_t      a8_scan_phys;
++static uint32_t      a8_shown_addr, a8_shown_width;
++static uint64_t      a8_flips, a8_flip_late;
++
++static bool
++a8_flip_on(void)
++{
++	if (a8_flip < 0) {
++		int on = 1;
++		PE_parse_boot_argn("a8flip", &on, sizeof(on));
++		a8_flip = on != 0;
++	}
++	return a8_flip > 0;
++}
++
++/* Show a buffer: physical address and full width in pixels.  Waits for the
++ * frame that takes it when wait is true. */
++static void
++a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
++{
++	if (a8_idma == 0) {
++		a8_idma = ml_io_map(A8_IDMA0, 0x1000);
++		a8_decon = ml_io_map(A8_DECON, 0x1000);
++		if (a8_idma == 0 || a8_decon == 0) {
++			a8_flip = 0;
++			return;
++		}
++		a8_shown_addr = *(volatile uint32_t *)(a8_idma + A8_IDMA_ADDR_Y8);
++		a8_shown_width = *(volatile uint32_t *)(a8_idma + A8_IDMA_SRC_SIZE) & 0xffffu;
++	}
++	if (addr == a8_shown_addr && width == a8_shown_width) {
++		return;
++	}
++	*(volatile uint32_t *)(a8_idma + A8_IDMA_SRC_SIZE) = (fb->fHeight << 16) | width;
++	*(volatile uint32_t *)(a8_idma + A8_IDMA_ADDR_Y8) = addr;
++	*(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) = A8_DECON_UPDATE;
++	a8_shown_addr = addr;
++	a8_shown_width = width;
++	a8_flips++;
++	if (wait) {
++		int i;
++		for (i = 0; i < 200 && *(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) != 0; i++) {
++			IODelay(100);
++		}
++		if (i == 200 && a8_flip_late++ < 8) {
++			IOLog("A8 FLIP: the display took no update in 20 ms (flip %llu)\n", a8_flips);
++		}
++	}
++	if (a8_flips <= 4 || (a8_flips & 1023) == 0) {
++		IOLog("A8 FLIP: %llu: showing 0x%08x, %u pixels a row\n", a8_flips, addr, width);
++	}
++}
++
++/* Back to the panel memory; copy the second buffer's picture there first
++ * when asked (display going dim, flipping turned off). */
++static void
++a8_scan_to_panel(AppleCLCD *fb, bool copy)
++{
++	SweetSurface *s = a8_scan_owner;
++
++	if (a8_idma == 0 || a8_shown_addr == (uint32_t)fb->fPhys) {
++		return;
++	}
++	if (copy && s != NULL) {
++		uintptr_t src = s->kernelAddress();
++		for (uint32_t y = 0; src != 0 && y < fb->fHeight; y++) {
++			memcpy((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes),
++			    (const void *)(src + (uint64_t)y * s->bytesPerRow), (size_t)fb->fWidth * 4);
++		}
++	}
++	a8_scan_show(fb, (uint32_t)fb->fPhys, fb->fRowBytes / 4, false);
++}
++
++extern "C" IOMemoryDescriptor *
++sweet_fb_scanout_claim(SweetSurface *s)
++{
++	AppleCLCD *fb = sweet_fb_main;
++	char name[32];
++
++	if (fb == NULL || !a8_flip_on() || s->width != fb->fWidth || s->height != fb->fHeight ||
++	    s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->bytesPerElement != 4 || s->planeCount != 0 ||
++	    s->offset != 0 || s->bytesPerRow < fb->fWidth * 4 || (s->bytesPerRow & 63) != 0) {
++		return NULL;
++	}
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "backboardd") != 0) {
++		return NULL;
++	}
++	uint64_t slot = ((uint64_t)fb->fRowBytes * fb->fHeight + 0xffffull) & ~0xffffull;
++	if (slot + s->allocSize > A8_FB_RESERVED) {
++		return NULL;
++	}
++	if (!OSCompareAndSwapPtr(NULL, s, (void * volatile *)&a8_scan_owner)) {
++		return NULL;
++	}
++	a8_scan_phys = fb->fPhys + slot;
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(a8_scan_phys, s->allocSize,
++	    kIODirectionInOut);
++	if (md == NULL) {
++		a8_scan_owner = NULL;
++		return NULL;
++	}
++	IOLog("A8 FLIP: backboardd's %ux%u render target lives at 0x%llx (%u bytes, %u a row)\n",
++	    s->width, s->height, a8_scan_phys, s->allocSize, s->bytesPerRow);
++	return md;
++}
++
++extern "C" void
++sweet_fb_scanout_release(SweetSurface *s)
++{
++	AppleCLCD *fb = sweet_fb_main;
++
++	if (s == NULL || a8_scan_owner != s) {
++		return;
++	}
++	if (fb != NULL && a8_idma != 0 && a8_shown_addr == (uint32_t)a8_scan_phys) {
++		a8_scan_show(fb, (uint32_t)fb->fPhys, fb->fRowBytes / 4, false);
++	}
++	a8_scan_owner = NULL;
++	IOLog("A8 FLIP: the second buffer is free again (%llu flips)\n", a8_flips);
++}
++
++/* Console "flip 0|1" (bsd/dev/a5xelte_usb.c); -1 only reports. */
++extern "C" int
++sweet_fb_flip_set(int on)
++{
++	AppleCLCD *fb = sweet_fb_main;
++
++	if (on >= 0) {
++		(void)a8_flip_on();
++		if (fb != NULL) {
++			IOLockLock(fb->fPresentLock);
++			if (!on) {
++				a8_scan_to_panel(fb, true);
++			}
++			a8_flip = on != 0;
++			IOLockUnlock(fb->fPresentLock);
++		}
++	}
++	IOLog("A8 FLIP: %s, %llu flips, %llu late, second buffer %s\n", a8_flip_on() ? "on" : "off",
++	    a8_flips, a8_flip_late, a8_scan_owner != NULL ? "in use" : "free");
++	return a8_flip_on();
++}
++#endif
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -549,6 +743,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++		if (s != NULL && s == fSurface && a8_flip_on()) {
++			a8_scan_show(this, (uint32_t)fPhys, fRowBytes / 4, true);
++		}
++#endif
+ 		if (s == NULL || s == fSurface) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+@@ -590,6 +789,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++		if (s == a8_scan_owner && a8_flip_on() && !fPowerOff && sx == 0 && sy == 0 &&
++		    dx == 0 && dy == 0 && w == (int32_t)fWidth && h == (int32_t)fHeight) {
++			a8_scan_show(this, (uint32_t)a8_scan_phys, s->bytesPerRow / 4, true);
++			s->release();
++			continue;
++		}
++#endif
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+@@ -841,6 +1048,13 @@ sweet_fb_snapshot(const uint8_t **pixels, uint32_t *width, uint32_t *height, uin
+ 	*width = fb->fWidth;
+ 	*height = fb->fHeight;
+ 	*rowbytes = fb->fRowBytes;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	SweetSurface *s = a8_scan_owner;
++	if (s != NULL && a8_idma != 0 && a8_shown_addr == (uint32_t)a8_scan_phys && s->kernelAddress() != 0) {
++		*pixels = (const uint8_t *)s->kernelAddress();
++		*rowbytes = s->bytesPerRow;
++	}
++#endif
+ 	return 0;
+ }
+ #endif /* SWEET || A5XELTE */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 6d7ee30..bde2426 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -91,11 +91,19 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ static uint64_t      sweet_surface_client_wired;        /* clients' own pages held */
+ #define SWEET_SURFACE_CLIENT_MAX        (512ull << 20)
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++extern "C" IOMemoryDescriptor *sweet_fb_scanout_claim(SweetSurface *s);    /* SweetFramebuffer.cpp */
++extern "C" void sweet_fb_scanout_release(SweetSurface *s);
++#endif
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+ SweetSurface::free()
+ {
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	sweet_fb_scanout_release(this);
++#endif
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -389,6 +397,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+  */
+ static int sweet_surface_wrap_on = -1;
+ 
++
+ static IOReturn
+ sweet_surface_take_client(SweetSurface *s, task_t task, uint64_t at, uint64_t need,
+     bool *wrapped)
+@@ -914,6 +923,19 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		}
+ 	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++		/* backboardd's second panel-sized render target: the second
++		 * scan-out buffer, shown by moving the display's DMA instead of
++		 * a copy a frame (SweetFramebuffer.cpp, 0191). */
++		IOMemoryDescriptor *scan = sweet_fb_scanout_claim(s);
++		if (scan != NULL) {
++			s->memory = scan;
++			s->mapCache = kIOMapWriteCombineCache;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		} else {
++#endif
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+@@ -930,6 +952,9 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				ret = kIOReturnNoResources;
+ 			}
+ 		}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++		}
++#endif
+ 	}
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+ 		char name[32];
