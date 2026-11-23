@@ -269,10 +269,10 @@ index 985331f..32c2cd9 100644
  }
 diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
 new file mode 100644
-index 0000000..f182936
+index 0000000..7f8bc72
 --- /dev/null
 +++ b/bsd/dev/a8_files.c
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,557 @@
 +/*
 + * A8 2018: files and the clock from the USB console's kernel shell
 + * (a5xelte_usb.c, a8usbmode=1), so a setting on the iOS data volume can be
@@ -358,6 +358,20 @@ index 0000000..f182936
 +		return 63;
 +	}
 +	return -1;
++}
++
++/* Whether s contains sub (the kernel has no strstr). */
++static bool
++a8f_has(const char *s, const char *sub)
++{
++	size_t n = strlen(sub);
++
++	for (; *s; s++) {
++		if (strncmp(s, sub, n) == 0) {
++			return true;
++		}
++	}
++	return false;
 +}
 +
 +/* Next space-separated word of *p into out (bounded); false when none. */
@@ -540,7 +554,7 @@ index 0000000..f182936
 +	}
 +	/* The data volume only, and no way out of it. */
 +	if (strncmp(a8f_put_state.path, "/private/var/", 13) != 0 ||
-+	    strstr(a8f_put_state.path, "/../") != NULL || strstr(a8f_put_state.path, "/./") != NULL) {
++	    a8f_has(a8f_put_state.path, "/../") || a8f_has(a8f_put_state.path, "/./")) {
 +		printf("A8F PUT error: only files under /private/var/ (no . or ..): %s\n",
 +		    a8f_put_state.path);
 +		a8f_put_reset();
