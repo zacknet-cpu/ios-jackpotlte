@@ -1,0 +1,1422 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index adbcbb0..e90e75a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/jackpotlte_mali.c		standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a8_files.c			standard
+ bsd/dev/a8_acpm.c			standard
++bsd/dev/a8_slots.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
+ bsd/dev/a5xelte_bt.c			standard
+ bsd/dev/a5xelte_sensors.c		standard
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+index 46aea6e..277b688 100644
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -77,6 +77,10 @@ static dev_t emmc_bdev;
+ static bool emmc_ready;
+ static bool emmc_writable;
+ static uint64_t emmc_log_first_lba, emmc_log_nsectors;
++/* The BOOT partition, for the two-slot kernel updates (a8_slots.c). Written
++ * only inside a8_boot_io() while emmc_boot_writing is set. */
++static uint64_t emmc_boot_first_lba, emmc_boot_nsectors;
++static bool emmc_boot_writing;
+ static bool emmc_log_enabled;
+ static char emmc_log_ring[A5_LOG_SIZE];
+ static uint64_t _Atomic emmc_log_total;
+@@ -214,7 +218,10 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ 	    address - emmc_first_lba < emmc_nsectors;
+ 	bool log_write = emmc_log_enabled && address >= emmc_log_first_lba &&
+ 	    address - emmc_log_first_lba < A5_LOG_SECTORS;
+-	if (!root_write && !log_write) {
++	bool boot_write = emmc_boot_writing && emmc_boot_nsectors &&
++	    address >= emmc_boot_first_lba &&
++	    address - emmc_boot_first_lba < emmc_boot_nsectors;
++	if (!root_write && !log_write && !boot_write) {
+ 		return EROFS;
+ 	}
+ 	if (width > 2 || ver == 0 || ver == 0xffff ||
+@@ -622,7 +629,10 @@ emmc_multi_chunk(uint32_t lba, uint32_t nsect, uint8_t *buf, bool write)
+ 		    address + nsect <= emmc_first_lba + emmc_nsectors;
+ 		bool log = emmc_log_enabled && address >= emmc_log_first_lba &&
+ 		    address + nsect <= emmc_log_first_lba + A5_LOG_SECTORS;
+-		if (!root && !log) {
++		bool boot = emmc_boot_writing && emmc_boot_nsectors &&
++		    address >= emmc_boot_first_lba &&
++		    address + nsect <= emmc_boot_first_lba + emmc_boot_nsectors;
++		if (!root && !log && !boot) {
+ 			return EROFS;
+ 		}
+ 	}
+@@ -869,6 +879,8 @@ emmc_find_root_partition(void)
+ 	emmc_nsectors = 0;
+ 	emmc_log_first_lba = 0;
+ 	emmc_log_nsectors = 0;
++	emmc_boot_first_lba = 0;
++	emmc_boot_nsectors = 0;
+ 	int error = emmc_read_sector(1, hdr);
+ 	if (error) {
+ 		return error;
+@@ -908,7 +920,9 @@ emmc_find_root_partition(void)
+ 			const uint8_t *p = entry + j * 128;
+ 			bool match = true;
+ 			bool system_match = true;
++			bool boot_match = true;
+ 			static const char system_name[] = "SYSTEM";
++			static const char boot_name[] = "BOOT";
+ 			for (unsigned k = 0; k <= strlen(emmc_partition_name); k++) {
+ 				if (p[56 + k * 2] != (uint8_t)emmc_partition_name[k] ||
+ 				    p[57 + k * 2] != 0) {
+@@ -923,6 +937,21 @@ emmc_find_root_partition(void)
+ 					break;
+ 				}
+ 			}
++			for (unsigned k = 0; k < sizeof(boot_name); k++) {
++				if (p[56 + k * 2] != (uint8_t)boot_name[k] ||
++				    p[57 + k * 2] != 0) {
++					boot_match = false;
++					break;
++				}
++			}
++			if (boot_match) {
++				uint64_t first = emmc_le64(p + 32);
++				uint64_t last = emmc_le64(p + 40);
++				if (first >= first_usable && last <= last_usable && first <= last) {
++					emmc_boot_first_lba = first;
++					emmc_boot_nsectors = last - first + 1;
++				}
++			}
+ 			if (match || system_match) {
+ 				uint64_t first = emmc_le64(p + 32);
+ 				uint64_t last = emmc_le64(p + 40);
+@@ -959,6 +988,10 @@ emmc_find_root_partition(void)
+ 	printf("A5XELTE eMMC: GPT %s first=%llu sectors=%llu %s\n",
+ 	    emmc_partition_name, emmc_first_lba, emmc_nsectors,
+ 	    emmc_writable ? "writable" : "read-only");
++	if (emmc_boot_nsectors) {
++		printf("A5XELTE eMMC: GPT BOOT first=%llu sectors=%llu\n",
++		    emmc_boot_first_lba, emmc_boot_nsectors);
++	}
+ 	return 0;
+ }
+ 
+@@ -1305,6 +1338,53 @@ emmc_log_start(void)
+ 	}
+ }
+ 
++/*
++ * Read or write whole sectors of the BOOT partition (a8_slots.c). off and len
++ * are bytes from the start of BOOT, both multiples of 512. Writes are allowed
++ * only here, only inside BOOT, and only while this call runs.
++ */
++int a8_boot_io(uint64_t off, void *buf, uint32_t len, bool write);
++uint64_t a8_boot_size(void);
++
++uint64_t
++a8_boot_size(void)
++{
++	return emmc_ready ? emmc_boot_nsectors * 512u : 0;
++}
++
++int
++a8_boot_io(uint64_t off, void *buf, uint32_t len, bool write)
++{
++	uint64_t size = emmc_boot_nsectors * 512u;
++	uint8_t *p = buf;
++	int error = 0;
++
++	if (!emmc_ready || !emmc_boot_nsectors) {
++		return ENXIO;
++	}
++	if ((off & 511u) || (len & 511u) || off > size || len > size - off) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&a5xelte_emmc_lock);
++	emmc_boot_writing = write;
++	for (uint32_t n = 0; n < len && !error;) {
++		uint32_t lba = (uint32_t)(emmc_boot_first_lba + (off + n) / 512u);
++		uint32_t nsect = MIN((len - n) / 512u, EMMC_MULTI_MAX);
++
++		if (nsect >= 2 && (emmc_multi & (write ? EMMC_MULTI_WRITE : EMMC_MULTI_READ)) &&
++		    !emmc_multi_chunk(lba, nsect, p + n, write)) {
++			n += nsect * 512u;
++			continue;
++		}
++		error = write ? emmc_write_sector(lba, p + n) : emmc_read_sector(lba, p + n);
++		n += 512u;
++	}
++	emmc_boot_writing = false;
++	emmc_stats_tick();
++	lck_mtx_unlock(&a5xelte_emmc_lock);
++	return error;
++}
++
+ int
+ a5xelte_emmc_rootdev(dev_t *dev)
+ {
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 2f698a2..5521cc0 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -51,6 +51,15 @@
+ #include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* a8_slots.c: the two kernel slots in BOOT (Phase 2) */
++extern void a8b_init(void);
++extern void a8b_slots(void);
++extern void a8b_put(const char *args);
++extern void a8b_data(const char *b64);
++extern void a8b_end(void);
++extern int a8b_tryb(void);
++extern void a8b_tryok(void);
++extern void a8b_promote(void);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void a5xelte_usb_probe(void);
+ static void a8_usb_gadget_start(vm_offset_t dwc, vm_offset_t phy);
+@@ -406,6 +415,7 @@ a5xelte_usb_probe(void)
+ 	int enabled = 1;
+ 	uint32_t statsecs = 0;
+ 
++	a8b_init();             /* a8_slots.c: what booted, watchdog, last panic */
+ 	PE_parse_boot_argn("a8top", &a8_top_on, sizeof(a8_top_on));
+ 	if (PE_parse_boot_argn("a8stat", &statsecs, sizeof(statsecs)) && statsecs > 0) {
+ 		thread_t st;
+@@ -641,9 +651,17 @@ static struct {
+  * slot, as before, dropped every line that came while a command ran -- which
+  * is all of an fput's data.  The RX side only adds, the shell only takes.
+  */
+-#define A8S_QUEUE       32
++#define A8S_QUEUE       256
+ static char a8s_queue[A8S_QUEUE][256];
+ static volatile uint32_t a8s_qhead, a8s_qtail, a8s_qdropped;
++/*
++ * Flow control (0194): the next OUT transfer (up to A8G_RX_MAX bytes, a dozen
++ * or so data lines) is only armed while the queue has room for it, so a host
++ * that sends faster than the shell runs is held off by the USB NAKs instead
++ * of losing lines. a8g_thread re-arms when the shell has caught up.
++ */
++#define A8S_RX_ROOM     32
++static bool a8s_rx_held;
+ 
+ static inline void
+ a8_dwc_wr(uint32_t off, uint32_t v)
+@@ -854,6 +872,7 @@ a8g_string(unsigned idx, uint8_t *out)
+ static void
+ a8g_rx_arm(void)
+ {
++	a8s_rx_held = false;
+ 	a8g_start_trb(A8G_EP_RX, A8G_TRB_RX, A8G_RX, A8G_RX_MAX, A8_TRBCTL_NORMAL);
+ }
+ 
+@@ -1396,7 +1415,11 @@ a8s_rx_done(void)
+ 			a8g.line[a8g.line_len++] = c;
+ 		}
+ 	}
+-	a8g_rx_arm();
++	if (A8S_QUEUE - (a8s_qhead - a8s_qtail) >= A8S_RX_ROOM) {
++		a8g_rx_arm();
++	} else {
++		a8s_rx_held = true;
++	}
+ }
+ 
+ /* Next piece of the console ring to the host, if the IN endpoint is idle. */
+@@ -1635,11 +1658,15 @@ a8s_command(const char *line)
+ 	const char *rest;
+ 	bool ok = true;
+ 
+-	/* fput's data lines are not echoed: they are most of the traffic. */
++	/* fput's and bput's data lines are not echoed: they are most of the traffic. */
+ 	if (a8s_word(line, "fd", &rest)) {
+ 		a8f_data(rest);
+ 		return;
+ 	}
++	if (a8s_word(line, "bd", &rest)) {
++		a8b_data(rest);
++		return;
++	}
+ 	printf("A8SH> %s\n", line);
+ 	if (a8s_word(line, "help", &rest)) {
+ 		printf("A8SH: help | ping | stat | top | ps | kill NAME|PID [SIG] | log (resend the ring) | "
+@@ -1657,6 +1684,9 @@ a8s_command(const char *line)
+ 		    "dvfs big|little|g3d KHZ | dvfs boot | tmu [on]\n");
+ 		printf("A8SH: looking: tee NAME,NAME|- (stderr and log of those programs, "
+ 		    "from their next start) | sample NAME|PID [N]\n");
++		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
++		    "(writes the slot that is not the default) | tryb (boot it once) | "
++		    "tryok | promote\n");
+ 	} else if (a8s_word(line, "ping", &rest)) {
+ 		printf("A8SH: pong\n");
+ 	} else if (a8s_word(line, "stat", &rest)) {
+@@ -1937,6 +1967,20 @@ a8s_command(const char *line)
+ 				}
+ 			}
+ 		}
++	} else if (a8s_word(line, "slots", &rest)) {
++		a8b_slots();
++	} else if (a8s_word(line, "bput", &rest)) {
++		a8b_put(rest);
++	} else if (a8s_word(line, "bend", &rest)) {
++		a8b_end();
++	} else if (a8s_word(line, "tryb", &rest)) {
++		if (a8b_tryb() == 0) {
++			a8s_reboot(A8S_REASON_NONE, "a slot try");
++		}
++	} else if (a8s_word(line, "tryok", &rest)) {
++		a8b_tryok();
++	} else if (a8s_word(line, "promote", &rest)) {
++		a8b_promote();
+ 	} else if (a8s_word(line, "reboot", &rest)) {
+ 		while (*rest == ' ') {
+ 			rest++;
+@@ -1993,6 +2037,7 @@ a8g_event(uint32_t ev)
+ 			a8g.configured = false;
+ 			a8g.host_open = false;
+ 			a8g.tx_busy = false;
++			a8s_rx_held = false;
+ 			mtp_open = false;
+ 			if (a8g_resets++ < 20) {
+ 				printf("A5XELTE USB: bus reset\n");
+@@ -2093,6 +2138,10 @@ a8g_thread(void *arg __unused, wait_result_t wr __unused)
+ 			a8_dwc_wr(A8_GEVNTCOUNT, count);
+ 		}
+ 		if (a8g.serial) {
++			if (a8s_rx_held && a8g.configured &&
++			    A8S_QUEUE - (a8s_qhead - a8s_qtail) >= A8S_RX_ROOM) {
++				a8g_rx_arm();
++			}
+ 			a8s_pump();
+ 		}
+ 		if ((++ticks % 60000) == 0 && a8g.events == 0) {
+diff --git a/bsd/dev/a8_slots.c b/bsd/dev/a8_slots.c
+new file mode 100644
+index 0000000..caf6629
+--- /dev/null
++++ b/bsd/dev/a8_slots.c
+@@ -0,0 +1,1097 @@
++/*
++ * A8 2018: two kernel slots in BOOT (Phase 2), driven from the USB console's
++ * kernel shell (a5xelte_usb.c, a8usbmode=1).
++ *
++ * BOOT holds a "SWEETSLT" container (tools/jackpotlte/mkslots.py) in place of
++ * one kernel payload. The boot shim (shim/jackpotlte/loader.c) boots the good
++ * slot with the highest generation (the default), or the other slot once when
++ * the RAM page below asks for it. This file writes the other slot, asks for
++ * one try of it, and promotes it after the PC has scored the try.
++ *
++ *   slots                     both slots, the default, what booted and why
++ *   bput SIZE SHA256          then  bd BASE64 ... (repeated)  then  bend
++ *       SIZE and SHA256 are of a slot image ("mkslots.py blob"): a 128-byte
++ *       record and the compressed payload. Written only to the slot that is
++ *       NOT the default, read back and compared, then its record is written.
++ *   tryb                      boot the other slot once (reboots now)
++ *   tryok                     on the try boot: the try counts as good
++ *   promote                   on the try boot: make that slot the default
++ *
++ * Limits the PC cannot lift: never the default slot; at most 4 tries in any
++ * hour (calendar time, so "date" must have been set); none after two tries
++ * in a row that did not come back, until a force restart (a person at the
++ * phone); promote only from the try boot itself and after 120 s of uptime.
++ *
++ * RAM page 0xed3ff000 (last page of the 20 MiB framebuffer reservation,
++ * outside XNU RAM; it survives a warm reset):
++ *   +0x000 try request (written here, read and wiped by the loader)
++ *   +0x100 boot record (written by the loader)
++ *   +0x200 this file's state across reboots (tries, failures)
++ *   +0x400 the first panic message of the previous boot
++ *
++ * Watchdog (watchdog@10060000, reset masked by the PMU until armed): the
++ * loader arms it for a try boot (about 80 s); this file pets it every 5 s.
++ * On other two-slot boots it arms it for 60 s (a8wdt=SECONDS to change,
++ * a8wdt=0 for off); a single-kernel image only with a8wdt. A panic stops the
++ * petting, so the phone resets by itself and the loader picks the default.
++ * After two watchdog resets in a row it is not armed again (the panic stays
++ * on the screen for a person to see).
++ */
++#include <pexpert/arm64/board_config.h>
++#include <pexpert/pexpert.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/debug.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++#include <stdarg.h>
++#include <string.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t,
++    thread_t *);
++int a8_boot_io(uint64_t off, void *buf, uint32_t len, bool write);    /* a5xelte_emmc.c */
++uint64_t a8_boot_size(void);
++
++void a8b_init(void);
++void a8b_slots(void);
++void a8b_put(const char *args);
++void a8b_data(const char *b64);
++void a8b_end(void);
++int a8b_tryb(void);
++void a8b_tryok(void);
++void a8b_promote(void);
++void a8_slots_panic(const char *fmt, va_list *args);
++
++#define A8B_PAGE_PA     0xed3ff000ull
++#define A8B_FLAG        0x000u
++#define A8B_BOOT        0x100u
++#define A8B_STATE       0x200u
++#define A8B_PANIC       0x400u
++#define A8B_PANIC_MAX   (0x1000u - A8B_PANIC - 16u)
++
++#define TRY_MAGIC       0x52543841u     /* "A8TR", loader.c */
++#define BOOT_MAGIC      0x54423841u     /* "A8BT", loader.c */
++#define STATE_MAGIC     0x534b3841u     /* "A8KS" */
++#define PANIC_MAGIC     0x4e503841u     /* "A8PN" */
++
++#define WHY_DEFAULT     0u
++#define WHY_TRY         1u
++#define WHY_TRY_FAILED  2u
++#define WHY_OTHER_GOOD  3u
++
++#define A8B_WDT_PA      0x10060000ull
++#define WTCON           0x0u
++#define WTDAT           0x4u
++#define WTCNT           0x8u
++#define WTCON_ARMED     0xff39u         /* prescaler 256, /128, on, reset on */
++#define WDT_HZ          793u            /* 26 MHz / 256 / 128 */
++#define A8B_PMU_PA      0x11c80000ull
++#define PMU_RST_STAT    0x404u
++#define PMU_DISABLE_WDT 0x408u
++#define PMU_MASK_WDT    0x40cu
++#define PMU_WDT_BIT     (1u << 24)      /* A53 WDTRESET */
++#define RST_MANUAL      0x00010000u     /* a force restart: a person held the keys */
++#define A8B_WDT_PRI     95              /* MAXPRI_KERNEL */
++
++#define SLOT_HDR        4096u
++#define SLOT_REC(i)     (512u * (1u + (uint32_t)(i)))
++#define SLOT_MAX_C      (16u << 20)
++#define SLOT_MAX_U      (64u << 20)
++#define TRIES_PER_HOUR  4u
++#define PROMOTE_UPTIME  120u
++
++struct a8b_rec {
++	uint64_t off, cap, csize, usize;
++	uint32_t codec, crc_c, crc_u, gen;
++	uint8_t  sha[32];
++	char     name[32];
++	uint32_t good, rsv1, rsv2, crc;
++};
++_Static_assert(sizeof(struct a8b_rec) == 128, "slot record is 128 bytes");
++
++struct a8b_state {
++	uint32_t magic, version;
++	uint32_t seq;                   /* last try number */
++	uint32_t pending, pending_slot; /* a try not judged yet */
++	uint32_t fails;                 /* tries in a row that did not come back */
++	uint32_t wdt_row;               /* watchdog resets in a row */
++	uint32_t ntimes;
++	uint32_t times[8];              /* calendar seconds of the last tries */
++	uint32_t check;
++};
++
++static volatile uint8_t *a8b_page;
++static volatile uint32_t *a8b_wdt;
++static uint32_t a8b_wdt_count;
++static int a8b_sleep_chan;
++static uint32_t a8b_boot[12];
++static bool a8b_boot_valid;
++static bool a8b_panicked;
++
++/* ---- small helpers ---- */
++
++static uint32_t
++a8b_crc32(uint32_t crc, const uint8_t *p, size_t n)
++{
++	crc = ~crc;
++	while (n--) {
++		crc ^= *p++;
++		for (int k = 0; k < 8; k++) {
++			crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++		}
++	}
++	return ~crc;
++}
++
++/* SHA-256 (FIPS 180-4). The kernel's own needs the corecrypto kext. */
++struct a8b_sha {
++	uint32_t h[8];
++	uint64_t len;
++	uint8_t  buf[64];
++	uint32_t n;
++};
++
++static const uint32_t a8b_k[64] = {
++	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++};
++
++#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
++
++static void
++a8b_sha_block(struct a8b_sha *s, const uint8_t *p)
++{
++	uint32_t w[64], a, b, c, d, e, f, g, h;
++
++	for (int i = 0; i < 16; i++) {
++		w[i] = (uint32_t)p[i * 4] << 24 | (uint32_t)p[i * 4 + 1] << 16 |
++		    (uint32_t)p[i * 4 + 2] << 8 | p[i * 4 + 3];
++	}
++	for (int i = 16; i < 64; i++) {
++		uint32_t s0 = ROR(w[i - 15], 7) ^ ROR(w[i - 15], 18) ^ (w[i - 15] >> 3);
++		uint32_t s1 = ROR(w[i - 2], 17) ^ ROR(w[i - 2], 19) ^ (w[i - 2] >> 10);
++		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++	}
++	a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3];
++	e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
++	for (int i = 0; i < 64; i++) {
++		uint32_t t1 = h + (ROR(e, 6) ^ ROR(e, 11) ^ ROR(e, 25)) + ((e & f) ^ (~e & g)) +
++		    a8b_k[i] + w[i];
++		uint32_t t2 = (ROR(a, 2) ^ ROR(a, 13) ^ ROR(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
++		h = g; g = f; f = e; e = d + t1;
++		d = c; c = b; b = a; a = t1 + t2;
++	}
++	s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
++	s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
++}
++
++static void
++a8b_sha256(const uint8_t *p, size_t n, uint8_t out[32])
++{
++	static const uint32_t iv[8] = {
++		0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
++		0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
++	};
++	struct a8b_sha s;
++	uint64_t bits = (uint64_t)n * 8;
++
++	memcpy(s.h, iv, sizeof(iv));
++	for (; n >= 64; n -= 64, p += 64) {
++		a8b_sha_block(&s, p);
++	}
++	memset(s.buf, 0, sizeof(s.buf));
++	memcpy(s.buf, p, n);
++	s.buf[n] = 0x80;
++	if (n >= 56) {
++		a8b_sha_block(&s, s.buf);
++		memset(s.buf, 0, sizeof(s.buf));
++	}
++	for (int i = 0; i < 8; i++) {
++		s.buf[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	a8b_sha_block(&s, s.buf);
++	for (int i = 0; i < 8; i++) {
++		out[i * 4] = (uint8_t)(s.h[i] >> 24);
++		out[i * 4 + 1] = (uint8_t)(s.h[i] >> 16);
++		out[i * 4 + 2] = (uint8_t)(s.h[i] >> 8);
++		out[i * 4 + 3] = (uint8_t)s.h[i];
++	}
++}
++
++static void
++a8b_hex(const uint8_t *p, size_t n, char *out)
++{
++	static const char digits[] = "0123456789abcdef";
++	for (size_t i = 0; i < n; i++) {
++		out[i * 2] = digits[p[i] >> 4];
++		out[i * 2 + 1] = digits[p[i] & 15];
++	}
++	out[n * 2] = 0;
++}
++
++static uint32_t
++a8b_rd(volatile uint32_t *base, uint32_t off)
++{
++	return base[off / 4];
++}
++
++static void
++a8b_wr(volatile uint32_t *base, uint32_t off, uint32_t v)
++{
++	base[off / 4] = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static volatile uint32_t *
++a8b_words(uint32_t off)
++{
++	return (volatile uint32_t *)(a8b_page + off);
++}
++
++static uint32_t
++a8b_xor(volatile uint32_t *w, int n)
++{
++	uint32_t x = 0;
++	for (int i = 0; i < n; i++) {
++		x ^= w[i];
++	}
++	return x ^ 0xffffffffu;
++}
++
++static uint32_t
++a8b_now(void)
++{
++	clock_sec_t secs = 0;
++	clock_usec_t usecs = 0;
++	clock_get_calendar_microtime(&secs, &usecs);
++	return (uint32_t)secs;
++}
++
++static uint64_t
++a8b_uptime(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_SEC;
++}
++
++static void
++a8b_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a8b_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- state kept across reboots ---- */
++
++static struct a8b_state a8b_st;
++
++static void
++a8b_state_save(void)
++{
++	volatile uint32_t *w = a8b_words(A8B_STATE);
++	const uint32_t *src = (const uint32_t *)&a8b_st;
++	int n = (int)(sizeof(a8b_st) / 4);
++
++	a8b_st.check = 0;
++	for (int i = 0; i < n - 1; i++) {
++		w[i] = src[i];
++	}
++	w[n - 1] = a8b_xor(w, n - 1);
++	a8b_st.check = w[n - 1];
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++a8b_state_load(void)
++{
++	volatile uint32_t *w = a8b_words(A8B_STATE);
++	uint32_t *dst = (uint32_t *)&a8b_st;
++	int n = (int)(sizeof(a8b_st) / 4);
++
++	for (int i = 0; i < n; i++) {
++		dst[i] = w[i];
++	}
++	if (a8b_st.magic != STATE_MAGIC || a8b_st.version != 1 ||
++	    a8b_st.check != a8b_xor(w, n - 1)) {
++		memset(&a8b_st, 0, sizeof(a8b_st));
++		a8b_st.magic = STATE_MAGIC;
++		a8b_st.version = 1;
++		printf("A8 SLOTS: no saved state (cold start); starting fresh\n");
++	}
++}
++
++/* ---- the container in BOOT ---- */
++
++struct a8b_view {
++	uint64_t rd_off, rd_size;
++	struct a8b_rec rec[2];
++	bool ok[2];                     /* record CRC fine and not empty */
++	bool good[2];
++	int def;                        /* -1: none */
++	uint8_t hdr[512];
++};
++
++static const char *
++a8b_load(struct a8b_view *v)
++{
++	uint8_t *sec = kalloc_data(SLOT_HDR, Z_WAITOK | Z_ZERO);
++	const char *why = NULL;
++	uint32_t ksize, rsize, page, w[5], hcrc;
++
++	memset(v, 0, sizeof(*v));
++	v->def = -1;
++	if (sec == NULL) {
++		return "no memory";
++	}
++	if (a8_boot_size() == 0) {
++		why = "BOOT partition not found (eMMC not up?)";
++		goto out;
++	}
++	if (a8_boot_io(0, sec, 512, false) != 0 || memcmp(sec, "ANDROID!", 8) != 0) {
++		why = "BOOT has no Android boot header";
++		goto out;
++	}
++	memcpy(&ksize, sec + 8, 4);
++	memcpy(&rsize, sec + 16, 4);
++	memcpy(&page, sec + 36, 4);
++	if ((page != 2048 && page != 4096) || rsize < SLOT_HDR) {
++		why = "unexpected boot header (page size or ramdisk size)";
++		goto out;
++	}
++	v->rd_off = (uint64_t)page * (1 + ((uint64_t)ksize + page - 1) / page);
++	v->rd_size = rsize;
++	if (v->rd_off + v->rd_size > a8_boot_size()) {
++		why = "ramdisk runs past the end of BOOT";
++		goto out;
++	}
++	if (a8_boot_io(v->rd_off, sec, SLOT_HDR, false) != 0) {
++		why = "BOOT read failed";
++		goto out;
++	}
++	if (memcmp(sec, "SWEETSLT", 8) != 0) {
++		why = "BOOT holds one kernel, not two slots (flash a 0194+ image)";
++		goto out;
++	}
++	memcpy(w, sec + 8, sizeof(w));
++	memcpy(&hcrc, sec + 24, 4);
++	if (w[0] != 2 || w[1] != SLOT_HDR || w[2] != 2 || a8b_crc32(0, sec, 24) != hcrc) {
++		why = "bad container header";
++		goto out;
++	}
++	memcpy(v->hdr, sec, sizeof(v->hdr));
++	for (int i = 0; i < 2; i++) {
++		memcpy(&v->rec[i], sec + SLOT_REC(i), sizeof(v->rec[i]));
++		v->ok[i] = a8b_crc32(0, (const uint8_t *)&v->rec[i], 124) == v->rec[i].crc &&
++		    v->rec[i].csize != 0;
++		v->good[i] = v->ok[i] && v->rec[i].good == 1;
++		if (v->good[i] && (v->def < 0 || v->rec[i].gen > v->rec[v->def].gen)) {
++			v->def = i;
++		}
++	}
++	if (v->def < 0) {
++		why = "no good slot";
++	}
++out:
++	kfree_data(sec, SLOT_HDR);
++	return why;
++}
++
++/* Where slot i lives: both slots have the default's capacity, slot 0 right
++ * after the header and slot 1 after it (mkslots.py). */
++static bool
++a8b_place(const struct a8b_view *v, int i, uint64_t *off, uint64_t *cap)
++{
++	const struct a8b_rec *d = &v->rec[v->def];
++	*cap = d->cap;
++	*off = i == 0 ? SLOT_HDR : SLOT_HDR + d->cap;
++	if (d->off != (v->def == 0 ? SLOT_HDR : SLOT_HDR + d->cap) ||
++	    (d->cap & 4095u) || d->cap == 0 || *off + *cap > v->rd_size) {
++		return false;
++	}
++	if (v->ok[i] && (v->rec[i].off != *off || v->rec[i].cap != *cap)) {
++		return false;
++	}
++	return true;
++}
++
++static void
++a8b_print_rec(const struct a8b_view *v, int i)
++{
++	const struct a8b_rec *r = &v->rec[i];
++	char sha[17], name[33];
++
++	if (!v->ok[i]) {
++		bool zero = true;
++		for (size_t k = 0; k < sizeof(*r); k++) {
++			if (((const uint8_t *)r)[k] != 0) {
++				zero = false;
++			}
++		}
++		printf("A8 SLOTS: slot %d: %s\n", i, zero ? "empty (cleared)" :
++		    r->csize == 0 && a8b_crc32(0, (const uint8_t *)r, 124) == r->crc ?
++		    "empty" : "NO VALID RECORD");
++		return;
++	}
++	a8b_hex(r->sha, 8, sha);
++	memcpy(name, r->name, 32);
++	name[32] = 0;
++	printf("A8 SLOTS: slot %d: \"%s\" %s gen %u, %llu -> %llu bytes, sha256 %s.., "
++	    "crc %08x/%08x%s\n", i, name, r->good == 1 ? "good" : "untested", r->gen,
++	    r->csize, r->usize, sha, r->crc_c, r->crc_u, i == v->def ? " (default)" : "");
++}
++
++static const char *
++a8b_reason(uint32_t why)
++{
++	switch (why) {
++	case WHY_DEFAULT: return "default";
++	case WHY_TRY: return "try once";
++	case WHY_TRY_FAILED: return "try refused by the loader, default instead";
++	case WHY_OTHER_GOOD: return "default refused by the loader, other good slot";
++	default: return "?";
++	}
++}
++
++void
++a8b_slots(void)
++{
++	struct a8b_view v;
++	const char *why = a8b_load(&v);
++
++	if (a8b_boot_valid) {
++		printf("A8 SLOTS: this boot: slot %u (%s), try %u, loader %u ms, reset cause %08x, "
++		    "default %d\n", a8b_boot[2], a8b_reason(a8b_boot[3]), a8b_boot[4], a8b_boot[6],
++		    a8b_boot[5], (int)a8b_boot[7]);
++	} else {
++		printf("A8 SLOTS: this boot: no loader record (single-kernel image)\n");
++	}
++	printf("A8 SLOTS: tries: last %u, pending %u (slot %u), failed in a row %u, "
++	    "watchdog resets in a row %u, watchdog %s\n", a8b_st.seq, a8b_st.pending,
++	    a8b_st.pending_slot, a8b_st.fails, a8b_st.wdt_row,
++	    a8b_wdt_count ? "petted" : "off");
++	if (why != NULL && v.def < 0 && !v.ok[0] && !v.ok[1]) {
++		printf("A8 SLOTS: %s\n", why);
++		return;
++	}
++	a8b_print_rec(&v, 0);
++	a8b_print_rec(&v, 1);
++	if (why != NULL) {
++		printf("A8 SLOTS: %s\n", why);
++	}
++}
++
++/* ---- bput: write the slot that is not the default ---- */
++
++static struct {
++	uint8_t *buf;
++	uint32_t size, alloc, have;
++	uint8_t  sha[32];
++	bool     bad;
++	uint32_t quad;
++	int      quad_bits;
++} a8b_put_st;
++
++static void
++a8b_put_reset(void)
++{
++	if (a8b_put_st.buf != NULL) {
++		kfree_data(a8b_put_st.buf, a8b_put_st.alloc);
++	}
++	memset(&a8b_put_st, 0, sizeof(a8b_put_st));
++}
++
++static int
++a8b_hexval(char c)
++{
++	if (c >= '0' && c <= '9') {
++		return c - '0';
++	}
++	if (c >= 'a' && c <= 'f') {
++		return c - 'a' + 10;
++	}
++	if (c >= 'A' && c <= 'F') {
++		return c - 'A' + 10;
++	}
++	return -1;
++}
++
++void
++a8b_put(const char *args)
++{
++	uint64_t size = 0;
++	int k = 0;
++
++	a8b_put_reset();
++	while (*args == ' ') {
++		args++;
++	}
++	while (*args >= '0' && *args <= '9' && size <= SLOT_MAX_C + 128u) {
++		size = size * 10 + (uint64_t)(*args++ - '0');
++	}
++	while (*args == ' ') {
++		args++;
++	}
++	for (; k < 64 && a8b_hexval(args[k]) >= 0; k++) {
++		if (k & 1) {
++			a8b_put_st.sha[k / 2] |= (uint8_t)a8b_hexval(args[k]);
++		} else {
++			a8b_put_st.sha[k / 2] = (uint8_t)(a8b_hexval(args[k]) << 4);
++		}
++	}
++	if (k != 64 || size <= 128 || size > SLOT_MAX_C + 128u) {
++		printf("A8B PUT error: bput SIZE SHA256 (decimal size of a slot image, "
++		    "128 to %u bytes; 64 hex digits)\n", SLOT_MAX_C + 128u);
++		a8b_put_reset();
++		return;
++	}
++	/* Room to write whole sectors from the payload's start. */
++	a8b_put_st.alloc = (uint32_t)size + 1024u;
++	a8b_put_st.buf = kalloc_data(a8b_put_st.alloc, Z_WAITOK | Z_ZERO);
++	if (a8b_put_st.buf == NULL) {
++		printf("A8B PUT error: no memory for %llu bytes\n", size);
++		a8b_put_reset();
++		return;
++	}
++	a8b_put_st.size = (uint32_t)size;
++	printf("A8B PUT ready %u bytes\n", a8b_put_st.size);
++}
++
++static int
++a8b_b64(char c)
++{
++	if (c >= 'A' && c <= 'Z') {
++		return c - 'A';
++	}
++	if (c >= 'a' && c <= 'z') {
++		return c - 'a' + 26;
++	}
++	if (c >= '0' && c <= '9') {
++		return c - '0' + 52;
++	}
++	return c == '+' ? 62 : c == '/' ? 63 : -1;
++}
++
++void
++a8b_data(const char *b64)
++{
++	if (a8b_put_st.buf == NULL || a8b_put_st.bad) {
++		return;
++	}
++	for (const char *c = b64; *c; c++) {
++		int v;
++		if (*c == ' ' || *c == '=') {
++			continue;
++		}
++		v = a8b_b64(*c);
++		if (v < 0) {
++			a8b_put_st.bad = true;
++			printf("A8B PUT error: not base64 at '%c'\n", *c);
++			return;
++		}
++		a8b_put_st.quad = (a8b_put_st.quad << 6) | (uint32_t)v;
++		a8b_put_st.quad_bits += 6;
++		if (a8b_put_st.quad_bits >= 8) {
++			a8b_put_st.quad_bits -= 8;
++			if (a8b_put_st.have >= a8b_put_st.size) {
++				a8b_put_st.bad = true;
++				printf("A8B PUT error: more than %u bytes\n", a8b_put_st.size);
++				return;
++			}
++			a8b_put_st.buf[a8b_put_st.have++] = (uint8_t)(a8b_put_st.quad >> a8b_put_st.quad_bits);
++			if ((a8b_put_st.have & 0x7ffffu) == 0) {
++				printf("A8B PUT got %u of %u\n", a8b_put_st.have, a8b_put_st.size);
++			}
++		}
++	}
++}
++
++/* Write one record sector and read it back. */
++static int
++a8b_write_rec(const struct a8b_view *v, int i, const struct a8b_rec *r)
++{
++	uint8_t sec[512], back[512];
++	int error;
++
++	memset(sec, 0, sizeof(sec));
++	if (r != NULL) {
++		memcpy(sec, r, sizeof(*r));
++	}
++	error = a8_boot_io(v->rd_off + SLOT_REC(i), sec, 512, true);
++	if (!error) {
++		error = a8_boot_io(v->rd_off + SLOT_REC(i), back, 512, false);
++	}
++	if (!error && memcmp(sec, back, 512) != 0) {
++		error = EIO;
++	}
++	return error;
++}
++
++void
++a8b_end(void)
++{
++	struct a8b_view v;
++	struct a8b_rec r;
++	uint8_t sha[32], *back = NULL;
++	const uint8_t *data;
++	char hex[65];
++	const char *why;
++	uint64_t off = 0, cap = 0, t0 = a8b_uptime();
++	uint32_t csize, span = 0;
++	int error, target;
++
++	if (a8b_put_st.buf == NULL) {
++		printf("A8B PUT error: bend without bput\n");
++		return;
++	}
++	if (a8b_put_st.bad || a8b_put_st.have != a8b_put_st.size) {
++		printf("A8B PUT error: %u of %u bytes arrived%s; nothing written\n",
++		    a8b_put_st.have, a8b_put_st.size, a8b_put_st.bad ? " (bad data)" : "");
++		goto out;
++	}
++	a8b_sha256(a8b_put_st.buf, a8b_put_st.size, sha);
++	if (memcmp(sha, a8b_put_st.sha, 32) != 0) {
++		a8b_hex(sha, 32, hex);
++		printf("A8B PUT error: sha256 %s is not the one given; nothing written\n", hex);
++		goto out;
++	}
++	memcpy(&r, a8b_put_st.buf, sizeof(r));
++	data = a8b_put_st.buf + 128;
++	csize = a8b_put_st.size - 128u;
++	a8b_sha256(data, csize, sha);
++	if (r.csize != csize || r.codec != 1 || r.usize == 0 || r.usize > SLOT_MAX_U ||
++	    a8b_crc32(0, data, csize) != r.crc_c || memcmp(sha, r.sha, 32) != 0) {
++		printf("A8B PUT error: the slot image's record does not match its data; "
++		    "nothing written\n");
++		goto out;
++	}
++	why = a8b_load(&v);
++	if (v.def < 0) {
++		printf("A8B PUT error: %s; nothing written\n", why ? why : "no default slot");
++		goto out;
++	}
++	target = 1 - v.def;
++	if (!a8b_place(&v, target, &off, &cap)) {
++		printf("A8B PUT error: the slot layout is not the one mkslots.py makes; "
++		    "nothing written\n");
++		goto out;
++	}
++	span = (csize + 511u) & ~511u;
++	if (span > cap) {
++		printf("A8B PUT error: %u bytes do not fit slot %d (%llu); nothing written\n",
++		    csize, target, cap);
++		goto out;
++	}
++	printf("A8B PUT writing slot %d (the default is slot %d): %u bytes at BOOT+%llu\n",
++	    target, v.def, csize, v.rd_off + off);
++	/* 1. The old record goes first: a half-written slot is never described. */
++	error = a8b_write_rec(&v, target, NULL);
++	if (error) {
++		printf("A8B PUT error %d clearing slot %d's record; BOOT read-back failed?\n",
++		    error, target);
++		goto out;
++	}
++	/* 2. The data, padded with zeros to whole sectors, then read back. */
++	error = a8_boot_io(v.rd_off + off, a8b_put_st.buf + 128, span, true);
++	if (error) {
++		printf("A8B PUT error %d writing slot %d's data; its record stays empty\n",
++		    error, target);
++		goto out;
++	}
++	back = kalloc_data(span, Z_WAITOK | Z_ZERO);
++	if (back == NULL) {
++		printf("A8B PUT error: no memory to read back; slot %d's record stays empty\n",
++		    target);
++		goto out;
++	}
++	error = a8_boot_io(v.rd_off + off, back, span, false);
++	a8b_sha256(back, csize, sha);
++	if (error || memcmp(back, a8b_put_st.buf + 128, span) != 0 || memcmp(sha, r.sha, 32) != 0) {
++		printf("A8B PUT error: READ-BACK DIFFERS (error %d) for slot %d; its record "
++		    "stays empty. Stop and call the user.\n", error, target);
++		goto out;
++	}
++	/* 3. The record: untested, generation 0, our place in the container. */
++	r.off = off;
++	r.cap = cap;
++	r.gen = 0;
++	r.good = 0;
++	r.rsv1 = r.rsv2 = 0;
++	r.crc = a8b_crc32(0, (const uint8_t *)&r, 124);
++	error = a8b_write_rec(&v, target, &r);
++	if (error) {
++		printf("A8B PUT error: RECORD READ-BACK FAILED (%d) for slot %d. Stop and call "
++		    "the user.\n", error, target);
++		goto out;
++	}
++	a8b_hex(r.sha, 32, hex);
++	printf("A8B PUT ok slot %d %u bytes (payload %llu) sha256 %s in %llu s\n",
++	    target, csize, r.usize, hex, a8b_uptime() - t0);
++out:
++	if (back != NULL) {
++		kfree_data(back, span);
++	}
++	a8b_put_reset();
++}
++
++/* ---- tries ---- */
++
++static bool
++a8b_this_is_try(void)
++{
++	return a8b_boot_valid && a8b_boot[3] == WHY_TRY && a8b_st.pending != 0 &&
++	       a8b_boot[4] == a8b_st.pending;
++}
++
++/* 0: the request is in RAM, reboot now. */
++int
++a8b_tryb(void)
++{
++	struct a8b_view v;
++	const char *why;
++	uint32_t now = a8b_now(), recent = 0;
++	int target;
++
++	if (a8b_page == NULL) {
++		printf("A8B TRY error: the RAM page is not mapped\n");
++		return -1;
++	}
++	if (a8b_st.fails >= 2) {
++		printf("A8B TRY refused: %u tries in a row did not come back. Stop and call "
++		    "the user (a force restart clears this).\n", a8b_st.fails);
++		return -1;
++	}
++	if (a8b_st.pending != 0) {
++		printf("A8B TRY refused: try %u is not judged yet (tryok or promote on its "
++		    "boot)\n", a8b_st.pending);
++		return -1;
++	}
++	if (now < 1767225600u) {        /* 2026-01-01 */
++		printf("A8B TRY refused: the calendar is not set (send date first)\n");
++		return -1;
++	}
++	for (uint32_t i = 0; i < 8 && i < a8b_st.ntimes; i++) {
++		if (a8b_st.times[i] <= now && now - a8b_st.times[i] < 3600u) {
++			recent++;
++		}
++	}
++	if (recent >= TRIES_PER_HOUR) {
++		printf("A8B TRY refused: %u tries in the last hour (limit %u)\n", recent,
++		    TRIES_PER_HOUR);
++		return -1;
++	}
++	why = a8b_load(&v);
++	if (v.def < 0) {
++		printf("A8B TRY refused: %s\n", why ? why : "no default slot");
++		return -1;
++	}
++	target = 1 - v.def;
++	if (!v.ok[target]) {
++		printf("A8B TRY refused: slot %d is empty (bput first)\n", target);
++		return -1;
++	}
++	a8b_st.seq++;
++	a8b_st.pending = a8b_st.seq;
++	a8b_st.pending_slot = (uint32_t)target;
++	a8b_st.times[a8b_st.ntimes % 8] = now;
++	a8b_st.ntimes++;
++	a8b_state_save();
++
++	volatile uint32_t *f = a8b_words(A8B_FLAG);
++	f[0] = TRY_MAGIC;
++	f[1] = 1;
++	f[2] = (uint32_t)target;
++	f[3] = a8b_st.seq;
++	f[4] = f[0] ^ f[1] ^ f[2] ^ f[3] ^ 0xffffffffu;
++	f[5] = f[6] = f[7] = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("A8B TRY %u: slot %d once, then the default (slot %d) again; rebooting\n",
++	    a8b_st.seq, target, v.def);
++	return 0;
++}
++
++void
++a8b_tryok(void)
++{
++	if (!a8b_this_is_try()) {
++		printf("A8B TRYOK refused: this boot is not a try\n");
++		return;
++	}
++	printf("A8B TRYOK: try %u of slot %u came up and passed\n", a8b_st.pending,
++	    a8b_st.pending_slot);
++	a8b_st.pending = 0;
++	a8b_st.fails = 0;
++	a8b_state_save();
++}
++
++void
++a8b_promote(void)
++{
++	struct a8b_view v;
++	struct a8b_rec r;
++	const char *why;
++	uint64_t up = a8b_uptime();
++	int slot;
++
++	if (!a8b_this_is_try()) {
++		printf("A8B PROMOTE refused: only from the try boot itself\n");
++		return;
++	}
++	if (up < PROMOTE_UPTIME) {
++		printf("A8B PROMOTE refused: up %llu s, need %u s\n", up, PROMOTE_UPTIME);
++		return;
++	}
++	slot = (int)a8b_boot[2];
++	why = a8b_load(&v);
++	if (v.def < 0 || slot == v.def || !v.ok[slot]) {
++		printf("A8B PROMOTE refused: %s\n", why ? why : "slot is already the default or empty");
++		return;
++	}
++	r = v.rec[slot];
++	r.good = 1;
++	r.gen = v.rec[v.def].gen + 1;
++	r.crc = a8b_crc32(0, (const uint8_t *)&r, 124);
++	int error = a8b_write_rec(&v, slot, &r);
++	if (error) {
++		printf("A8B PROMOTE error: RECORD READ-BACK FAILED (%d). Stop and call the user.\n",
++		    error);
++		return;
++	}
++	printf("A8B PROMOTE ok: slot %d is the default now (gen %u); slot %d keeps the old "
++	    "kernel until the next bput\n", slot, r.gen, v.def);
++	a8b_st.pending = 0;
++	a8b_st.fails = 0;
++	a8b_state_save();
++}
++
++/* ---- watchdog ---- */
++
++static void
++a8b_wdt_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		a8b_wr(a8b_wdt, WTCNT, a8b_wdt_count);
++		a8b_sleep_ms(5000);
++	}
++}
++
++static void
++a8b_wdt_start(uint32_t secs, bool arm)
++{
++	volatile uint32_t *pmu = (volatile uint32_t *)ml_io_map(A8B_PMU_PA, 0x1000);
++	thread_t th;
++
++	a8b_wdt = (volatile uint32_t *)ml_io_map(A8B_WDT_PA, 0x1000);
++	if (a8b_wdt == NULL || pmu == NULL) {
++		printf("A8 WDT: map failed\n");
++		return;
++	}
++	if (arm) {
++		uint32_t count = secs * WDT_HZ;
++		if (count > 0xffffu) {
++			count = 0xffffu;
++		}
++		a8b_wr(a8b_wdt, WTDAT, count);
++		a8b_wr(a8b_wdt, WTCNT, count);
++		a8b_wr(a8b_wdt, WTCON, WTCON_ARMED);
++		a8b_wr(pmu, PMU_DISABLE_WDT, a8b_rd(pmu, PMU_DISABLE_WDT) & ~PMU_WDT_BIT);
++		a8b_wr(pmu, PMU_MASK_WDT, a8b_rd(pmu, PMU_MASK_WDT) & ~PMU_WDT_BIT);
++	}
++	a8b_wdt_count = a8b_rd(a8b_wdt, WTDAT);
++	printf("A8 WDT: %s, WTCON %08x WTDAT %08x WTCNT %08x (about %u s), PMU disable %08x "
++	    "mask %08x; petted every 5 s\n", arm ? "armed" : "armed by the loader",
++	    a8b_rd(a8b_wdt, WTCON), a8b_wdt_count, a8b_rd(a8b_wdt, WTCNT),
++	    a8b_wdt_count / WDT_HZ, a8b_rd(pmu, PMU_DISABLE_WDT), a8b_rd(pmu, PMU_MASK_WDT));
++	if (kernel_thread_start_priority(a8b_wdt_thread, NULL, A8B_WDT_PRI, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("A8 WDT: no pet thread; disarming\n");
++		a8b_wr(pmu, PMU_MASK_WDT, a8b_rd(pmu, PMU_MASK_WDT) | PMU_WDT_BIT);
++		a8b_wdt_count = 0;
++	}
++}
++
++static void
++a8b_wdt_disarm(void)
++{
++	volatile uint32_t *pmu = (volatile uint32_t *)ml_io_map(A8B_PMU_PA, 0x1000);
++	if (pmu != NULL) {
++		a8b_wr(pmu, PMU_MASK_WDT, a8b_rd(pmu, PMU_MASK_WDT) | PMU_WDT_BIT);
++	}
++}
++
++/* ---- the deliberately broken kernel (a8bootpanic=SECONDS) ---- */
++
++static uint32_t a8b_bootpanic;
++
++static void
++a8b_bootpanic_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	a8b_sleep_ms(a8b_bootpanic * 1000u);
++	panic("a8bootpanic: deliberate test panic %u s after start (Phase 2 fallback test)",
++	    a8b_bootpanic);
++}
++
++/* ---- panic text for the next boot ---- */
++
++static char a8b_panic_buf[A8B_PANIC_MAX];
++
++void
++a8_slots_panic(const char *fmt, va_list *args)
++{
++	va_list copy;
++	int n;
++
++	if (a8b_page == NULL || a8b_panicked) {
++		return;
++	}
++	a8b_panicked = true;
++	va_copy(copy, *args);
++	n = vsnprintf(a8b_panic_buf, sizeof(a8b_panic_buf), fmt, copy);
++	va_end(copy);
++	if (n < 0) {
++		n = 0;
++	}
++	if ((uint32_t)n >= sizeof(a8b_panic_buf)) {
++		n = (int)sizeof(a8b_panic_buf) - 1;
++	}
++	volatile uint32_t *w = a8b_words(A8B_PANIC);
++	volatile uint8_t *t = a8b_page + A8B_PANIC + 16;
++	for (int i = 0; i < n; i++) {
++		t[i] = (uint8_t)a8b_panic_buf[i];
++	}
++	w[1] = (uint32_t)n;
++	w[2] = a8b_st.pending;
++	w[3] = a8b_boot_valid ? a8b_boot[2] : 0xffffffffu;
++	w[0] = PANIC_MAGIC;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++a8b_report_panic(void)
++{
++	volatile uint32_t *w = a8b_words(A8B_PANIC);
++	uint32_t n = w[1];
++	char line[161];
++
++	if (w[0] != PANIC_MAGIC || n == 0 || n > A8B_PANIC_MAX) {
++		return;
++	}
++	printf("A8 SLOTS: last boot panicked (slot %d, try %u):\n", (int)w[3], w[2]);
++	for (uint32_t i = 0; i < n; i += 160) {
++		uint32_t k = 0;
++		for (; k < 160 && i + k < n; k++) {
++			char c = (char)a8b_page[A8B_PANIC + 16 + i + k];
++			line[k] = (c == '\n' || c == '\r' || c == 0) ? ' ' : c;
++		}
++		line[k] = 0;
++		printf("A8 PANIC: %s\n", line);
++	}
++	w[0] = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ---- boot ---- */
++
++void
++a8b_init(void)
++{
++	uint32_t secs = 0, rst;
++	volatile uint32_t *b;
++	bool loader_armed;
++
++	a8b_page = (volatile uint8_t *)ml_io_map(A8B_PAGE_PA, 0x1000);
++	if (a8b_page == NULL) {
++		printf("A8 SLOTS: cannot map the RAM page\n");
++		return;
++	}
++	b = a8b_words(A8B_BOOT);
++	for (int i = 0; i < 12; i++) {
++		a8b_boot[i] = b[i];
++	}
++	a8b_boot_valid = a8b_boot[0] == BOOT_MAGIC && a8b_boot[1] == 2 &&
++	    a8b_boot[11] == a8b_xor(b, 11);
++	b[0] = 0;               /* a single-kernel boot later must not show it */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (a8b_boot_valid) {
++		rst = a8b_boot[5];
++	} else {
++		volatile uint32_t *pmu = (volatile uint32_t *)ml_io_map(A8B_PMU_PA, 0x1000);
++		rst = pmu != NULL ? a8b_rd(pmu, PMU_RST_STAT) : 0;
++	}
++	a8b_state_load();
++	if (rst & RST_MANUAL) {
++		if (a8b_st.fails || a8b_st.wdt_row) {
++			printf("A8 SLOTS: force restart: try and watchdog limits cleared\n");
++		}
++		a8b_st.fails = 0;
++		a8b_st.wdt_row = 0;
++	}
++	a8b_st.wdt_row = (rst & PMU_WDT_BIT) ? a8b_st.wdt_row + 1 : 0;
++	if (a8b_boot_valid) {
++		printf("A8 SLOTS: booted slot %u (%s), default %d, gen %u, loader decode %u ms, "
++		    "reset cause %08x%s\n", a8b_boot[2], a8b_reason(a8b_boot[3]), (int)a8b_boot[7],
++		    a8b_boot[8], a8b_boot[6], rst, (rst & PMU_WDT_BIT) ? " (WATCHDOG)" : "");
++	} else {
++		printf("A8 SLOTS: single-kernel boot, reset cause %08x%s\n", rst,
++		    (rst & PMU_WDT_BIT) ? " (WATCHDOG)" : "");
++	}
++	if (a8b_st.pending != 0) {
++		if (a8b_this_is_try()) {
++			printf("A8 SLOTS: this is try %u of slot %u; judge it with tryok or promote\n",
++			    a8b_st.pending, a8b_st.pending_slot);
++		} else {
++			a8b_st.fails++;
++			printf("A8 SLOTS: TRY %u OF SLOT %u FAILED: %s (%u in a row)\n",
++			    a8b_st.pending, a8b_st.pending_slot,
++			    a8b_boot_valid && a8b_boot[3] == WHY_TRY_FAILED && a8b_boot[4] == a8b_st.pending ?
++			    "the loader refused it" : "it did not stay up", a8b_st.fails);
++			a8b_st.pending = 0;
++		}
++	}
++	a8b_state_save();
++	a8b_report_panic();
++
++	loader_armed = a8b_boot_valid && a8b_boot[3] == WHY_TRY;
++	secs = a8b_boot_valid ? 60u : 0u;
++	(void)PE_parse_boot_argn("a8wdt", &secs, sizeof(secs));
++	if (a8b_st.wdt_row >= 2) {
++		printf("A8 WDT: %u watchdog resets in a row; not arming (call the user)\n",
++		    a8b_st.wdt_row);
++		if (loader_armed) {
++			a8b_wdt_disarm();
++		}
++	} else if (loader_armed) {
++		a8b_wdt_start(0, false);
++	} else if (secs != 0) {
++		a8b_wdt_start(secs < 10u ? 10u : secs, true);
++	}
++
++	if (PE_parse_boot_argn("a8bootpanic", &a8b_bootpanic, sizeof(a8b_bootpanic)) &&
++	    a8b_bootpanic > 0) {
++		thread_t th;
++		printf("A8 SLOTS: a8bootpanic=%u: this kernel will panic on purpose\n",
++		    a8b_bootpanic);
++		if (kernel_thread_start(a8b_bootpanic_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++		}
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..cad94ba 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -87,6 +87,9 @@
+ #if defined(__arm64__)
+ #include <arm64/sweet_early.h>
+ #endif
++#if defined(JACKPOTLTE)
++extern void a8_slots_panic(const char *fmt, va_list *args);
++#endif
+ #include <IOKit/IOBSD.h>
+ 
+ #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
+@@ -1077,6 +1080,12 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 	sweet_early_panic(panic_format_str, panic_args);
+ #endif
+ 
++#if defined(JACKPOTLTE)
++	/* A8 2018 (bsd/dev/a8_slots.c): keep the message in a RAM page that
++	 * survives the watchdog reset, for the next boot to report. */
++	a8_slots_panic(panic_format_str, panic_args);
++#endif
++
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+ #endif

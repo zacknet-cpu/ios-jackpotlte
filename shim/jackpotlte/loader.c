@@ -494,6 +494,26 @@ static void slot_record(uint32_t slot, uint32_t reason, uint32_t seq,
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* A try boot gets the watchdog: if the kernel under test never starts
+ * petting it (bsd/dev/a8_slots.c), or panics, the SoC resets in ~82 s and
+ * this loader boots the default slot. Armed last, just before the jump. */
+static int slot_wdt;
+
+static void slot_wdt_arm(void)
+{
+	volatile uint32_t *w = (volatile uint32_t *)JT_WDT_BASE;
+	volatile uint32_t *pmu = (volatile uint32_t *)JT_PMU_BASE;
+
+	w[JT_WDT_WTDAT / 4] = 0xffffU;
+	w[JT_WDT_WTCNT / 4] = 0xffffU;
+	w[JT_WDT_WTCON / 4] = JT_WDT_ARMED;
+	__asm__ volatile("dsb sy" ::: "memory");
+	pmu[JT_PMU_DISABLE_WDT / 4] &= ~JT_PMU_WDT_BIT;
+	pmu[JT_PMU_MASK_WDT / 4] &= ~JT_PMU_WDT_BIT;
+	__asm__ volatile("dsb sy" ::: "memory");
+	out("watchdog armed for the try (~82 s)\n");
+}
+
 /* 0: not a container (rd unchanged); 1: rd now points at the decoded
  * payload; -1: nothing bootable (fail() already printed). */
 static int slots_select(uint64_t *rd_start, uint64_t *rd_end, uintptr_t dtb)
@@ -561,6 +581,7 @@ static int slots_select(uint64_t *rd_start, uint64_t *rd_end, uintptr_t dtb)
 		out(" ms\n");
 		*rd_start = SLOT_SCRATCH;
 		*rd_end = SLOT_SCRATCH + plen;
+		slot_wdt = why[k] == WHY_TRY;
 		return 1;
 	}
 	fail("slots: nothing bootable");
@@ -828,6 +849,8 @@ uint64_t jt_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	}
 	out("\n");
 	fg = 0xff40ff40U;
+	if (slot_wdt)
+		slot_wdt_arm();
 	out("\nJUMP TO XNU\n");
 #if JT_HAVE_RAMOOPS
 	clean(JT_RAMOOPS_CONSOLE, JT_RAMOOPS_CONSOLE + JT_RAMOOPS_SIZE);

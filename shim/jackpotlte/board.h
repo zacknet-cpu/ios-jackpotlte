@@ -87,6 +87,19 @@
 #define JT_SLOT_FLAG_PA		0xed3ff000UL	/* "try B once", written by XNU */
 #define JT_SLOT_BOOT_PA		0xed3ff100UL	/* what the loader booted, for XNU */
 #define JT_PMU_RST_STAT		0x0404U		/* reset cause (bit 24 watchdog) */
+/* Watchdog for a try boot (Samsung s3c2410_wdt.c, exynos7885 "A53 WDTRESET"
+ * data: PMU DISABLE_WDT 0x408 and MASK_WDT_RESET 0x40c, bit 24). S-Boot
+ * leaves the timer running with the reset masked (WTCON 0x8021, PMU bits all
+ * ones, read on the phone 2026-11-23); WTCNT counted ~12.9 kHz with
+ * prescaler 129 /16, so prescaler 256 /128 gives ~793 Hz and 0xffff ~82 s. */
+#define JT_WDT_BASE		0x10060000UL	/* DT watchdog@10060000 */
+#define JT_WDT_WTCON		0x00U
+#define JT_WDT_WTDAT		0x04U
+#define JT_WDT_WTCNT		0x08U
+#define JT_WDT_ARMED		0xff39U		/* prescaler 256, /128, on, reset on */
+#define JT_PMU_DISABLE_WDT	0x0408U
+#define JT_PMU_MASK_WDT		0x040cU
+#define JT_PMU_WDT_BIT		(1U << 24)
 
 /* ---- Timer (SAM-K exynos7885.dtsi timer) ----
  * arm,armv8-timer, clock-frequency 26000000. The arch timer PPIs (with the
