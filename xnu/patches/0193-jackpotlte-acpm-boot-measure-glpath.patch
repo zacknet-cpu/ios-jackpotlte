@@ -1,0 +1,678 @@
+diff --git a/bsd/dev/a8_acpm.c b/bsd/dev/a8_acpm.c
+index dcfe453..b620c24 100644
+--- a/bsd/dev/a8_acpm.c
++++ b/bsd/dev/a8_acpm.c
+@@ -35,16 +35,20 @@
+  *    stock BOOT image; "acpm fvp PATH" loads them from a file on the data
+  *    volume and checks length and CRC before a byte is written.
+  *
+- * Nothing here runs unless the boot-args say a8dvfs=1, and then only on a
+- * console command (a5xelte_usb.c): there is no automatic governor.  A rate
+- * has to be one of the firmware's own table and not above the stock limit of
+- * its domain; raising one needs a temperature reading below a8dvfstemp
+- * (default 80 C), and a thread takes every raised domain back to its boot
+- * rate when the SoC gets hotter than that.
++ * Nothing here runs unless the boot-args say a8dvfs=1.  Console commands
++ * (a5xelte_usb.c) still drive it by hand.  Boot-arg a8dvfsboot=g3d:KHZ,big:KHZ,
++ * little:KHZ (default off), with a8dvfs=1, asks for those rates once the root
++ * is mounted: load /private/var/root/a8-acpm-fvp.fw, read the TMU, then
++ * FREQ_REQ each listed domain (same checks as the console).  A rate has to
++ * be one of the firmware's own table and not above the stock limit; raising
++ * needs a temperature reading below a8dvfstemp (default 80 C), and a thread
++ * takes every raised domain back to its boot rate when the SoC gets hotter.
+  *
+  * Never read the CPU clusters' clock blocks (0x10800000, 0x10900000,
+  * 0x10a00000) from here: the read is refused and was a panic (sleh.c,
+- * a8_probe_read32).  CPU rates come from FREQ_GET.
++ * a8_probe_read32).  FREQ_GET returns 0 on this phone's FVP plug-in (probed
++ * 2026-11-23); CPU rates in "dvfs" are measured with PMCCNTR_EL0 on a pinned
++ * A53 (cpu 0) and A73 (cpu 6) for 100 ms instead.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -57,6 +61,8 @@
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/processor.h>
++#include <kern/startup.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <string.h>
+@@ -65,6 +71,9 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern bool a8_probe_read32(vm_offset_t va, uint32_t *value, uint32_t *esr);    /* sleh.c */
+ extern int a8f_read_whole(const char *path, uint8_t *buf, uint32_t max, uint32_t *got,
+     uint32_t *crc);                                                             /* a8_files.c */
++extern void (*mountroot_post_hook)(void);                                       /* bsd_init.c */
++extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
++extern void nanoseconds_to_absolutetime(uint64_t, uint64_t *);
+ 
+ void a8_acpm_command(const char *args);
+ void a8_dvfs_command(const char *args);
+@@ -185,6 +194,10 @@ static struct {
+ 	bool                    watching, hot;
+ 	uint32_t                watch_ticks, tmu_misses;
+ 	int                     watch_chan;
++	/* a8dvfsboot=g3d:KHZ,big:KHZ,little:KHZ (0 = not asked at boot) */
++	uint32_t                boot_want[A8A_DOMAINS];
++	bool                    boot_cfg, boot_started, boot_done;
++	uint32_t                meas_little_khz, meas_big_khz; /* last PMCCNTR measure */
+ } a8a;
+ 
+ static LCK_GRP_DECLARE(a8a_grp, "a8acpm");
+@@ -360,6 +373,128 @@ a8a_read_fvmap(void)
+ 	a8a.fvmap = base;
+ }
+ 
++
++/* ---- a8dvfsboot parse and PMCCNTR measure (0193) ---- */
++#define A8A_FVP_PATH            "/private/var/root/a8-acpm-fvp.fw"
++#define A8A_CPU_LITTLE          0               /* A53 */
++#define A8A_CPU_BIG             6               /* A73; logical CPUs 6-7 */
++#define A8A_MEASURE_MS          100u
++
++static void a8a_watch_thread(void *arg, wait_result_t wr);
++static void a8a_dvfs_set(uint32_t d, uint32_t khz);
++static void a8a_dvfs_report(const char *why);
++static void a8a_ensure_watch(void);
++static bool a8t_hottest(int *celsius, int *cpu, int *g3d);
++
++static bool
++a8a_parse_boot_rates(const char *cfg)
++{
++	const char *p = cfg;
++	bool any = false;
++
++	for (uint32_t i = 0; i < A8A_DOMAINS; i++) {
++		a8a.boot_want[i] = 0;
++	}
++	while (*p != 0) {
++		char name[16];
++		uint32_t n = 0, khz = 0;
++		int d;
++
++		while (*p == ',' || *p == ' ') {
++			p++;
++		}
++		if (*p == 0) {
++			break;
++		}
++		while (*p != 0 && *p != ':' && n + 1 < sizeof(name)) {
++			name[n++] = *p++;
++		}
++		name[n] = 0;
++		if (*p != ':') {
++			printf("A8 DVFS boot: bad a8dvfsboot near \"%s\" (want NAME:KHZ,...)\n", name);
++			return false;
++		}
++		p++;
++		while (*p >= '0' && *p <= '9') {
++			khz = khz * 10u + (uint32_t)(*p++ - '0');
++			if (khz > 4000000u) {
++				printf("A8 DVFS boot: rate too large in a8dvfsboot\n");
++				return false;
++			}
++		}
++		d = -1;
++		for (uint32_t i = 0; i < A8A_DOMAINS; i++) {
++			if (strcmp(name, a8a_dom_name[i]) == 0) {
++				d = (int)i;
++				break;
++			}
++		}
++		if (d < 0 || a8a_dom_cap[d] == 0) {
++			printf("A8 DVFS boot: \"%s\" is not a domain to set at boot (big, little, g3d)\n",
++			    name);
++			return false;
++		}
++		a8a.boot_want[d] = khz;
++		any = true;
++	}
++	return any;
++}
++
++static uint32_t
++a8a_measure_cpu_khz(int cpu)
++{
++	processor_t target, prev;
++	uint64_t window, t0, t1, c0, c1, ns = 0, pmcr;
++	boolean_t iflag;
++	uint32_t khz;
++
++	if (cpu < 0 || cpu >= MAX_SCHED_CPUS || processor_array[cpu] == PROCESSOR_NULL) {
++		return 0;
++	}
++	target = processor_array[cpu];
++	prev = thread_bind(target);
++	thread_block(THREAD_CONTINUE_NULL);
++	if ((int)cpu_number() != cpu) {
++		printf("A8 DVFS: measure: wanted cpu %d, ran on %d\n", cpu, cpu_number());
++		thread_bind(prev);
++		thread_block(THREAD_CONTINUE_NULL);
++		return 0;
++	}
++	nanoseconds_to_absolutetime((uint64_t)A8A_MEASURE_MS * NSEC_PER_MSEC, &window);
++	pmcr = __builtin_arm_rsr64("PMCR_EL0");
++	__builtin_arm_wsr64("PMCR_EL0", (pmcr | 0x15ull) & ~0x2ull);
++	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ull << 31);
++	__builtin_arm_isb(0xf);
++
++	iflag = ml_set_interrupts_enabled(FALSE);
++	t0 = mach_absolute_time();
++	c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	do {
++		t1 = mach_absolute_time();
++	} while (t1 - t0 < window);
++	c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	(void)ml_set_interrupts_enabled(iflag);
++
++	thread_bind(prev);
++	thread_block(THREAD_CONTINUE_NULL);
++
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	if (ns == 0 || c1 <= c0) {
++		return 0;
++	}
++	khz = (uint32_t)(((c1 - c0) * 1000ull) / ns);
++	return khz;
++}
++
++static void
++a8a_measure_both(void)
++{
++	a8a.meas_little_khz = a8a_measure_cpu_khz(A8A_CPU_LITTLE);
++	a8a.meas_big_khz = a8a_measure_cpu_khz(A8A_CPU_BIG);
++	printf("A8 DVFS: measure (PMCCNTR %u ms): little cpu%u %u kHz, big cpu%u %u kHz\n",
++	    A8A_MEASURE_MS, A8A_CPU_LITTLE, a8a.meas_little_khz, A8A_CPU_BIG, a8a.meas_big_khz);
++}
++
+ static bool
+ a8a_init(void)
+ {
+@@ -643,7 +778,7 @@ a8a_status(void)
+ }
+ 
+ /* ---- loading the FVP plug-in (acpm.c plugins_init, handle_dynamic_plugin) ---- */
+-static void
++static int
+ a8a_fvp_load(const char *path)
+ {
+ 	struct a8a_plugin *fvp;
+@@ -655,11 +790,11 @@ a8a_fvp_load(const char *path)
+ 	fvp = a8a_plugin_named(A8A_FVP_NAME);
+ 	if (fvp == NULL) {
+ 		printf("A8A FVP: the framework lists no plug-in named %s\n", A8A_FVP_NAME);
+-		return;
++		return ENOENT;
+ 	}
+ 	if (fvp->attached) {
+ 		printf("A8A FVP: plug-in %u is attached already (ops 0x%x)\n", fvp->id, fvp->ops);
+-		return;
++		return 0;
+ 	}
+ 	base = fvp->base & ~1u;
+ 	if (!fvp->stay || base != A8A_FVP_BASE || fvp->size != A8A_FVP_BYTES ||
+@@ -667,7 +802,7 @@ a8a_fvp_load(const char *path)
+ 		printf("A8A FVP: plug-in %u is not where this phone had it: base 0x%x size 0x%x "
+ 		    "stay %u (want 0x%x, 0x%x, 1); nothing written\n", fvp->id, base, fvp->size,
+ 		    fvp->stay, A8A_FVP_BASE, A8A_FVP_BYTES);
+-		return;
++		return EINVAL;
+ 	}
+ 	/* Its room must not be anyone else's. */
+ 	for (uint32_t i = 0; i < a8a.nplug; i++) {
+@@ -678,25 +813,25 @@ a8a_fvp_load(const char *path)
+ 		    base < pb + p->size) {
+ 			printf("A8A FVP: its room 0x%x-0x%x is inside attached plug-in %u (0x%x-0x%x); "
+ 			    "nothing written\n", base, base + A8A_FVP_BYTES, p->id, pb, pb + p->size);
+-			return;
++			return EINVAL;
+ 		}
+ 	}
+ 	if (!a8a_channel_usable(a8a_channel(A8A_CH_FRAMEWORK))) {
+ 		printf("A8A FVP: the framework's channel %u is not usable; nothing written\n",
+ 		    A8A_CH_FRAMEWORK);
+-		return;
++		return EINVAL;
+ 	}
+ 	buf = kalloc_data(A8A_FVP_BYTES, Z_WAITOK | Z_ZERO);
+ 	if (buf == NULL) {
+ 		printf("A8A FVP: no memory\n");
+-		return;
++		return ENOMEM;
+ 	}
+ 	error = a8f_read_whole(path, buf, A8A_FVP_BYTES, &got, &crc);
+ 	if (error || got != A8A_FVP_BYTES || crc != A8A_FVP_CRC) {
+ 		printf("A8A FVP: %s: error %d, %u bytes, crc %08x; want %u bytes, crc %08x; nothing "
+ 		    "written\n", path, error, got, crc, A8A_FVP_BYTES, A8A_FVP_CRC);
+ 		kfree_data(buf, A8A_FVP_BYTES);
+-		return;
++		return EIO;
+ 	}
+ 	printf("A8A FVP: %s is the plug-in (%u bytes, crc %08x); its room at SRAM + 0x%x starts "
+ 	    "0x%08x 0x%08x\n", path, got, crc, base, a8a_rd(base), a8a_rd(base + 4));
+@@ -715,7 +850,7 @@ a8a_fvp_load(const char *path)
+ 			printf("A8A FVP: SRAM + 0x%x reads 0x%08x, not 0x%08x: not attached\n", base + off,
+ 			    a8a_rd(base + off), word);
+ 			kfree_data(buf, A8A_FVP_BYTES);
+-			return;
++			return EIO;
+ 		}
+ 	}
+ 	kfree_data(buf, A8A_FVP_BYTES);
+@@ -729,7 +864,9 @@ a8a_fvp_load(const char *path)
+ 	    fvp->ops);
+ 	if (!error && fvp->attached) {
+ 		printf("A8A FVP: attached; \"dvfs\" now reads the rates\n");
++		return 0;
+ 	}
++	return error ? error : EIO;
+ }
+ 
+ /* ---- temperature ---- */
+@@ -889,19 +1026,26 @@ a8a_dvfs_report(const char *why)
+ 	len = snprintf(line, sizeof(line), "A8 DVFS (%s):", why);
+ 	for (uint32_t d = 0; d < A8A_DOMAINS && len < (int)sizeof(line) - 60; d++) {
+ 		const struct a8a_domain *dom = &a8a.dom[d];
+-		uint32_t khz = 0;
++		uint32_t khz = 0, shown;
+ 
+-		if (attached && a8a_get_rate(d, &khz) == 0) {
+-			len += snprintf(line + len, sizeof(line) - len, " %s %u", a8a_dom_name[d], khz);
+-		} else if (dom->ok) {
+-			len += snprintf(line + len, sizeof(line) - len, " %s boot %u", a8a_dom_name[d],
+-			    dom->boot_khz);
++		if (attached) {
++			(void)a8a_get_rate(d, &khz);
++		}
++		/* FREQ_GET returns 0 on this FVP; prefer the last asked rate. */
++		shown = (khz != 0) ? khz : (dom->asked_khz != 0 ? dom->asked_khz :
++		    (dom->ok ? dom->boot_khz : 0));
++		if (shown != 0) {
++			len += snprintf(line + len, sizeof(line) - len, " %s %u", a8a_dom_name[d], shown);
+ 		} else {
+ 			len += snprintf(line + len, sizeof(line) - len, " %s ?", a8a_dom_name[d]);
+ 		}
+ 	}
+ 	pll = a8a_g3d_pll_khz(&con0);
+ 	len += snprintf(line + len, sizeof(line) - len, " kHz; G3D PLL %u kHz (0x%x)", pll, con0);
++	if (a8a.meas_little_khz != 0 || a8a.meas_big_khz != 0) {
++		len += snprintf(line + len, sizeof(line) - len, "; PMCCNTR little %u big %u kHz",
++		    a8a.meas_little_khz, a8a.meas_big_khz);
++	}
+ 	if (a8t_hottest(&hot, &cpu, &g3d)) {
+ 		len += snprintf(line + len, sizeof(line) - len, "; %d C cpu, %d C g3d", cpu, g3d);
+ 	} else {
+@@ -1037,19 +1181,139 @@ a8a_dvfs_set(uint32_t d, uint32_t khz)
+ 	/* By what was asked, not by what it reports: a wrong report must not
+ 	 * take the domain out of the temperature watch. */
+ 	dom->raised = khz > dom->boot_khz;
+-	if (dom->raised && !a8a.watching) {
+-		thread_t thread;
++	if (dom->raised) {
++		a8a_ensure_watch();
++	}
++	a8a_dvfs_report("after the request");
++}
+ 
+-		if (kernel_thread_start(a8a_watch_thread, NULL, &thread) == KERN_SUCCESS) {
+-			thread_deallocate(thread);
+-			a8a.watching = true;
+-		} else {
+-			printf("A8 DVFS: no temperature watch thread; watch it by hand (tmu)\n");
++static void
++a8a_ensure_watch(void)
++{
++	thread_t thread;
++
++	if (a8a.watching) {
++		return;
++	}
++	if (kernel_thread_start(a8a_watch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		a8a.watching = true;
++	} else {
++		printf("A8 DVFS: no temperature watch thread; watch it by hand (tmu)\n");
++	}
++}
++
++static void
++a8a_boot_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	int hot = 0, cpu = -1, g3d = -1;
++	int tries;
++
++	bool held = false;
++
++	for (tries = 0; tries < 30; tries++) {
++		lck_mtx_lock(&a8a_lock);
++		held = true;
++		if (!a8a_init()) {
++			lck_mtx_unlock(&a8a_lock);
++			printf("A8 DVFS boot: ACPM init failed\n");
++			return;
++		}
++		if (a8a_fvp_attached()) {
++			break;
+ 		}
++		if (a8a_fvp_load(A8A_FVP_PATH) == 0 && a8a_fvp_attached()) {
++			break;
++		}
++		lck_mtx_unlock(&a8a_lock);
++		held = false;
++		delay(500000);
++	}
++	if (!held) {
++		lck_mtx_lock(&a8a_lock);
++	}
++	if (!a8a_fvp_attached()) {
++		printf("A8 DVFS boot: FVP plug-in not attached after retries; no rates asked\n");
++		a8a.boot_done = true;
++		lck_mtx_unlock(&a8a_lock);
++		return;
++	}
++	if (!a8t_hottest(&hot, &cpu, &g3d) && a8a.allow < 2) {
++		printf("A8 DVFS boot: TMU did not read (cpu/g3d); refusing to raise clocks\n");
++		a8a.boot_done = true;
++		lck_mtx_unlock(&a8a_lock);
++		return;
++	}
++	printf("A8 DVFS boot: TMU %d C cpu, %d C g3d (limit %u)\n", cpu, g3d, a8a.temp_limit);
++	for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++		uint32_t want = a8a.boot_want[d];
++
++		if (want == 0) {
++			continue;
++		}
++		lck_mtx_unlock(&a8a_lock);
++		printf("A8 DVFS boot: %s -> %u kHz\n", a8a_dom_name[d], want);
++		lck_mtx_lock(&a8a_lock);
++		a8a_dvfs_set(d, want);
++	}
++	a8a_ensure_watch();
++	a8a.boot_done = true;
++	lck_mtx_unlock(&a8a_lock);
++	a8a_measure_both();
++	lck_mtx_lock(&a8a_lock);
++	a8a_dvfs_report("boot done");
++	lck_mtx_unlock(&a8a_lock);
++}
++
++static void
++a8a_boot_hook(void)
++{
++	thread_t thread;
++
++	if (a8a.boot_started) {
++		return;
++	}
++	a8a.boot_started = true;
++	if (kernel_thread_start(a8a_boot_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("A8 DVFS boot: waiting on the FVP file after root mount\n");
++	} else {
++		printf("A8 DVFS boot: no thread\n");
+ 	}
+-	a8a_dvfs_report("after the request");
+ }
+ 
++static void
++a8a_startup(void)
++{
++	char cfg[128];
++
++	cfg[0] = 0;
++	if (!PE_parse_boot_arg_str("a8dvfsboot", cfg, sizeof(cfg)) || cfg[0] == 0) {
++		return;
++	}
++	a8a.temp_limit = 80;
++	(void)PE_parse_boot_argn("a8dvfs", &a8a.allow, sizeof(a8a.allow));
++	(void)PE_parse_boot_argn("a8dvfstemp", &a8a.temp_limit, sizeof(a8a.temp_limit));
++	if (a8a.allow == 0) {
++		printf("A8 DVFS boot: a8dvfsboot set but a8dvfs is off; ignored\n");
++		return;
++	}
++	if (!a8a_parse_boot_rates(cfg)) {
++		printf("A8 DVFS boot: a8dvfsboot=\"%s\" parsed to nothing\n", cfg);
++		return;
++	}
++	a8a.boot_cfg = true;
++	mountroot_post_hook = a8a_boot_hook;
++	printf("A8 DVFS boot: will ask");
++	for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++		if (a8a.boot_want[d] != 0) {
++			printf(" %s=%u", a8a_dom_name[d], a8a.boot_want[d]);
++		}
++	}
++	printf(" kHz after root mounts\n");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, a8a_startup);
++
+ /* ---- console commands ---- */
+ static bool
+ a8a_word(const char **p, char *out, size_t size)
+@@ -1173,9 +1437,10 @@ a8_acpm_command(const char *args)
+ 
+ /*
+  * dvfs                     the rate of every domain, the G3D PLL, the temperatures
+- * dvfs table [DOMAIN]      the firmware's levels
++ * dvfs table [DOMAIN]      the firmware's frequency/voltage table
+  * dvfs DOMAIN KHZ          ask for a rate: big | little | g3d (a8dvfs=1)
+  * dvfs boot                every raised domain back to its boot rate
++ * dvfs measure             PMCCNTR_EL0 on cpu0 (A53) and cpu6 (A73) for 100 ms
+  */
+ void
+ a8_dvfs_command(const char *args)
+@@ -1191,6 +1456,11 @@ a8_dvfs_command(const char *args)
+ 	}
+ 	if (!a8a_word(&args, word, sizeof(word))) {
+ 		a8a_dvfs_report("asked");
++	} else if (strcmp(word, "measure") == 0) {
++		lck_mtx_unlock(&a8a_lock);
++		a8a_measure_both();
++		lck_mtx_lock(&a8a_lock);
++		a8a_dvfs_report("after measure");
+ 	} else if (strcmp(word, "table") == 0) {
+ 		if (a8a_word(&args, word, sizeof(word)) && (d = a8a_domain_named(word)) >= 0) {
+ 			a8a_dvfs_table((uint32_t)d);
+@@ -1210,7 +1480,7 @@ a8_dvfs_command(const char *args)
+ 		a8a_dvfs_set((uint32_t)d, khz);
+ 	} else {
+ 		printf("A8 DVFS: dvfs | dvfs table [mif|int|big|little|g3d] | dvfs big|little|g3d KHZ | "
+-		    "dvfs boot\n");
++		    "dvfs boot | dvfs measure\n");
+ 	}
+ 	lck_mtx_unlock(&a8a_lock);
+ }
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index 454d3e4..122b7c3 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -18,6 +18,7 @@
+  * The CRC is the zlib/PNG CRC-32 of the whole file.
+  */
+ #include <pexpert/arm64/board_config.h>
++#include <pexpert/pexpert.h>
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
+ #include <sys/param.h>
+@@ -43,6 +44,7 @@ void a8f_data(const char *b64);
+ void a8f_end(void);
+ void a8f_ls(const char *args);
+ void a8f_date(const char *args);
++bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size);
+ 
+ #define A8F_MAX_GET     (512u << 10)
+ #define A8F_MAX_PUT     (1024u << 10)
+@@ -599,4 +601,101 @@ a8f_date(const char *args)
+ 	clock_get_calendar_microtime(&secs, &usecs);
+ 	printf("A8SH: date %lu (seconds since 1970, UTC)\n", (unsigned long)secs);
+ }
++
++/*
++ * 0193: jtexecinject prefers a USB-updated GL shim under /private/var/root.
++ * Boot-arg a8glpath=0 forces the path from the boot-arg (usually
++ * /usr/local/lib/libjackpotlte-gl.dylib).  The root file must be an arm64
++ * Mach-O dylib; otherwise the boot-arg path is used and a line is logged.
++ */
++#define A8_GL_ROOT_PATH    "/private/var/root/libjackpotlte-gl.dylib"
++#define A8_GL_BASENAME     "libjackpotlte-gl.dylib"
++#define A8_MH_MAGIC_64     0xFEEDFACFu
++#define A8_MH_DYLIB        0x6u
++#define A8_CPU_ARM64       0x0100000Cu
++
++static uint32_t
++a8_gl_path_mode(void)
++{
++	static bool read;
++	static uint32_t mode = 1;
++
++	if (!read) {
++		(void)PE_parse_boot_argn("a8glpath", &mode, sizeof(mode));
++		read = true;
++	}
++	return mode;
++}
++
++static bool
++a8_gl_header_ok(vnode_t vp, vfs_context_t ctx)
++{
++	char hdr[16];
++	uio_t auio;
++	int error;
++	uint32_t magic, cputype, filetype;
++
++	auio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	if (auio == NULL) {
++		return false;
++	}
++	uio_addiov(auio, CAST_USER_ADDR_T(hdr), sizeof(hdr));
++	error = VNOP_READ(vp, auio, 0, ctx);
++	uio_free(auio);
++	if (error) {
++		return false;
++	}
++	magic = (uint32_t)(uint8_t)hdr[0] | ((uint32_t)(uint8_t)hdr[1] << 8) |
++	    ((uint32_t)(uint8_t)hdr[2] << 16) | ((uint32_t)(uint8_t)hdr[3] << 24);
++	cputype = (uint32_t)(uint8_t)hdr[4] | ((uint32_t)(uint8_t)hdr[5] << 8) |
++	    ((uint32_t)(uint8_t)hdr[6] << 16) | ((uint32_t)(uint8_t)hdr[7] << 24);
++	filetype = (uint32_t)(uint8_t)hdr[12] | ((uint32_t)(uint8_t)hdr[13] << 8) |
++	    ((uint32_t)(uint8_t)hdr[14] << 16) | ((uint32_t)(uint8_t)hdr[15] << 24);
++	return magic == A8_MH_MAGIC_64 && cputype == A8_CPU_ARM64 && filetype == A8_MH_DYLIB;
++}
++
++/*
++ * library/liblen is the path from jtexecinject.  If it names the GL shim and
++ * a usable root copy exists, fill out[] with that path and return true.
++ * Otherwise return false (caller keeps the original path).
++ */
++bool
++a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx;
++	const char *base;
++	int error;
++
++	if (out == NULL || out_size < sizeof(A8_GL_ROOT_PATH) || library == NULL || liblen == 0) {
++		return false;
++	}
++	if (a8_gl_path_mode() == 0) {
++		return false;
++	}
++	base = library;
++	for (size_t i = 0; i < liblen; i++) {
++		if (library[i] == '/') {
++			base = library + i + 1;
++		}
++	}
++	if ((size_t)(library + liblen - base) != sizeof(A8_GL_BASENAME) - 1 ||
++	    strncmp(base, A8_GL_BASENAME, sizeof(A8_GL_BASENAME) - 1) != 0) {
++		return false;
++	}
++	ctx = vfs_context_kernel();
++	error = vnode_open(A8_GL_ROOT_PATH, FREAD, 0, 0, &vp, ctx);
++	if (error || vp == NULLVP) {
++		return false;
++	}
++	if (!a8_gl_header_ok(vp, ctx)) {
++		printf("A8 GL: %s failed the Mach-O header check; using %.*s\n",
++		    A8_GL_ROOT_PATH, (int)liblen, library);
++		(void)vnode_close(vp, FREAD, ctx);
++		return false;
++	}
++	(void)vnode_close(vp, FREAD, ctx);
++	strlcpy(out, A8_GL_ROOT_PATH, out_size);
++	return true;
++}
+ #endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b46b454..d6be179 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5612,6 +5612,10 @@ static TUNABLE(uint32_t, jt_gl_log, "jtgllog", 0);
+  */
+ static TUNABLE_STR(exec_inject_vars, 256, "jtexecenv", "");
+ 
++
++#if defined(JACKPOTLTE)
++extern bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size); /* a8_files.c */
++#endif
+ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5653,14 +5657,47 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 				matched = true;
+ 			}
+ 		}
+-		if (matched && liblen != 0 && used + 1 + liblen < size) {
+-			if (any) {
+-				env[used++] = ':';
++		if (matched && liblen != 0) {
++			const char *use = library;
++			size_t uselen = liblen;
++#if defined(JACKPOTLTE)
++			char resolved[96];
++
++			if (a8_gl_resolve_inject(library, liblen, resolved, sizeof(resolved))) {
++				use = resolved;
++				uselen = strlen(resolved);
++				printf("A8 GL: injecting %s (USB-updatable) into %.*s
++",
++				    use, (int)(namelen > 64 ? 64 : namelen),
++				    name != NULL ? name : "?");
++			} else {
++				/* Log once-ish when this is the GL shim and we fell back. */
++				const char *base = library;
++				for (size_t i = 0; i < liblen; i++) {
++					if (library[i] == '/') {
++						base = library + i + 1;
++					}
++				}
++				if ((size_t)(library + liblen - base) == sizeof("libjackpotlte-gl.dylib") - 1 &&
++				    strncmp(base, "libjackpotlte-gl.dylib",
++				    sizeof("libjackpotlte-gl.dylib") - 1) == 0) {
++					printf("A8 GL: injecting %.*s (fallback) into %.*s
++",
++					    (int)liblen, library,
++					    (int)(namelen > 64 ? 64 : namelen),
++					    name != NULL ? name : "?");
++				}
++			}
++#endif /* JACKPOTLTE */
++			if (used + 1 + uselen < size) {
++				if (any) {
++					env[used++] = ':';
++				}
++				memcpy(env + used, use, uselen);
++				used += uselen;
++				env[used] = 0;
++				any = true;
+ 			}
+-			memcpy(env + used, library, liblen);
+-			used += liblen;
+-			env[used] = 0;
+-			any = true;
+ 		}
+ 	}
+ 	if (jt_gl_log != 0) {
