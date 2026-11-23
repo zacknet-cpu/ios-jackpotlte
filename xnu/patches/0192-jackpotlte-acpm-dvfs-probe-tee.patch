@@ -1,0 +1,1771 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6348d67..adbcbb0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/jackpotlte_mali.c		standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a8_files.c			standard
++bsd/dev/a8_acpm.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
+ bsd/dev/a5xelte_bt.c			standard
+ bsd/dev/a5xelte_sensors.c		standard
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index bf9bc85..2f698a2 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1599,6 +1599,35 @@ extern void a8f_end(void);
+ extern void a8f_ls(const char *args);
+ extern void a8f_date(const char *args);
+ extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
++/* 0192 */
++extern void a8_acpm_command(const char *args);  /* a8_acpm.c */
++extern void a8_dvfs_command(const char *args);
++extern void a8_tmu_command(const char *args);
++extern void a8_tee_set(const char *names);      /* mem.c */
++extern const char *a8_tee_get(void);
++extern bool a8_probe_read32(vm_offset_t va, uint32_t *value, uint32_t *esr);    /* sleh.c */
++extern void sweet_sample_task(const char *name, int pid, task_t task);         /* exception.c */
++
++/* "sample NAME|PID [N]": where each thread of a process is (SMP lines). */
++static const char *a8_sample_name;
++static int a8_sample_hits;
++
++static int
++a8_sample_proc(proc_t p, void *arg __unused)
++{
++	char name[20];
++
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, a8_sample_name) == 0) {
++		task_t task = proc_task(p);
++
++		if (task != TASK_NULL) {
++			sweet_sample_task(name, proc_pid(p), task);
++			a8_sample_hits++;
++		}
++	}
++	return PROC_RETURNED;
++}
+ 
+ static void
+ a8s_command(const char *line)
+@@ -1623,6 +1652,11 @@ a8s_command(const char *line)
+ 		    "(only under /private/var/) | date [SECONDS] | flip [0|1]\n");
+ 		printf("A8SH: X Y are panel pixels (1080x2220, as in shot x SCALE); "
+ 		    "numbers after tap/swipe/key/shot are decimal, peek/poke hex\n");
++		printf("A8SH: clocks (a8dvfs=1): acpm | acpm log | acpm fvp PATH | "
++		    "acpm send CH W0 W1 W2 W3 | dvfs | dvfs table [DOMAIN] | "
++		    "dvfs big|little|g3d KHZ | dvfs boot | tmu [on]\n");
++		printf("A8SH: looking: tee NAME,NAME|- (stderr and log of those programs, "
++		    "from their next start) | sample NAME|PID [N]\n");
+ 	} else if (a8s_word(line, "ping", &rest)) {
+ 		printf("A8SH: pong\n");
+ 	} else if (a8s_word(line, "stat", &rest)) {
+@@ -1758,19 +1792,41 @@ a8s_command(const char *line)
+ 			    "1-64 words inside one 4 KiB page\n");
+ 			return;
+ 		}
++		/* The CPU clusters' clock blocks (CMU_CPUCL1, CPUCL0, CPUCL2) are not
++		 * the kernel's to read: "peek 0x10900140" was a panic on 2026-11-23.
++		 * Their rates come from the power manager ("dvfs"). */
++		if (pa >= 0x10800000ull && pa < 0x10b00000ull) {
++			printf("A8SH: peek: 0x%llx is in a CPU cluster's clock block, which refuses "
++			    "the kernel; use dvfs\n", pa);
++			return;
++		}
+ 		vm_offset_t va = ml_io_map((vm_offset_t)(pa & ~0xfffull), 0x1000);
+ 		if (va == 0) {
+ 			printf("A8SH: map failed\n");
+ 			return;
+ 		}
++		/* Each word is a marked read (sleh.c): a block that refuses it is
++		 * reported, not a panic. */
+ 		for (uint64_t i = 0; i < words; i += 4) {
+ 			char out[96];
+ 			int len = snprintf(out, sizeof(out), "A8SH: %09llx:", pa + i * 4);
++			uint32_t esr = 0;
++			bool refused = false;
++
+ 			for (uint64_t j = i; j < words && j < i + 4; j++) {
+-				len += snprintf(out + len, sizeof(out) - (size_t)len, " %08x",
+-				    a8_usb_rd(va, (uint32_t)((pa & 0xfffu) + j * 4)));
++				uint32_t v = 0;
++
++				if (!a8_probe_read32(va + (vm_offset_t)((pa & 0xfffu) + j * 4), &v, &esr)) {
++					refused = true;
++					break;
++				}
++				len += snprintf(out + len, sizeof(out) - (size_t)len, " %08x", v);
+ 			}
+ 			printf("%s\n", out);
++			if (refused) {
++				printf("A8SH: peek: the read was refused (ESR 0x%x); stopped\n", esr);
++				break;
++			}
+ 		}
+ 	} else if (a8s_word(line, "poke", &rest)) {
+ 		uint64_t pa = a8s_hex(&rest, &ok);
+@@ -1809,6 +1865,78 @@ a8s_command(const char *line)
+ 			rest++;
+ 		}
+ 		a8f_date(rest);
++	} else if (a8s_word(line, "acpm", &rest)) {
++		a8_acpm_command(rest);
++	} else if (a8s_word(line, "dvfs", &rest)) {
++		a8_dvfs_command(rest);
++	} else if (a8s_word(line, "tmu", &rest)) {
++		a8_tmu_command(rest);
++	} else if (a8s_word(line, "tee", &rest)) {
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest != 0) {
++			a8_tee_set(rest);
++		}
++		printf("A8SH: tee: %s (on top of the boot list; a program named here logs to "
++		    "stderr from its next start: kill it)\n",
++		    a8_tee_get()[0] != 0 ? a8_tee_get() : "nothing");
++	} else if (a8s_word(line, "sample", &rest)) {
++		char name[20];
++		size_t n = 0;
++		long times = 1;
++		bool times_ok = false;
++
++		while (*rest == ' ') {
++			rest++;
++		}
++		while (rest[n] != 0 && rest[n] != ' ' && n < sizeof(name) - 1) {
++			name[n] = rest[n];
++			n++;
++		}
++		name[n] = 0;
++		if (rest[n] == ' ') {
++			const char *q = rest + n;
++			times = a8s_dec(&q, &times_ok);
++			if (!times_ok || times < 1 || times > 10) {
++				times = 1;
++			}
++		}
++		if (n == 0) {
++			printf("A8SH: sample NAME|PID [N 1-10]: user pc, lr and backtrace of every "
++			    "thread, N times 200 ms apart\n");
++		}
++		for (long k = 0; n != 0 && k < times; k++) {
++			if (k != 0) {
++				a8g_sleep_ms(200);
++			}
++			printf("SMP --- %s sample %ld of %ld\n", name, k + 1, times);
++			if (name[0] >= '0' && name[0] <= '9') {
++				int pid = 0;
++				for (size_t i = 0; i < n && name[i] >= '0' && name[i] <= '9'; i++) {
++					pid = pid * 10 + (name[i] - '0');
++				}
++				proc_t pp = pid > 0 ? proc_find(pid) : PROC_NULL;
++				if (pp == PROC_NULL) {
++					printf("A8SH: sample: no process %d\n", pid);
++					break;
++				}
++				char pname[20];
++				proc_name(pid, pname, sizeof(pname));
++				if (proc_task(pp) != TASK_NULL) {
++					sweet_sample_task(pname, pid, proc_task(pp));
++				}
++				proc_rele(pp);
++			} else {
++				a8_sample_name = name;
++				a8_sample_hits = 0;
++				proc_iterate(PROC_ALLPROCLIST, a8_sample_proc, NULL, NULL, NULL);
++				if (a8_sample_hits == 0) {
++					printf("A8SH: sample: no process named %s\n", name);
++					break;
++				}
++			}
++		}
+ 	} else if (a8s_word(line, "reboot", &rest)) {
+ 		while (*rest == ' ') {
+ 			rest++;
+diff --git a/bsd/dev/a8_acpm.c b/bsd/dev/a8_acpm.c
+new file mode 100644
+index 0000000..dcfe453
+--- /dev/null
++++ b/bsd/dev/a8_acpm.c
+@@ -0,0 +1,1260 @@
++/*
++ * A8 2018 (Exynos 7885): the clocks of the CPU clusters and the GPU, through
++ * the power manager that owns them.
++ *
++ * The 7885 does not let the kernel write its DVFS clocks or voltages.  A
++ * Cortex-M0+ in the always-on block (the "APM") runs Samsung's ACPM firmware,
++ * which holds the frequency/voltage map of each domain, drives the PMIC over
++ * its own bus and reprograms the PLLs itself; the kernel asks for a rate over
++ * a mailbox and a few words of shared SRAM.  S-Boot starts the framework and
++ * its DVFS plug-in and leaves every domain at its boot level: the Mali-G71 at
++ * 343 MHz, the A73 pair at 1352 MHz, the A53s at 1014 MHz (read off this
++ * phone on 2026-11-23, session handoff section 11).  Nothing in XNU ever
++ * asked for more, which is the larger part of why the UI draws 10-19 frames
++ * a second.
++ *
++ * What stock Linux does, and this file repeats (Samsung's 7885 kernel,
++ * drivers/soc/samsung/acpm/acpm.c, acpm_ipc.c and cal-if/acpm_dvfs.c,
++ * fvmap.c; the structures are fw_header/framework.h and common.h):
++ *
++ *  - shared SRAM 0x02052000 (0x1b000), mailbox 0x11c40000; the framework's
++ *    description of itself ("initdata") is at SRAM + 0x4b80: where the
++ *    plug-in table and the IPC channel table are.
++ *  - A channel is two queues of 16-byte commands in the SRAM.  To send: put
++ *    the command at the AP->APM queue's front, advance the front, raise the
++ *    channel's bit in the mailbox (INTGR0, upper half).  The answer comes
++ *    back in the APM->AP queue with the same 6-bit sequence number, and the
++ *    channel's bit in INTSR1.
++ *  - Rates are asked for on channel 0 (the clock controller's): {domain,
++ *    kHz, FREQ_REQ}, and read back with {domain, 0, FREQ_GET}.  Domains:
++ *    0 MIF, 1 INT, 2 the A73s ("big"), 3 the A53s ("little"), 4 G3D.
++ *  - Channel 0 belongs to the plug-in "exynos7885_acpm_fvp.fw", and that one
++ *    S-Boot does not start: Linux copies it into the SRAM at boot (12288
++ *    bytes at SRAM + 0x7800, from the kernel's built-in firmware) and
++ *    attaches it over channel 4.  The same bytes are in this phone's own
++ *    stock BOOT image; "acpm fvp PATH" loads them from a file on the data
++ *    volume and checks length and CRC before a byte is written.
++ *
++ * Nothing here runs unless the boot-args say a8dvfs=1, and then only on a
++ * console command (a5xelte_usb.c): there is no automatic governor.  A rate
++ * has to be one of the firmware's own table and not above the stock limit of
++ * its domain; raising one needs a temperature reading below a8dvfstemp
++ * (default 80 C), and a thread takes every raised domain back to its boot
++ * rate when the SoC gets hotter than that.
++ *
++ * Never read the CPU clusters' clock blocks (0x10800000, 0x10900000,
++ * 0x10a00000) from here: the read is refused and was a panic (sleh.c,
++ * a8_probe_read32).  CPU rates come from FREQ_GET.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <string.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool a8_probe_read32(vm_offset_t va, uint32_t *value, uint32_t *esr);    /* sleh.c */
++extern int a8f_read_whole(const char *path, uint8_t *buf, uint32_t max, uint32_t *got,
++    uint32_t *crc);                                                             /* a8_files.c */
++
++void a8_acpm_command(const char *args);
++void a8_dvfs_command(const char *args);
++void a8_tmu_command(const char *args);
++
++/* ---- where things are ---- */
++#define A8A_SRAM_PA             0x02052000u     /* acpm_ipc reg[1] */
++#define A8A_SRAM_SIZE           0x1b000u
++#define A8A_MBOX_PA             0x11c40000u     /* acpm_ipc reg[0] */
++#define A8A_MBOX_SIZE           0x1000u
++#define A8A_INITDATA            0x4b80u         /* acpm_ipc initdata-base */
++#define A8A_FVMAP_AFTER         0x6c00u         /* acpm fvmap_offset, from the DVFS plug-in's base */
++
++/* mailbox (acpm_ipc.h) */
++#define A8A_INTGR0              0x08u           /* AP -> APM: bit (16 + channel) */
++#define A8A_INTCR1              0x20u           /* APM -> AP: clear */
++#define A8A_INTMR1              0x24u           /* APM -> AP: mask */
++#define A8A_INTSR1              0x28u           /* APM -> AP: raw status */
++#define A8A_INTGR1              0x1cu
++
++/* command word 0 (acpm_ipc_ctrl.h) */
++#define A8A_PROTO_ID_SHIFT      26
++#define A8A_PROTO_ATTACH        (1u << 25)
++#define A8A_PROTO_DETACH        (1u << 24)
++#define A8A_PROTO_SEQ_SHIFT     16
++#define A8A_PROTO_SEQ_MASK      (0x3fu << A8A_PROTO_SEQ_SHIFT)
++
++/* DVFS requests, command word 2 (acpm_dvfs.h) */
++#define A8A_FREQ_REQ            0u
++#define A8A_FREQ_GET            1u
++
++#define A8A_CH_DVFS             0u              /* clock-controller acpm-ipc-channel */
++#define A8A_CH_FRAMEWORK        4u              /* acpm acpm-ipc-channel */
++#define A8A_TYPE_QUEUE          1u
++
++#define A8A_IPC_TIMEOUT_MS      150u            /* acpm_ipc.h IPC_TIMEOUT */
++
++/* The FVP plug-in, as it is in this phone's stock BOOT image (0xd00170) and
++ * in firmware/exynos7885_acpm_fvp.fw.ihex of Samsung's kernel. */
++#define A8A_FVP_NAME            "exynos7885_acpm_fvp.fw"
++#define A8A_FVP_BYTES           12288u
++#define A8A_FVP_CRC             0x14f4d437u
++#define A8A_FVP_BASE            0x7800u
++#define A8A_DVFS_NAME           "exynos7885_acpm_dvfs.fw"
++
++#define A8A_PLUGINS_MAX         8u
++#define A8A_CHANNELS_MAX        16u
++#define A8A_PLUGIN_WORDS        11u
++#define A8A_CHANNEL_WORDS       18u
++
++/* ---- DVFS domains (acpm_dvfs_exynos7885.h) ---- */
++#define A8A_DOM_MIF             0u
++#define A8A_DOM_INT             1u
++#define A8A_DOM_BIG             2u
++#define A8A_DOM_LITTLE          3u
++#define A8A_DOM_G3D             4u
++#define A8A_DOMAINS             5u
++#define A8A_LEVELS_MAX          32u
++
++static const char *const a8a_dom_name[A8A_DOMAINS] = { "mif", "int", "big", "little", "g3d" };
++/* The most each domain may be asked for: the stock kernel's own ceilings
++ * (cpufreq domain tables in the device tree top out at 2184000 and 1690000;
++ * mali gpu_max_clock is 1100000).  The firmware's tables go further (2496,
++ * 2002, 1300 MHz); those entries are not for this phone.  0: not ours to set. */
++static const uint32_t a8a_dom_cap[A8A_DOMAINS] = { 0, 0, 2184000u, 1690000u, 1100000u };
++
++/* ---- TMU (exynos_tmu.c, exynos78XX; device tree BIG/LITTLE@10070000, G3D@10074000) ---- */
++#define A8T_CPU_PA              0x10070000u
++#define A8T_G3D_PA              0x10074000u
++#define A8T_TRIMINFO            0x00u
++#define A8T_CONTROL             0x20u
++#define A8T_STATUS              0x28u
++#define A8T_CURRENT_TEMP        0x40u           /* sensor 0 in bits 8:0 */
++#define A8T_CORE_EN             (1u << 0)
++#define A8T_EFUSE               0x13au          /* samsung,tmu_efuse_value */
++#define A8T_FIRST_POINT         25              /* samsung,tmu_first_point_trim */
++#define A8T_SECOND_POINT        85              /* samsung,tmu_second_point_trim */
++
++/* G3D PLL, to show what a request did (jackpotlte_mali.c reads the same). */
++#define A8A_PMU_PA              0x11c80000u
++#define A8A_PMU_G3D_STATUS      0x40a4u
++#define A8A_CMU_G3D_PA          0x11400000u
++#define A8A_G3D_PLL_CON0        0x0120u
++
++struct a8a_plugin {
++	uint32_t id, base, ops, attached, size, stay, name_off;
++	char     name[32];
++};
++
++struct a8a_channel {
++	uint32_t id, owner, type, poll, len, esize;
++	uint32_t ap_rear, ap_front, ap_base;            /* AP -> APM (the firmware's rx_*) */
++	uint32_t apm_rear, apm_front, apm_base;         /* APM -> AP (the firmware's tx_*) */
++	uint32_t seq;
++};
++
++struct a8a_domain {
++	bool     ok;
++	uint32_t levels, init_lv, table;                /* table: SRAM offset of {kHz, uV} pairs */
++	uint32_t boot_khz;
++	uint32_t asked_khz;                             /* 0: never asked */
++	bool     raised;
++};
++
++static struct {
++	bool                    ready, failed, mask_set;
++	uint32_t                allow;                  /* boot-arg a8dvfs */
++	uint32_t                temp_limit;             /* boot-arg a8dvfstemp, C */
++	volatile uint32_t      *sram;
++	volatile uint32_t      *mbox;
++	volatile uint32_t      *tmu_cpu, *tmu_g3d, *pmu, *cmu_g3d;
++	uint32_t                init[26];
++	uint32_t                nplug, nchan, nap;
++	struct a8a_plugin       plug[A8A_PLUGINS_MAX];
++	struct a8a_channel      chan[A8A_CHANNELS_MAX];
++	uint32_t                fvmap;                  /* SRAM offset, 0: not found */
++	struct a8a_domain       dom[A8A_DOMAINS];
++	bool                    watching, hot;
++	uint32_t                watch_ticks, tmu_misses;
++	int                     watch_chan;
++} a8a;
++
++static LCK_GRP_DECLARE(a8a_grp, "a8acpm");
++static LCK_MTX_DECLARE(a8a_lock, &a8a_grp);
++
++/* ---- the shared SRAM ---- */
++static bool
++a8a_in(uint32_t off, uint32_t len)
++{
++	return (off & 3u) == 0 && off < A8A_SRAM_SIZE && len <= A8A_SRAM_SIZE - off;
++}
++
++static uint32_t
++a8a_rd(uint32_t off)
++{
++	if (a8a.sram == NULL || !a8a_in(off, 4)) {
++		return 0;
++	}
++	return a8a.sram[off >> 2];
++}
++
++static void
++a8a_wr(uint32_t off, uint32_t value)
++{
++	if (a8a.sram != NULL && a8a_in(off, 4)) {
++		a8a.sram[off >> 2] = value;
++	}
++}
++
++static uint32_t
++a8a_rd8(uint32_t off)
++{
++	return (a8a_rd(off & ~3u) >> ((off & 3u) * 8u)) & 0xffu;
++}
++
++static uint32_t
++a8a_rd16(uint32_t off)
++{
++	return a8a_rd8(off) | (a8a_rd8(off + 1) << 8);
++}
++
++static uint32_t
++a8a_mb(uint32_t reg)
++{
++	return a8a.mbox[reg >> 2];
++}
++
++static void
++a8a_mb_wr(uint32_t reg, uint32_t value)
++{
++	a8a.mbox[reg >> 2] = value;
++}
++
++/* Whether s contains sub (the kernel has no strstr). */
++static bool
++a8a_has(const char *s, const char *sub)
++{
++	size_t n = strlen(sub);
++
++	for (; *s; s++) {
++		if (strncmp(s, sub, n) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* ---- the framework's tables ---- */
++static void
++a8a_read_plugins(void)
++{
++	for (uint32_t i = 0; i < a8a.nplug; i++) {
++		uint32_t at = a8a.init[0] + i * A8A_PLUGIN_WORDS * 4u;
++		struct a8a_plugin *p = &a8a.plug[i];
++
++		p->id = a8a_rd(at);
++		p->base = a8a_rd(at + 4);
++		p->ops = a8a_rd(at + 12);
++		p->attached = a8a_rd(at + 28) & 0xffu;
++		p->size = a8a_rd(at + 32);
++		p->stay = a8a_rd(at + 36) & 0xffu;
++		p->name_off = a8a_rd(at + 40);
++		p->name[0] = 0;
++		if (p->name_off != 0 && a8a_in(p->name_off & ~3u, sizeof(p->name))) {
++			for (uint32_t k = 0; k < sizeof(p->name) - 1; k++) {
++				char c = (char)a8a_rd8(p->name_off + k);
++				if (c < 0x20 || c > 0x7e) {
++					c = 0;
++				}
++				p->name[k] = c;
++				p->name[k + 1] = 0;
++				if (c == 0) {
++					break;
++				}
++			}
++		}
++	}
++}
++
++static struct a8a_plugin *
++a8a_plugin_named(const char *name)
++{
++	for (uint32_t i = 0; i < a8a.nplug; i++) {
++		if (strcmp(a8a.plug[i].name, name) == 0) {
++			return &a8a.plug[i];
++		}
++	}
++	return NULL;
++}
++
++static struct a8a_channel *
++a8a_channel(uint32_t id)
++{
++	for (uint32_t i = 0; i < a8a.nap; i++) {
++		if (a8a.chan[i].id == id) {
++			return &a8a.chan[i];
++		}
++	}
++	return NULL;
++}
++
++/*
++ * The frequency/voltage map behind the DVFS plug-in (fvmap.h): one 24-byte
++ * header a domain, then {kHz, uV} pairs, fastest first.
++ */
++static void
++a8a_read_fvmap(void)
++{
++	struct a8a_plugin *dvfs = a8a_plugin_named(A8A_DVFS_NAME);
++
++	a8a.fvmap = 0;
++	for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++		a8a.dom[d].ok = false;
++	}
++	if (dvfs == NULL || !dvfs->attached) {
++		return;
++	}
++	uint32_t base = (dvfs->base & ~1u) + A8A_FVMAP_AFTER;
++	if (!a8a_in(base, 0x800)) {
++		return;
++	}
++	for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++		uint32_t h = base + d * 24u;
++		struct a8a_domain *dom = &a8a.dom[d];
++		uint32_t levels = a8a_rd8(h + 1);
++		uint32_t init_lv = a8a_rd8(h + 8);
++		uint32_t table = base + a8a_rd16(h + 20);
++		uint32_t last = 0xffffffffu;
++		bool ok = a8a_rd8(h) == d && levels >= 1 && levels <= A8A_LEVELS_MAX &&
++		    init_lv < levels && a8a_in(table, levels * 8u);
++
++		for (uint32_t i = 0; ok && i < levels; i++) {
++			uint32_t khz = a8a_rd(table + i * 8u);
++			uint32_t uv = a8a_rd(table + i * 8u + 4);
++
++			/* fastest first, and volts a PMIC buck can make */
++			if (khz == 0 || khz >= last || uv < 400000u || uv > 1400000u) {
++				ok = false;
++			}
++			last = khz;
++		}
++		if (!ok) {
++			printf("A8A: fvmap domain %u (%s) does not look like one: type %u, %u levels, "
++			    "init %u, table 0x%x\n", d, a8a_dom_name[d], a8a_rd8(h), levels, init_lv, table);
++			continue;
++		}
++		dom->levels = levels;
++		dom->init_lv = init_lv;
++		dom->table = table;
++		dom->boot_khz = a8a_rd(table + init_lv * 8u);
++		dom->ok = true;
++	}
++	a8a.fvmap = base;
++}
++
++static bool
++a8a_init(void)
++{
++	if (a8a.ready) {
++		return true;
++	}
++	if (a8a.failed) {
++		return false;
++	}
++	a8a.temp_limit = 80;
++	(void)PE_parse_boot_argn("a8dvfs", &a8a.allow, sizeof(a8a.allow));
++	(void)PE_parse_boot_argn("a8dvfstemp", &a8a.temp_limit, sizeof(a8a.temp_limit));
++	if (a8a.temp_limit < 40 || a8a.temp_limit > 95) {
++		a8a.temp_limit = 80;
++	}
++	a8a.sram = (volatile uint32_t *)ml_io_map(A8A_SRAM_PA, A8A_SRAM_SIZE);
++	a8a.mbox = (volatile uint32_t *)ml_io_map(A8A_MBOX_PA, A8A_MBOX_SIZE);
++	if (a8a.sram == NULL || a8a.mbox == NULL) {
++		printf("A8A: cannot map the power manager's SRAM or mailbox\n");
++		a8a.failed = true;
++		return false;
++	}
++	for (uint32_t i = 0; i < 26; i++) {
++		a8a.init[i] = a8a_rd(A8A_INITDATA + i * 4u);
++	}
++	a8a.nplug = a8a.init[1];
++	a8a.nchan = a8a.init[3];
++	a8a.nap = a8a.init[6];
++	if (a8a.nplug == 0 || a8a.nplug > A8A_PLUGINS_MAX || a8a.nchan == 0 ||
++	    a8a.nchan > A8A_CHANNELS_MAX || a8a.nap == 0 || a8a.nap > a8a.nchan ||
++	    !a8a_in(a8a.init[0], a8a.nplug * A8A_PLUGIN_WORDS * 4u) ||
++	    !a8a_in(a8a.init[2], a8a.nchan * A8A_CHANNEL_WORDS * 4u)) {
++		printf("A8A: no ACPM framework at SRAM + 0x%x: plugins 0x%x x %u, channels 0x%x x %u, "
++		    "%u for the AP\n", A8A_INITDATA, a8a.init[0], a8a.nplug, a8a.init[2], a8a.nchan,
++		    a8a.nap);
++		a8a.failed = true;
++		return false;
++	}
++	a8a_read_plugins();
++	for (uint32_t i = 0; i < a8a.nchan; i++) {
++		uint32_t at = a8a.init[2] + i * A8A_CHANNEL_WORDS * 4u;
++		struct a8a_channel *c = &a8a.chan[i];
++
++		c->id = a8a_rd(at);
++		c->owner = a8a_rd(at + 8);
++		c->type = a8a_rd(at + 12);
++		c->ap_rear = a8a_rd(at + 16);
++		c->ap_front = a8a_rd(at + 20);
++		c->ap_base = a8a_rd(at + 24);
++		c->apm_rear = a8a_rd(at + 40);
++		c->apm_front = a8a_rd(at + 44);
++		c->apm_base = a8a_rd(at + 48);
++		c->len = a8a_rd(at + 52);
++		c->esize = a8a_rd(at + 56);
++		c->poll = a8a_rd(at + 68);
++		c->seq = 0;
++	}
++	a8a_read_fvmap();
++	a8a.ready = true;
++	return true;
++}
++
++/* ---- IPC (acpm_ipc.c: acpm_ipc_send_data, check_response) ---- */
++static bool
++a8a_channel_usable(const struct a8a_channel *c)
++{
++	return c != NULL && c->type == A8A_TYPE_QUEUE && c->poll == 1 && c->esize == 16 &&
++	       c->len >= 2 && c->len <= 64 && c->id < 16 &&
++	       a8a_in(c->ap_rear, 4) && a8a_in(c->ap_front, 4) && a8a_in(c->ap_base, c->len * 16u) &&
++	       a8a_in(c->apm_rear, 4) && a8a_in(c->apm_front, 4) && a8a_in(c->apm_base, c->len * 16u);
++}
++
++/* The answer with our sequence number, if it is in the APM->AP queue. */
++static bool
++a8a_take_answer(struct a8a_channel *c, uint32_t cmd[4])
++{
++	uint32_t front = a8a_rd(c->apm_front);
++	uint32_t rear = a8a_rd(c->apm_rear);
++	uint32_t want = cmd[0] & A8A_PROTO_SEQ_MASK;
++
++	if (front >= c->len || rear >= c->len) {
++		return false;
++	}
++	for (uint32_t i = rear; i != front; i = (i + 1) % c->len) {
++		uint32_t at = c->apm_base + i * 16u;
++
++		if ((a8a_rd(at) & A8A_PROTO_SEQ_MASK) != want) {
++			continue;
++		}
++		for (uint32_t k = 0; k < 4; k++) {
++			cmd[k] = a8a_rd(at + k * 4u);
++		}
++		/* Take it out: the oldest entry moves into its place. */
++		if (i != rear) {
++			for (uint32_t k = 0; k < 4; k++) {
++				a8a_wr(at + k * 4u, a8a_rd(c->apm_base + rear * 16u + k * 4u));
++			}
++		}
++		rear = (rear + 1) % c->len;
++		a8a_wr(c->apm_rear, rear);
++		if (rear == a8a_rd(c->apm_front)) {
++			a8a_mb_wr(A8A_INTCR1, 1u << c->id);
++			if (rear != a8a_rd(c->apm_front)) {
++				a8a_mb_wr(A8A_INTGR1, 1u << c->id);
++			}
++		}
++		return true;
++	}
++	return false;
++}
++
++/*
++ * One command and its answer.  cmd comes back as the answer.  0, or EINVAL
++ * (no such queue), ENOSPC (the queue stayed full), ETIMEDOUT (no answer).
++ * Called with a8a_lock held.
++ */
++static int
++a8a_ipc(uint32_t id, uint32_t cmd[4])
++{
++	struct a8a_channel *c = a8a_channel(id);
++	uint64_t deadline;
++	uint32_t front, next;
++
++	if (!a8a_channel_usable(c)) {
++		printf("A8A: channel %u is not a polled queue of 16-byte commands\n", id);
++		return EINVAL;
++	}
++	if (!a8a.mask_set) {
++		/* channel_init(): the channels the AP polls do not interrupt it. */
++		uint32_t mask = 0;
++
++		for (uint32_t i = 0; i < a8a.nap; i++) {
++			if (a8a.chan[i].poll == 1 && a8a.chan[i].id < 16) {
++				mask |= 1u << a8a.chan[i].id;
++			}
++		}
++		a8a_mb_wr(A8A_INTMR1, mask);
++		a8a.mask_set = true;
++	}
++	/*
++	 * Answers nobody is waiting for any more (a command that timed out and
++	 * was answered late): one caller at a time uses a channel here, so
++	 * whatever is in the APM->AP queue now is stale.  Left there, they
++	 * would fill it and the firmware could not answer again.
++	 */
++	{
++		uint32_t stale_rear = a8a_rd(c->apm_rear), stale_front = a8a_rd(c->apm_front);
++		uint32_t dropped = 0;
++
++		while (stale_rear < c->len && stale_front < c->len && stale_rear != stale_front &&
++		    dropped < c->len) {
++			printf("A8A: channel %u: dropping a late answer 0x%08x 0x%x 0x%x 0x%x\n", id,
++			    a8a_rd(c->apm_base + stale_rear * 16u), a8a_rd(c->apm_base + stale_rear * 16u + 4),
++			    a8a_rd(c->apm_base + stale_rear * 16u + 8),
++			    a8a_rd(c->apm_base + stale_rear * 16u + 12));
++			stale_rear = (stale_rear + 1) % c->len;
++			a8a_wr(c->apm_rear, stale_rear);
++			stale_front = a8a_rd(c->apm_front);
++			dropped++;
++		}
++		if (dropped != 0 && stale_rear == a8a_rd(c->apm_front)) {
++			a8a_mb_wr(A8A_INTCR1, 1u << c->id);
++		}
++	}
++	front = a8a_rd(c->ap_front);
++	if (front >= c->len) {
++		printf("A8A: channel %u front %u is past its %u entries\n", id, front, c->len);
++		return EINVAL;
++	}
++	next = (front + 1) % c->len;
++	clock_interval_to_deadline(A8A_IPC_TIMEOUT_MS, NSEC_PER_MSEC, &deadline);
++	while (next == a8a_rd(c->ap_rear)) {
++		if (mach_absolute_time() > deadline) {
++			printf("A8A: channel %u stayed full (rear %u front %u): the plug-in behind it "
++			    "is not taking commands\n", id, a8a_rd(c->ap_rear), front);
++			return ENOSPC;
++		}
++		delay(50);
++	}
++	if (++c->seq == 64) {
++		c->seq = 1;
++	}
++	cmd[0] = (cmd[0] & ~A8A_PROTO_SEQ_MASK) | (c->seq << A8A_PROTO_SEQ_SHIFT);
++	for (uint32_t k = 0; k < 4; k++) {
++		a8a_wr(c->ap_base + front * 16u + k * 4u, cmd[k]);
++	}
++	cmd[1] = cmd[2] = cmd[3] = 0;
++	a8a_wr(c->ap_front, next);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a8a_mb_wr(A8A_INTGR0, (1u << c->id) << 16);
++
++	clock_interval_to_deadline(A8A_IPC_TIMEOUT_MS, NSEC_PER_MSEC, &deadline);
++	for (;;) {
++		if ((a8a_mb(A8A_INTSR1) & (1u << c->id)) != 0 && a8a_take_answer(c, cmd)) {
++			return 0;
++		}
++		if (mach_absolute_time() > deadline) {
++			if (a8a_take_answer(c, cmd)) {
++				return 0;
++			}
++			printf("A8A: channel %u: no answer in %u ms (seq %u; INTSR1 0x%x; AP->APM rear %u "
++			    "front %u; APM->AP rear %u front %u)\n", id, A8A_IPC_TIMEOUT_MS, c->seq,
++			    a8a_mb(A8A_INTSR1), a8a_rd(c->ap_rear), a8a_rd(c->ap_front),
++			    a8a_rd(c->apm_rear), a8a_rd(c->apm_front));
++			return ETIMEDOUT;
++		}
++		delay(50);
++	}
++}
++
++/* ---- the firmware's own log (acpm_ipc.c acpm_log_print) ---- */
++static void
++a8a_log_dump(void)
++{
++	uint32_t rear_at = a8a.init[13], front_at = a8a.init[14], base = a8a.init[15];
++	uint32_t esize = a8a.init[16], len = a8a.init[17];
++	uint32_t front, rear, waiting, shown = 0;
++
++	if (esize != 16 || len == 0 || len > 4096 || !a8a_in(rear_at, 4) || !a8a_in(front_at, 4) ||
++	    !a8a_in(base, len * esize)) {
++		printf("A8A LOG: no log buffer (base 0x%x, %u x %u bytes)\n", base, len, esize);
++		return;
++	}
++	front = a8a_rd(front_at);
++	rear = a8a_rd(rear_at);
++	if (front >= len || rear >= len) {
++		printf("A8A LOG: rear %u front %u are past %u entries\n", rear, front, len);
++		return;
++	}
++	waiting = (front + len - rear) % len;
++	printf("A8A LOG: %u entries waiting (the last 64 are shown)\n", waiting);
++	while (rear != front) {
++		if (waiting <= 64) {
++			uint32_t at = base + rear * esize;
++			uint32_t head = a8a_rd(at);
++			char text[9];
++
++			for (uint32_t k = 0; k < 8; k++) {
++				char ch = (char)a8a_rd8(at + 4 + k);
++				text[k] = (ch >= 0x20 && ch <= 0x7e) ? ch : (ch == 0 ? 0 : '?');
++			}
++			text[8] = 0;
++			printf("A8A LOG: plugin %u tick %u %s 0x%x\n", head >> 29, head & 0x7fffffu, text,
++			    a8a_rd(at + 12));
++			shown++;
++		}
++		waiting--;
++		rear = (rear + 1) % len;
++	}
++	a8a_wr(rear_at, rear);
++	printf("A8A LOG: end (%u shown)\n", shown);
++}
++
++/* ---- status ---- */
++static void
++a8a_status(void)
++{
++	a8a_read_plugins();
++	printf("A8A: framework at SRAM + 0x%x: %u plug-ins at 0x%x, %u channels at 0x%x (%u for the "
++	    "AP), IPC area 0x%x, framework 0x%x bytes; a8dvfs=%u, limit %u C\n", A8A_INITDATA,
++	    a8a.nplug, a8a.init[0], a8a.nchan, a8a.init[2], a8a.nap, a8a.init[18], a8a.init[21],
++	    a8a.allow, a8a.temp_limit);
++	for (uint32_t i = 0; i < a8a.nplug; i++) {
++		const struct a8a_plugin *p = &a8a.plug[i];
++
++		printf("A8A: plug-in %u: base 0x%x size 0x%x ops 0x%x attached %u stay %u %s\n", p->id,
++		    p->base & ~1u, p->size, p->ops, p->attached, p->stay,
++		    p->name[0] ? p->name : "(built in)");
++	}
++	for (uint32_t i = 0; i < a8a.nap; i++) {
++		const struct a8a_channel *c = &a8a.chan[i];
++
++		printf("A8A: channel %u: owner 0x%x %s %s, %u x %u bytes; AP->APM rear %u front %u; "
++		    "APM->AP rear %u front %u\n", c->id, c->owner,
++		    c->type == A8A_TYPE_QUEUE ? "queue" : "buffer", c->poll ? "polled" : "interrupt",
++		    c->len, c->esize, a8a_rd(c->ap_rear), a8a_rd(c->ap_front), a8a_rd(c->apm_rear),
++		    a8a_rd(c->apm_front));
++	}
++	printf("A8A: mailbox INTMR1 0x%x INTSR1 0x%x; fvmap at SRAM + 0x%x\n", a8a_mb(A8A_INTMR1),
++	    a8a_mb(A8A_INTSR1), a8a.fvmap);
++}
++
++/* ---- loading the FVP plug-in (acpm.c plugins_init, handle_dynamic_plugin) ---- */
++static void
++a8a_fvp_load(const char *path)
++{
++	struct a8a_plugin *fvp;
++	uint32_t got = 0, crc = 0, base, cmd[4];
++	uint8_t *buf;
++	int error;
++
++	a8a_read_plugins();
++	fvp = a8a_plugin_named(A8A_FVP_NAME);
++	if (fvp == NULL) {
++		printf("A8A FVP: the framework lists no plug-in named %s\n", A8A_FVP_NAME);
++		return;
++	}
++	if (fvp->attached) {
++		printf("A8A FVP: plug-in %u is attached already (ops 0x%x)\n", fvp->id, fvp->ops);
++		return;
++	}
++	base = fvp->base & ~1u;
++	if (!fvp->stay || base != A8A_FVP_BASE || fvp->size != A8A_FVP_BYTES ||
++	    !a8a_in(base, A8A_FVP_BYTES)) {
++		printf("A8A FVP: plug-in %u is not where this phone had it: base 0x%x size 0x%x "
++		    "stay %u (want 0x%x, 0x%x, 1); nothing written\n", fvp->id, base, fvp->size,
++		    fvp->stay, A8A_FVP_BASE, A8A_FVP_BYTES);
++		return;
++	}
++	/* Its room must not be anyone else's. */
++	for (uint32_t i = 0; i < a8a.nplug; i++) {
++		const struct a8a_plugin *p = &a8a.plug[i];
++		uint32_t pb = p->base & ~1u;
++
++		if (p != fvp && p->attached && p->size != 0 && pb < base + A8A_FVP_BYTES &&
++		    base < pb + p->size) {
++			printf("A8A FVP: its room 0x%x-0x%x is inside attached plug-in %u (0x%x-0x%x); "
++			    "nothing written\n", base, base + A8A_FVP_BYTES, p->id, pb, pb + p->size);
++			return;
++		}
++	}
++	if (!a8a_channel_usable(a8a_channel(A8A_CH_FRAMEWORK))) {
++		printf("A8A FVP: the framework's channel %u is not usable; nothing written\n",
++		    A8A_CH_FRAMEWORK);
++		return;
++	}
++	buf = kalloc_data(A8A_FVP_BYTES, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		printf("A8A FVP: no memory\n");
++		return;
++	}
++	error = a8f_read_whole(path, buf, A8A_FVP_BYTES, &got, &crc);
++	if (error || got != A8A_FVP_BYTES || crc != A8A_FVP_CRC) {
++		printf("A8A FVP: %s: error %d, %u bytes, crc %08x; want %u bytes, crc %08x; nothing "
++		    "written\n", path, error, got, crc, A8A_FVP_BYTES, A8A_FVP_CRC);
++		kfree_data(buf, A8A_FVP_BYTES);
++		return;
++	}
++	printf("A8A FVP: %s is the plug-in (%u bytes, crc %08x); its room at SRAM + 0x%x starts "
++	    "0x%08x 0x%08x\n", path, got, crc, base, a8a_rd(base), a8a_rd(base + 4));
++	for (uint32_t off = 0; off < A8A_FVP_BYTES; off += 4) {
++		uint32_t word;
++
++		memcpy(&word, buf + off, 4);
++		a8a_wr(base + off, word);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t off = 0; off < A8A_FVP_BYTES; off += 4) {
++		uint32_t word;
++
++		memcpy(&word, buf + off, 4);
++		if (a8a_rd(base + off) != word) {
++			printf("A8A FVP: SRAM + 0x%x reads 0x%08x, not 0x%08x: not attached\n", base + off,
++			    a8a_rd(base + off), word);
++			kfree_data(buf, A8A_FVP_BYTES);
++			return;
++		}
++	}
++	kfree_data(buf, A8A_FVP_BYTES);
++
++	cmd[0] = A8A_PROTO_ATTACH | (fvp->id << A8A_PROTO_ID_SHIFT);
++	cmd[1] = cmd[2] = cmd[3] = 0;
++	error = a8a_ipc(A8A_CH_FRAMEWORK, cmd);
++	a8a_read_plugins();
++	printf("A8A FVP: attach %s: answer 0x%08x 0x%x 0x%x 0x%x; plug-in %u attached %u ops 0x%x\n",
++	    error ? "FAILED" : "sent", cmd[0], cmd[1], cmd[2], cmd[3], fvp->id, fvp->attached,
++	    fvp->ops);
++	if (!error && fvp->attached) {
++		printf("A8A FVP: attached; \"dvfs\" now reads the rates\n");
++	}
++}
++
++/* ---- temperature ---- */
++static void
++a8t_map(void)
++{
++	if (a8a.tmu_cpu == NULL) {
++		a8a.tmu_cpu = (volatile uint32_t *)ml_io_map(A8T_CPU_PA, 0x1000);
++		a8a.tmu_g3d = (volatile uint32_t *)ml_io_map(A8T_G3D_PA, 0x1000);
++		a8a.pmu = (volatile uint32_t *)ml_io_map(A8A_PMU_PA, 0x10000);
++		a8a.cmu_g3d = (volatile uint32_t *)ml_io_map(A8A_CMU_G3D_PA, 0x1000);
++	}
++}
++
++/*
++ * One sensor block: degrees C, or false with why in raw[]/esr.  raw is
++ * {TRIMINFO, CONTROL, STATUS, CURRENT_TEMP}.
++ */
++static bool
++a8t_read(volatile uint32_t *base, int *celsius, uint32_t raw[4], uint32_t *esr)
++{
++	static const uint32_t regs[4] = { A8T_TRIMINFO, A8T_CONTROL, A8T_STATUS, A8T_CURRENT_TEMP };
++	int code, e1, e2, temp;
++
++	*esr = 0;
++	raw[0] = raw[1] = raw[2] = raw[3] = 0;
++	if (base == NULL) {
++		return false;
++	}
++	for (int i = 0; i < 4; i++) {
++		if (!a8_probe_read32((vm_offset_t)&base[regs[i] >> 2], &raw[i], esr)) {
++			return false;
++		}
++	}
++	code = (int)(raw[3] & 0x1ffu);
++	if ((raw[1] & A8T_CORE_EN) == 0 || code == 0) {
++		return false;
++	}
++	e1 = (int)(raw[0] & 0x1ffu);
++	e2 = (int)((raw[0] >> 9) & 0x1ffu);
++	if (e1 == 0) {
++		e1 = (int)(A8T_EFUSE & 0x1ffu);
++	}
++	if (((raw[0] >> 23) & 1u) != 0 && e2 > e1) {
++		temp = (code - e1) * (A8T_SECOND_POINT - A8T_FIRST_POINT) / (e2 - e1) + A8T_FIRST_POINT;
++	} else {
++		temp = code - e1 + A8T_FIRST_POINT;
++	}
++	if (temp < -20 || temp > 150) {
++		return false;
++	}
++	*celsius = temp;
++	return true;
++}
++
++/* The hotter of the two sensors; false when neither reads. */
++static bool
++a8t_hottest(int *celsius, int *cpu, int *g3d)
++{
++	uint32_t raw[4], esr;
++	bool have_cpu, have_g3d;
++
++	a8t_map();
++	*cpu = *g3d = -1;
++	have_cpu = a8t_read(a8a.tmu_cpu, cpu, raw, &esr);
++	have_g3d = a8t_read(a8a.tmu_g3d, g3d, raw, &esr);
++	if (!have_cpu && !have_g3d) {
++		return false;
++	}
++	*celsius = (have_cpu && (!have_g3d || *cpu >= *g3d)) ? *cpu : *g3d;
++	return true;
++}
++
++/* ---- DVFS ---- */
++static bool
++a8a_fvp_attached(void)
++{
++	struct a8a_plugin *fvp;
++
++	a8a_read_plugins();
++	fvp = a8a_plugin_named(A8A_FVP_NAME);
++	return fvp != NULL && fvp->attached;
++}
++
++static int
++a8a_get_rate(uint32_t domain, uint32_t *khz)
++{
++	uint32_t cmd[4] = { domain, 0, A8A_FREQ_GET, 0 };
++	int error = a8a_ipc(A8A_CH_DVFS, cmd);
++
++	*khz = error ? 0 : cmd[1];
++	return error;
++}
++
++static int
++a8a_set_rate(uint32_t domain, uint32_t khz, uint32_t answer[4])
++{
++	uint32_t cmd[4] = { domain, khz, A8A_FREQ_REQ, 0 };
++	int error = a8a_ipc(A8A_CH_DVFS, cmd);
++
++	for (int k = 0; k < 4; k++) {
++		answer[k] = cmd[k];
++	}
++	return error;
++}
++
++/* The G3D PLL as the clock block has it now, in kHz; 0: not readable. */
++static uint32_t
++a8a_g3d_pll_khz(uint32_t *con0)
++{
++	uint32_t status = 0, con = 0, esr = 0, m, p, s;
++
++	a8t_map();
++	*con0 = 0;
++	if (a8a.pmu == NULL || a8a.cmu_g3d == NULL ||
++	    !a8_probe_read32((vm_offset_t)&a8a.pmu[A8A_PMU_G3D_STATUS >> 2], &status, &esr) ||
++	    (status & 0xfu) != 0xfu ||
++	    !a8_probe_read32((vm_offset_t)&a8a.cmu_g3d[A8A_G3D_PLL_CON0 >> 2], &con, &esr)) {
++		return 0;
++	}
++	*con0 = con;
++	m = (con >> 16) & 0x3ffu;
++	p = (con >> 8) & 0x3fu;
++	s = con & 0x7u;
++	if (p == 0) {
++		return 0;
++	}
++	return (uint32_t)((26000ull * m / p) >> s);
++}
++
++static void
++a8a_dvfs_table(uint32_t d)
++{
++	const struct a8a_domain *dom = &a8a.dom[d];
++
++	if (!dom->ok) {
++		printf("A8 DVFS: %s: no table\n", a8a_dom_name[d]);
++		return;
++	}
++	for (uint32_t i = 0; i < dom->levels; i++) {
++		uint32_t khz = a8a_rd(dom->table + i * 8u);
++
++		printf("A8 DVFS: %s level %u: %u kHz at %u uV%s%s\n", a8a_dom_name[d], i, khz,
++		    a8a_rd(dom->table + i * 8u + 4), i == dom->init_lv ? " (boot)" : "",
++		    (a8a_dom_cap[d] != 0 && khz > a8a_dom_cap[d]) ? " (above the stock limit)" : "");
++	}
++}
++
++static void
++a8a_dvfs_report(const char *why)
++{
++	bool attached = a8a_fvp_attached();
++	char line[400];
++	int len, hot = 0, cpu = -1, g3d = -1;
++	uint32_t con0 = 0, pll;
++
++	len = snprintf(line, sizeof(line), "A8 DVFS (%s):", why);
++	for (uint32_t d = 0; d < A8A_DOMAINS && len < (int)sizeof(line) - 60; d++) {
++		const struct a8a_domain *dom = &a8a.dom[d];
++		uint32_t khz = 0;
++
++		if (attached && a8a_get_rate(d, &khz) == 0) {
++			len += snprintf(line + len, sizeof(line) - len, " %s %u", a8a_dom_name[d], khz);
++		} else if (dom->ok) {
++			len += snprintf(line + len, sizeof(line) - len, " %s boot %u", a8a_dom_name[d],
++			    dom->boot_khz);
++		} else {
++			len += snprintf(line + len, sizeof(line) - len, " %s ?", a8a_dom_name[d]);
++		}
++	}
++	pll = a8a_g3d_pll_khz(&con0);
++	len += snprintf(line + len, sizeof(line) - len, " kHz; G3D PLL %u kHz (0x%x)", pll, con0);
++	if (a8t_hottest(&hot, &cpu, &g3d)) {
++		len += snprintf(line + len, sizeof(line) - len, "; %d C cpu, %d C g3d", cpu, g3d);
++	} else {
++		len += snprintf(line + len, sizeof(line) - len, "; no temperature");
++	}
++	printf("%s%s\n", line, attached ? "" : "; FVP plug-in not attached, rates are the boot levels");
++}
++
++static void
++a8a_watch_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		uint64_t deadline;
++		int hot = 0, cpu = -1, g3d = -1;
++		bool any = false, have;
++
++		clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&a8a.watch_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		lck_mtx_lock(&a8a_lock);
++		for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++			any = any || a8a.dom[d].raised;
++		}
++		have = a8t_hottest(&hot, &cpu, &g3d);
++		if (have) {
++			a8a.tmu_misses = 0;
++			if (a8a.hot && hot + 10 <= (int)a8a.temp_limit) {
++				a8a.hot = false;
++				printf("A8 DVFS: %d C, cool enough to raise a clock again\n", hot);
++			}
++		} else if (any) {
++			a8a.tmu_misses++;
++		}
++		if (any && ((have && hot >= (int)a8a.temp_limit) ||
++		    (!have && a8a.tmu_misses >= 3 && a8a.allow < 2))) {
++			if (have) {
++				printf("A8 DVFS: %d C (cpu %d, g3d %d) is at the %u C limit: back to the boot "
++				    "rates\n", hot, cpu, g3d, a8a.temp_limit);
++			} else {
++				printf("A8 DVFS: the temperature stopped reading: back to the boot rates\n");
++			}
++			for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++				struct a8a_domain *dom = &a8a.dom[d];
++				uint32_t answer[4];
++
++				if (!dom->raised) {
++					continue;
++				}
++				if (a8a_set_rate(d, dom->boot_khz, answer) == 0) {
++					dom->raised = false;
++					dom->asked_khz = dom->boot_khz;
++				} else {
++					printf("A8 DVFS: %s did not take %u kHz back\n", a8a_dom_name[d],
++					    dom->boot_khz);
++				}
++			}
++			a8a.hot = true;
++			a8a_dvfs_report("after the limit");
++		} else if (any && ++a8a.watch_ticks % 15 == 0) {
++			a8a_dvfs_report("every 30 s");
++		}
++		lck_mtx_unlock(&a8a_lock);
++	}
++}
++
++static void
++a8a_dvfs_set(uint32_t d, uint32_t khz)
++{
++	struct a8a_domain *dom = &a8a.dom[d];
++	uint32_t now = 0, after = 0, answer[4], uv = 0;
++	int hot = 0, cpu = -1, g3d = -1;
++	bool listed = false, have_temp;
++	int error;
++
++	if (a8a.allow == 0) {
++		printf("A8 DVFS: off; boot with a8dvfs=1 to allow rate requests\n");
++		return;
++	}
++	if (a8a_dom_cap[d] == 0 || !dom->ok) {
++		printf("A8 DVFS: %s is not a domain to set from here (big, little, g3d)\n",
++		    a8a_dom_name[d]);
++		return;
++	}
++	if (!a8a_fvp_attached()) {
++		printf("A8 DVFS: the FVP plug-in is not attached (acpm fvp PATH first)\n");
++		return;
++	}
++	for (uint32_t i = 0; i < dom->levels; i++) {
++		if (a8a_rd(dom->table + i * 8u) == khz) {
++			listed = true;
++			uv = a8a_rd(dom->table + i * 8u + 4);
++		}
++	}
++	if (!listed) {
++		printf("A8 DVFS: %u kHz is not a level of %s (dvfs table %s)\n", khz, a8a_dom_name[d],
++		    a8a_dom_name[d]);
++		return;
++	}
++	if (khz > a8a_dom_cap[d]) {
++		printf("A8 DVFS: %u kHz is above the stock limit of %s, %u kHz\n", khz,
++		    a8a_dom_name[d], a8a_dom_cap[d]);
++		return;
++	}
++	/* What it runs at now: its own word if it gives one, else what was
++	 * last asked of it here, else the boot level. */
++	if (a8a_get_rate(d, &now) != 0 || now == 0) {
++		now = dom->asked_khz != 0 ? dom->asked_khz : dom->boot_khz;
++		printf("A8 DVFS: %s does not answer FREQ_GET; taking %u kHz as its rate\n",
++		    a8a_dom_name[d], now);
++	}
++	have_temp = a8t_hottest(&hot, &cpu, &g3d);
++	if (khz > now && a8a.allow < 2) {
++		if (!have_temp) {
++			printf("A8 DVFS: no temperature reading (tmu), so nothing is raised\n");
++			return;
++		}
++		if (a8a.hot || hot + 10 > (int)a8a.temp_limit) {
++			printf("A8 DVFS: %d C is within 10 C of the %u C limit; not raising\n", hot,
++			    a8a.temp_limit);
++			return;
++		}
++	}
++	error = a8a_set_rate(d, khz, answer);
++	(void)a8a_get_rate(d, &after);
++	printf("A8 DVFS: %s %u -> %u kHz (table: %u uV): %s, answer 0x%08x 0x%x 0x%x 0x%x; it now "
++	    "reports %u kHz\n", a8a_dom_name[d], now, khz, uv, error ? "FAILED" : "asked",
++	    answer[0], answer[1], answer[2], answer[3], after);
++	if (error) {
++		return;
++	}
++	dom->asked_khz = khz;
++	/* By what was asked, not by what it reports: a wrong report must not
++	 * take the domain out of the temperature watch. */
++	dom->raised = khz > dom->boot_khz;
++	if (dom->raised && !a8a.watching) {
++		thread_t thread;
++
++		if (kernel_thread_start(a8a_watch_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			a8a.watching = true;
++		} else {
++			printf("A8 DVFS: no temperature watch thread; watch it by hand (tmu)\n");
++		}
++	}
++	a8a_dvfs_report("after the request");
++}
++
++/* ---- console commands ---- */
++static bool
++a8a_word(const char **p, char *out, size_t size)
++{
++	size_t n = 0;
++
++	while (**p == ' ') {
++		(*p)++;
++	}
++	while (**p != 0 && **p != ' ') {
++		if (n + 1 < size) {
++			out[n++] = **p;
++		}
++		(*p)++;
++	}
++	out[n] = 0;
++	return n > 0;
++}
++
++/* A number: 0x.. is hex, anything else decimal (or hex when asked). */
++static bool
++a8a_number(const char **p, bool hex, uint32_t *value)
++{
++	char word[20];
++	const char *c = word;
++	uint64_t v = 0;
++
++	if (!a8a_word(p, word, sizeof(word))) {
++		return false;
++	}
++	if (c[0] == '0' && (c[1] == 'x' || c[1] == 'X')) {
++		hex = true;
++		c += 2;
++	}
++	if (*c == 0) {
++		return false;
++	}
++	for (; *c; c++) {
++		uint32_t digit;
++
++		if (*c >= '0' && *c <= '9') {
++			digit = (uint32_t)(*c - '0');
++		} else if (hex && *c >= 'a' && *c <= 'f') {
++			digit = (uint32_t)(*c - 'a' + 10);
++		} else if (hex && *c >= 'A' && *c <= 'F') {
++			digit = (uint32_t)(*c - 'A' + 10);
++		} else {
++			return false;
++		}
++		v = v * (hex ? 16u : 10u) + digit;
++		if (v > 0xffffffffull) {
++			return false;
++		}
++	}
++	*value = (uint32_t)v;
++	return true;
++}
++
++static int
++a8a_domain_named(const char *name)
++{
++	for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++		if (strcmp(name, a8a_dom_name[d]) == 0) {
++			return (int)d;
++		}
++	}
++	return -1;
++}
++
++/*
++ * acpm                     the framework, its plug-ins and channels
++ * acpm log                 the firmware's log buffer (and empties it)
++ * acpm fvp PATH            load and attach the FVP plug-in (a8dvfs=1)
++ * acpm send CH W0 W1 W2 W3 one raw command, hex words (a8dvfs=1)
++ */
++void
++a8_acpm_command(const char *args)
++{
++	char word[16];
++
++	lck_mtx_lock(&a8a_lock);
++	if (!a8a_init()) {
++		lck_mtx_unlock(&a8a_lock);
++		return;
++	}
++	if (!a8a_word(&args, word, sizeof(word))) {
++		a8a_status();
++	} else if (strcmp(word, "log") == 0) {
++		a8a_log_dump();
++	} else if (strcmp(word, "fvp") == 0) {
++		char path[256];
++
++		if (a8a.allow == 0) {
++			printf("A8A: off; boot with a8dvfs=1\n");
++		} else if (!a8a_word(&args, path, sizeof(path)) || path[0] != '/' ||
++		    a8a_has(path, "..")) {
++			printf("A8A: acpm fvp /private/var/.../FILE (the 12288-byte %s)\n", A8A_FVP_NAME);
++		} else {
++			a8a_fvp_load(path);
++		}
++	} else if (strcmp(word, "send") == 0) {
++		uint32_t ch = 0, cmd[4] = { 0, 0, 0, 0 };
++
++		if (a8a.allow == 0) {
++			printf("A8A: off; boot with a8dvfs=1\n");
++		} else if (!a8a_number(&args, true, &ch) || !a8a_number(&args, true, &cmd[0]) ||
++		    !a8a_number(&args, true, &cmd[1]) || !a8a_number(&args, true, &cmd[2]) ||
++		    !a8a_number(&args, true, &cmd[3])) {
++			printf("A8A: acpm send CHANNEL W0 W1 W2 W3 (hex)\n");
++		} else {
++			int error = a8a_ipc(ch, cmd);
++
++			printf("A8A: channel %u: %s 0x%08x 0x%08x 0x%08x 0x%08x\n", ch,
++			    error ? "no answer; command left as" : "answer", cmd[0], cmd[1], cmd[2], cmd[3]);
++		}
++	} else {
++		printf("A8A: acpm | acpm log | acpm fvp PATH | acpm send CH W0 W1 W2 W3\n");
++	}
++	lck_mtx_unlock(&a8a_lock);
++}
++
++/*
++ * dvfs                     the rate of every domain, the G3D PLL, the temperatures
++ * dvfs table [DOMAIN]      the firmware's levels
++ * dvfs DOMAIN KHZ          ask for a rate: big | little | g3d (a8dvfs=1)
++ * dvfs boot                every raised domain back to its boot rate
++ */
++void
++a8_dvfs_command(const char *args)
++{
++	char word[16];
++	uint32_t khz = 0;
++	int d;
++
++	lck_mtx_lock(&a8a_lock);
++	if (!a8a_init()) {
++		lck_mtx_unlock(&a8a_lock);
++		return;
++	}
++	if (!a8a_word(&args, word, sizeof(word))) {
++		a8a_dvfs_report("asked");
++	} else if (strcmp(word, "table") == 0) {
++		if (a8a_word(&args, word, sizeof(word)) && (d = a8a_domain_named(word)) >= 0) {
++			a8a_dvfs_table((uint32_t)d);
++		} else {
++			for (uint32_t i = 0; i < A8A_DOMAINS; i++) {
++				a8a_dvfs_table(i);
++			}
++		}
++	} else if (strcmp(word, "boot") == 0) {
++		for (uint32_t i = 0; i < A8A_DOMAINS; i++) {
++			if (a8a.dom[i].raised) {
++				a8a_dvfs_set(i, a8a.dom[i].boot_khz);
++			}
++		}
++		a8a_dvfs_report("boot rates");
++	} else if ((d = a8a_domain_named(word)) >= 0 && a8a_number(&args, false, &khz)) {
++		a8a_dvfs_set((uint32_t)d, khz);
++	} else {
++		printf("A8 DVFS: dvfs | dvfs table [mif|int|big|little|g3d] | dvfs big|little|g3d KHZ | "
++		    "dvfs boot\n");
++	}
++	lck_mtx_unlock(&a8a_lock);
++}
++
++/*
++ * tmu                      both sensor blocks, raw and in degrees
++ * tmu on                   switch a sensor core on that S-Boot left off (a8dvfs=1)
++ */
++void
++a8_tmu_command(const char *args)
++{
++	static const char *const names[2] = { "cpu", "g3d" };
++	char word[8];
++	bool on;
++
++	lck_mtx_lock(&a8a_lock);
++	if (!a8a_init()) {
++		lck_mtx_unlock(&a8a_lock);
++		return;
++	}
++	on = a8a_word(&args, word, sizeof(word)) && strcmp(word, "on") == 0;
++	a8t_map();
++	for (int i = 0; i < 2; i++) {
++		volatile uint32_t *base = i == 0 ? a8a.tmu_cpu : a8a.tmu_g3d;
++		uint32_t raw[4], esr = 0;
++		int celsius = 0;
++
++		if (a8t_read(base, &celsius, raw, &esr)) {
++			printf("A8 TMU: %s %d C (code %u; TRIMINFO 0x%x CONTROL 0x%x STATUS 0x%x)\n",
++			    names[i], celsius, raw[3] & 0x1ffu, raw[0], raw[1], raw[2]);
++			continue;
++		}
++		if (esr != 0) {
++			printf("A8 TMU: %s: the read was refused (ESR 0x%x)\n", names[i], esr);
++			continue;
++		}
++		printf("A8 TMU: %s: no reading (TRIMINFO 0x%x CONTROL 0x%x STATUS 0x%x CURRENT 0x%x)\n",
++		    names[i], raw[0], raw[1], raw[2], raw[3]);
++		if (on && a8a.allow != 0 && base != NULL && (raw[1] & A8T_CORE_EN) == 0) {
++			base[A8T_CONTROL >> 2] = raw[1] | A8T_CORE_EN;
++			printf("A8 TMU: %s: sensor core switched on (CONTROL 0x%x); ask again in a "
++			    "second\n", names[i], raw[1] | A8T_CORE_EN);
++		}
++	}
++	lck_mtx_unlock(&a8a_lock);
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index 7f8bc72..454d3e4 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -236,6 +236,51 @@ a8f_get(const char *args)
+ 	}
+ }
+ 
++/*
++ * The whole of a small file for the kernel's own use (a8_acpm.c loads the
++ * power manager's plug-in from the data volume): at most max bytes into buf,
++ * the count and the CRC-32 back.  An errno, or 0.
++ */
++int a8f_read_whole(const char *path, uint8_t *buf, uint32_t max, uint32_t *got, uint32_t *crc);
++
++int
++a8f_read_whole(const char *path, uint8_t *buf, uint32_t max, uint32_t *got, uint32_t *crc)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int resid = 0;
++	int error;
++
++	*got = 0;
++	*crc = 0;
++	error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	if (vnode_vtype(vp) != VREG) {
++		vnode_close(vp, FREAD, ctx);
++		return EINVAL;
++	}
++	(void)vnode_size(vp, &size, ctx);
++	if (size <= 0 || (uint64_t)size > (uint64_t)max) {
++		vnode_close(vp, FREAD, ctx);
++		return EFBIG;
++	}
++	error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_close(vp, FREAD, ctx);
++	if (error) {
++		return error;
++	}
++	if (resid != 0) {
++		return EIO;
++	}
++	*got = (uint32_t)size;
++	*crc = a8f_crc32(0, buf, (size_t)size);
++	return 0;
++}
++
+ /* The file being put, between fput and fend. */
+ static struct {
+ 	char     path[A8F_PATH];
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 475af9f..cb04daf 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -171,6 +171,83 @@ mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
+ static char sweet_null_names[128];
+ static int sweet_null_parsed;
+ 
++#if defined(JACKPOTLTE)
++/*
++ * A8: more names, set while iOS runs ("tee NAME,NAME" on the USB console,
++ * "tee -" for none).  The keyboard daemon, PosterBoard, the widget daemon,
++ * the Photos library daemon and the apps that come up blank say why on
++ * stderr, and that is /dev/null.  A process started after it is named also
++ * gets OS_ACTIVITY_DT_MODE and CFLOG_FORCE_STDERR in its environment
++ * (kern_exec.c), so its os_log and NSLog lines are written to stderr too:
++ * name it, kill it, and launchd's next copy talks.  Nothing is named at
++ * boot, so nothing changes until the command is sent.
++ */
++static char a8_tee_buf[2][128];
++static const char *volatile a8_tee_names = "";
++static uint32_t a8_tee_flip;
++
++void a8_tee_set(const char *names);
++const char *a8_tee_get(void);
++bool a8_tee_wants(const char *name, size_t len);
++
++/* A process keeps MAXCOMLEN characters of its name, so both sides are cut there. */
++static bool
++a8_tee_listed(const char *list, const char *name, size_t n)
++{
++	if (n > MAXCOMLEN) {
++		n = MAXCOMLEN;
++	}
++	for (const char *t = list; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl > MAXCOMLEN) {
++			tl = MAXCOMLEN;
++		}
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++void
++a8_tee_set(const char *names)
++{
++	char *buf = a8_tee_buf[++a8_tee_flip & 1u];
++	size_t n;
++
++	while (*names == ' ') {
++		names++;
++	}
++	if (names[0] == '-') {
++		names = "";
++	}
++	strlcpy(buf, names, sizeof(a8_tee_buf[0]));
++	for (n = strlen(buf); n > 0 && buf[n - 1] == ' '; n--) {
++		buf[n - 1] = 0;
++	}
++	a8_tee_names = buf;
++}
++
++const char *
++a8_tee_get(void)
++{
++	return a8_tee_names;
++}
++
++bool
++a8_tee_wants(const char *name, size_t len)
++{
++	const char *list = a8_tee_names;
++
++	return name != NULL && list[0] != 0 && a8_tee_listed(list, name, len);
++}
++#endif /* JACKPOTLTE */
++
+ static bool
+ sweet_null_tee(char *name, size_t len)
+ {
+@@ -193,7 +270,11 @@ sweet_null_tee(char *name, size_t len)
+ 		}
+ 		t = end + 1;
+ 	}
++#if defined(JACKPOTLTE)
++	return a8_tee_wants(name, n);
++#else
+ 	return false;
++#endif
+ }
+ #endif
+ 
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 3cba751..b46b454 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5683,6 +5683,8 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+  * exec fails with EPERM; launchd throttles and retries every 10 s or gives up.
+  * boot-arg a8noexec=NAME,NAME replaces the list; a8noexec=- refuses nothing.
+  */
++extern bool a8_tee_wants(const char *name, size_t len);        /* bsd/dev/mem.c, console "tee" */
++
+ static TUNABLE_STR(exec_deny_conf, 256, "a8noexec", "");
+ static const char exec_deny_default[] =
+     "vmd,searchd,ReportCrash,aggregated,analyticsd,cloudd,homed,driverkitd,fairplayd.H2,bluetoothd";
+@@ -5953,6 +5955,37 @@ exec_extract_strings(struct image_params *imgp)
+ 		}
+ 	}
+ 
++#if defined(JACKPOTLTE)
++	/*
++	 * A program named with the console's "tee" (bsd/dev/mem.c) starts with
++	 * its os_log and NSLog lines going to stderr as well, which the tee
++	 * then shows: a daemon that fails silently is named, killed, and its
++	 * next copy says why.
++	 */
++	if (imgp->ip_ndp != NULL && imgp->ip_ndp->ni_cnd.cn_nameptr != NULL &&
++	    a8_tee_wants(imgp->ip_ndp->ni_cnd.cn_nameptr, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen)) {
++		static const char *const tee_env[] = { "OS_ACTIVITY_DT_MODE=1", "CFLOG_FORCE_STDERR=1" };
++
++		printf("A8 TEE: %.*s starts with its log on stderr\n",
++		    (int)imgp->ip_ndp->ni_cnd.cn_namelen, imgp->ip_ndp->ni_cnd.cn_nameptr);
++		for (size_t i = 0; i < sizeof(tee_env) / sizeof(tee_env[0]); i++) {
++			char var[32];
++
++			strlcpy(var, tee_env[i], sizeof(var));
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++#endif /* JACKPOTLTE */
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 87fb8a8..9e2bcaf 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1506,6 +1506,74 @@ handle_kernel_abort_recover(
+ #endif
+ }
+ 
++#if defined(JACKPOTLTE)
++/*
++ * A8 2018: a device register read that the bus may refuse.
++ *
++ * 2026-11-23: "peek 0x10900140" over the USB console (the A73 cluster's clock
++ * block, CMU_CPUCL0) took the kernel down at once.  The Exynos 7885 answers a
++ * read of a block the normal world may not touch, or one whose power domain
++ * is off, with an external abort; XNU has no recovery for one in the kernel
++ * ("Kernel data abort." / the SError path), so a probe was a panic.
++ *
++ * a8_probe_read32() makes one 32-bit load with a mark on the reading thread.
++ * A synchronous external abort on that thread steps over the load; an SError
++ * that arrives while the mark is up is swallowed.  Either way the read
++ * reports failure and the ESR, and nothing panics.  Preemption is off for
++ * the few microseconds the mark is up, so the abort cannot land on another
++ * thread.  A bus that never answers at all still hangs: nothing helps there.
++ */
++bool a8_probe_read32(vm_offset_t va, uint32_t *value, uint32_t *esr);
++
++static thread_t volatile a8_probe_thread;
++static volatile uint32_t a8_probe_hits;
++static volatile uint32_t a8_probe_esr;
++
++static bool
++a8_probe_took(uint32_t esr)
++{
++	thread_t marked = a8_probe_thread;
++
++	if (marked == THREAD_NULL || marked != current_thread()) {
++		return false;
++	}
++	a8_probe_esr = esr;
++	a8_probe_hits++;
++	return true;
++}
++
++__attribute__((noinline))
++bool
++a8_probe_read32(vm_offset_t va, uint32_t *value, uint32_t *esr)
++{
++	uint32_t v;
++	bool ok;
++
++	disable_preemption();
++	a8_probe_hits = 0;
++	a8_probe_esr = 0;
++	a8_probe_thread = current_thread();
++	__builtin_arm_isb(ISB_SY);
++	v = *(volatile uint32_t *)va;
++	/* An asynchronous abort is taken at the latest here. */
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++	for (volatile uint32_t spin = 0; spin < 4000; spin++) {
++	}
++	__builtin_arm_isb(ISB_SY);
++	ok = a8_probe_hits == 0;
++	a8_probe_thread = THREAD_NULL;
++	enable_preemption();
++	if (esr != NULL) {
++		*esr = a8_probe_esr;
++	}
++	if (ok && value != NULL) {
++		*value = v;
++	}
++	return ok;
++}
++#endif /* JACKPOTLTE */
++
+ static void
+ handle_kernel_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr,
+     fault_status_t fault_code, vm_prot_t fault_type, expected_fault_handler_t expected_fault_handler)
+@@ -1513,6 +1581,15 @@ handle_kernel_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_ad
+ 	thread_t thread = current_thread();
+ 	bool recover = find_copyio_recovery_entry(state) != 0;
+ 
++#if defined(JACKPOTLTE)
++	/* A marked device read (a8_probe_read32) that the bus refused: step
++	 * over the load, the reader sees the failure. */
++	if (!is_vm_fault(fault_code) && a8_probe_took(esr)) {
++		add_saved_state_pc(state, 4);
++		return;
++	}
++#endif
++
+ #ifndef CONFIG_XNUPOST
+ 	(void)expected_fault_handler;
+ #endif /* CONFIG_XNUPOST */
+@@ -2050,7 +2127,15 @@ sleh_serror(arm_context_t *context, uint32_t esr, vm_offset_t far)
+ 
+ 
+ 	ASSERT_CONTEXT_SANITY(context);
++#if defined(JACKPOTLTE)
++	/* The asynchronous answer to a marked device read (a8_probe_read32)
++	 * is the reader's to report, not a platform error. */
++	if (!a8_probe_took(esr)) {
++		arm64_platform_error(state, esr, far, PLAT_ERR_SRC_ASYNC);
++	}
++#else
+ 	arm64_platform_error(state, esr, far, PLAT_ERR_SRC_ASYNC);
++#endif
+ #if MACH_ASSERT
+ 	if (preemption_level != sleh_get_preemption_level()) {
+ 		panic("serror changed preemption level from %d to %d", preemption_level, sleh_get_preemption_level());
