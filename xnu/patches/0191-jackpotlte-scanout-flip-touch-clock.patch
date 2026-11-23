@@ -110,7 +110,7 @@ index cca74f3..dcbb4c6 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 1ea5b6b..387324f 100644
+index 1ea5b6b..71cf1af 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -51,6 +51,8 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -122,7 +122,24 @@ index 1ea5b6b..387324f 100644
  #if defined(ARM64_BOARD_CONFIG_A5XELTE)
  extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c */
  #endif
-@@ -385,6 +387,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -225,6 +227,16 @@ static uint32_t sweet_fb_no_present;
+  *  - the panel's pixels for the USB console's "shot" command (a5xelte_usb.c).
+  */
+ static AppleCLCD *sweet_fb_main;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++/* 0191 scan-out flip state (functions further down, before present()). */
++static int           a8_flip = -1;              /* -1: boot-arg not read yet */
++static vm_offset_t   a8_idma, a8_decon;
++static SweetSurface *volatile a8_scan_owner;    /* weak: cleared by its free() */
++static uint64_t      a8_scan_phys;
++static uint32_t      a8_shown_addr, a8_shown_width;
++static uint64_t      a8_flips, a8_flip_late;
++static void a8_scan_to_panel(AppleCLCD *fb, bool copy);
++#endif
+ static volatile int sweet_fb_requested_off_state;
+ static uint32_t sweet_fb_off_dim = 7;
+ 
+@@ -385,6 +397,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		/* Fade out: halve every channel each vsync, then black (step 6),
  		 * then idle; a5fb_offdim stops it after that many steps. */
  		uint32_t step = fb->fFadeStep;
@@ -140,7 +157,7 @@ index 1ea5b6b..387324f 100644
  		bool fade = step <= 6 && step < sweet_fb_off_dim;
  		if (fade) {
  			fb->fFadeStep = step + 1;
-@@ -475,6 +488,187 @@ sweet_fb_wait_frame_done(void)
+@@ -475,6 +498,181 @@ sweet_fb_wait_frame_done(void)
  }
  #endif
  
@@ -177,12 +194,6 @@ index 1ea5b6b..387324f 100644
 +#define A8_DECON_SHADOW_REQ     0x60u
 +#define A8_DECON_UPDATE         0x80000008u
 +
-+static int           a8_flip = -1;              /* -1: boot-arg not read yet */
-+static vm_offset_t   a8_idma, a8_decon;
-+static SweetSurface *volatile a8_scan_owner;    /* weak: cleared by its free() */
-+static uint64_t      a8_scan_phys;
-+static uint32_t      a8_shown_addr, a8_shown_width;
-+static uint64_t      a8_flips, a8_flip_late;
 +
 +static bool
 +a8_flip_on(void)
@@ -328,7 +339,7 @@ index 1ea5b6b..387324f 100644
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
-@@ -549,6 +743,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -549,6 +747,11 @@ AppleCLCD::present(const uint8_t *rec)
  			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
  			    get32(a, 12), dx, dy, w, h);
  		}
@@ -340,7 +351,7 @@ index 1ea5b6b..387324f 100644
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
-@@ -590,6 +789,14 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -590,6 +793,14 @@ AppleCLCD::present(const uint8_t *rec)
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -355,7 +366,7 @@ index 1ea5b6b..387324f 100644
  		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
  		    (uint64_t)(sx + w) * 4;
  		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
-@@ -841,6 +1048,13 @@ sweet_fb_snapshot(const uint8_t **pixels, uint32_t *width, uint32_t *height, uin
+@@ -841,6 +1052,13 @@ sweet_fb_snapshot(const uint8_t **pixels, uint32_t *width, uint32_t *height, uin
  	*width = fb->fWidth;
  	*height = fb->fHeight;
  	*rowbytes = fb->fRowBytes;
