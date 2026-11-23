@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/a8_acpm.c b/bsd/dev/a8_acpm.c
-index dcfe453..b620c24 100644
+index dcfe453..d89d06f 100644
 --- a/bsd/dev/a8_acpm.c
 +++ b/bsd/dev/a8_acpm.c
 @@ -35,16 +35,20 @@
@@ -30,26 +30,31 @@ index dcfe453..b620c24 100644
   */
  #include <pexpert/arm64/board_config.h>
  
-@@ -57,6 +61,8 @@
+@@ -57,6 +61,7 @@
  #include <kern/locks.h>
  #include <kern/thread.h>
  #include <kern/sched_prim.h>
-+#include <kern/processor.h>
 +#include <kern/startup.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
  #include <string.h>
-@@ -65,6 +71,9 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -65,6 +70,15 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern bool a8_probe_read32(vm_offset_t va, uint32_t *value, uint32_t *esr);    /* sleh.c */
  extern int a8f_read_whole(const char *path, uint8_t *buf, uint32_t max, uint32_t *got,
      uint32_t *crc);                                                             /* a8_files.c */
 +extern void (*mountroot_post_hook)(void);                                       /* bsd_init.c */
 +extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 +extern void nanoseconds_to_absolutetime(uint64_t, uint64_t *);
++extern unsigned int real_ncpus;
++extern processor_t cpu_to_processor(int cpu);                                   /* osfmk */
++extern processor_t thread_bind(processor_t processor);                          /* osfmk */
++#ifndef PROCESSOR_NULL
++#define PROCESSOR_NULL ((processor_t)0)
++#endif
  
  void a8_acpm_command(const char *args);
  void a8_dvfs_command(const char *args);
-@@ -185,6 +194,10 @@ static struct {
+@@ -185,6 +199,10 @@ static struct {
  	bool                    watching, hot;
  	uint32_t                watch_ticks, tmu_misses;
  	int                     watch_chan;
@@ -60,7 +65,7 @@ index dcfe453..b620c24 100644
  } a8a;
  
  static LCK_GRP_DECLARE(a8a_grp, "a8acpm");
-@@ -360,6 +373,128 @@ a8a_read_fvmap(void)
+@@ -360,6 +378,131 @@ a8a_read_fvmap(void)
  	a8a.fvmap = base;
  }
  
@@ -139,10 +144,13 @@ index dcfe453..b620c24 100644
 +	boolean_t iflag;
 +	uint32_t khz;
 +
-+	if (cpu < 0 || cpu >= MAX_SCHED_CPUS || processor_array[cpu] == PROCESSOR_NULL) {
++	if (cpu < 0 || cpu >= (int)real_ncpus) {
 +		return 0;
 +	}
-+	target = processor_array[cpu];
++	target = cpu_to_processor(cpu);
++	if (target == PROCESSOR_NULL) {
++		return 0;
++	}
 +	prev = thread_bind(target);
 +	thread_block(THREAD_CONTINUE_NULL);
 +	if ((int)cpu_number() != cpu) {
@@ -189,7 +197,7 @@ index dcfe453..b620c24 100644
  static bool
  a8a_init(void)
  {
-@@ -643,7 +778,7 @@ a8a_status(void)
+@@ -643,7 +786,7 @@ a8a_status(void)
  }
  
  /* ---- loading the FVP plug-in (acpm.c plugins_init, handle_dynamic_plugin) ---- */
@@ -198,7 +206,7 @@ index dcfe453..b620c24 100644
  a8a_fvp_load(const char *path)
  {
  	struct a8a_plugin *fvp;
-@@ -655,11 +790,11 @@ a8a_fvp_load(const char *path)
+@@ -655,11 +798,11 @@ a8a_fvp_load(const char *path)
  	fvp = a8a_plugin_named(A8A_FVP_NAME);
  	if (fvp == NULL) {
  		printf("A8A FVP: the framework lists no plug-in named %s\n", A8A_FVP_NAME);
@@ -212,7 +220,7 @@ index dcfe453..b620c24 100644
  	}
  	base = fvp->base & ~1u;
  	if (!fvp->stay || base != A8A_FVP_BASE || fvp->size != A8A_FVP_BYTES ||
-@@ -667,7 +802,7 @@ a8a_fvp_load(const char *path)
+@@ -667,7 +810,7 @@ a8a_fvp_load(const char *path)
  		printf("A8A FVP: plug-in %u is not where this phone had it: base 0x%x size 0x%x "
  		    "stay %u (want 0x%x, 0x%x, 1); nothing written\n", fvp->id, base, fvp->size,
  		    fvp->stay, A8A_FVP_BASE, A8A_FVP_BYTES);
@@ -221,7 +229,7 @@ index dcfe453..b620c24 100644
  	}
  	/* Its room must not be anyone else's. */
  	for (uint32_t i = 0; i < a8a.nplug; i++) {
-@@ -678,25 +813,25 @@ a8a_fvp_load(const char *path)
+@@ -678,25 +821,25 @@ a8a_fvp_load(const char *path)
  		    base < pb + p->size) {
  			printf("A8A FVP: its room 0x%x-0x%x is inside attached plug-in %u (0x%x-0x%x); "
  			    "nothing written\n", base, base + A8A_FVP_BYTES, p->id, pb, pb + p->size);
@@ -251,7 +259,7 @@ index dcfe453..b620c24 100644
  	}
  	printf("A8A FVP: %s is the plug-in (%u bytes, crc %08x); its room at SRAM + 0x%x starts "
  	    "0x%08x 0x%08x\n", path, got, crc, base, a8a_rd(base), a8a_rd(base + 4));
-@@ -715,7 +850,7 @@ a8a_fvp_load(const char *path)
+@@ -715,7 +858,7 @@ a8a_fvp_load(const char *path)
  			printf("A8A FVP: SRAM + 0x%x reads 0x%08x, not 0x%08x: not attached\n", base + off,
  			    a8a_rd(base + off), word);
  			kfree_data(buf, A8A_FVP_BYTES);
@@ -260,7 +268,7 @@ index dcfe453..b620c24 100644
  		}
  	}
  	kfree_data(buf, A8A_FVP_BYTES);
-@@ -729,7 +864,9 @@ a8a_fvp_load(const char *path)
+@@ -729,7 +872,9 @@ a8a_fvp_load(const char *path)
  	    fvp->ops);
  	if (!error && fvp->attached) {
  		printf("A8A FVP: attached; \"dvfs\" now reads the rates\n");
@@ -270,7 +278,7 @@ index dcfe453..b620c24 100644
  }
  
  /* ---- temperature ---- */
-@@ -889,19 +1026,26 @@ a8a_dvfs_report(const char *why)
+@@ -889,19 +1034,26 @@ a8a_dvfs_report(const char *why)
  	len = snprintf(line, sizeof(line), "A8 DVFS (%s):", why);
  	for (uint32_t d = 0; d < A8A_DOMAINS && len < (int)sizeof(line) - 60; d++) {
  		const struct a8a_domain *dom = &a8a.dom[d];
@@ -303,7 +311,7 @@ index dcfe453..b620c24 100644
  	if (a8t_hottest(&hot, &cpu, &g3d)) {
  		len += snprintf(line + len, sizeof(line) - len, "; %d C cpu, %d C g3d", cpu, g3d);
  	} else {
-@@ -1037,19 +1181,139 @@ a8a_dvfs_set(uint32_t d, uint32_t khz)
+@@ -1037,18 +1189,138 @@ a8a_dvfs_set(uint32_t d, uint32_t khz)
  	/* By what was asked, not by what it reports: a wrong report must not
  	 * take the domain out of the temperature watch. */
  	dom->raised = khz > dom->boot_khz;
@@ -351,17 +359,18 @@ index dcfe453..b620c24 100644
 +			lck_mtx_unlock(&a8a_lock);
 +			printf("A8 DVFS boot: ACPM init failed\n");
 +			return;
-+		}
+ 		}
 +		if (a8a_fvp_attached()) {
 +			break;
- 		}
++		}
 +		if (a8a_fvp_load(A8A_FVP_PATH) == 0 && a8a_fvp_attached()) {
 +			break;
 +		}
 +		lck_mtx_unlock(&a8a_lock);
 +		held = false;
 +		delay(500000);
-+	}
+ 	}
+-	a8a_dvfs_report("after the request");
 +	if (!held) {
 +		lck_mtx_lock(&a8a_lock);
 +	}
@@ -412,10 +421,9 @@ index dcfe453..b620c24 100644
 +		printf("A8 DVFS boot: waiting on the FVP file after root mount\n");
 +	} else {
 +		printf("A8 DVFS boot: no thread\n");
- 	}
--	a8a_dvfs_report("after the request");
- }
- 
++	}
++}
++
 +static void
 +a8a_startup(void)
 +{
@@ -445,13 +453,12 @@ index dcfe453..b620c24 100644
 +		}
 +	}
 +	printf(" kHz after root mounts\n");
-+}
+ }
 +STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, a8a_startup);
-+
+ 
  /* ---- console commands ---- */
  static bool
- a8a_word(const char **p, char *out, size_t size)
-@@ -1173,9 +1437,10 @@ a8_acpm_command(const char *args)
+@@ -1173,9 +1445,10 @@ a8_acpm_command(const char *args)
  
  /*
   * dvfs                     the rate of every domain, the G3D PLL, the temperatures
@@ -463,7 +470,7 @@ index dcfe453..b620c24 100644
   */
  void
  a8_dvfs_command(const char *args)
-@@ -1191,6 +1456,11 @@ a8_dvfs_command(const char *args)
+@@ -1191,6 +1464,11 @@ a8_dvfs_command(const char *args)
  	}
  	if (!a8a_word(&args, word, sizeof(word))) {
  		a8a_dvfs_report("asked");
@@ -475,7 +482,7 @@ index dcfe453..b620c24 100644
  	} else if (strcmp(word, "table") == 0) {
  		if (a8a_word(&args, word, sizeof(word)) && (d = a8a_domain_named(word)) >= 0) {
  			a8a_dvfs_table((uint32_t)d);
-@@ -1210,7 +1480,7 @@ a8_dvfs_command(const char *args)
+@@ -1210,7 +1488,7 @@ a8_dvfs_command(const char *args)
  		a8a_dvfs_set((uint32_t)d, khz);
  	} else {
  		printf("A8 DVFS: dvfs | dvfs table [mif|int|big|little|g3d] | dvfs big|little|g3d KHZ | "
@@ -607,7 +614,7 @@ index 454d3e4..122b7c3 100644
 +}
  #endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index b46b454..d6be179 100644
+index b46b454..8e0f02b 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -5612,6 +5612,10 @@ static TUNABLE(uint32_t, jt_gl_log, "jtgllog", 0);
@@ -621,7 +628,7 @@ index b46b454..d6be179 100644
  static bool
  exec_inject_env(struct image_params *imgp, char *env, size_t size)
  {
-@@ -5653,14 +5657,47 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+@@ -5653,14 +5657,45 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
  				matched = true;
  			}
  		}
@@ -637,8 +644,7 @@ index b46b454..d6be179 100644
 +			if (a8_gl_resolve_inject(library, liblen, resolved, sizeof(resolved))) {
 +				use = resolved;
 +				uselen = strlen(resolved);
-+				printf("A8 GL: injecting %s (USB-updatable) into %.*s
-+",
++				printf("A8 GL: injecting %s (USB-updatable) into %.*s\n",
 +				    use, (int)(namelen > 64 ? 64 : namelen),
 +				    name != NULL ? name : "?");
 +			} else {
@@ -652,8 +658,7 @@ index b46b454..d6be179 100644
 +				if ((size_t)(library + liblen - base) == sizeof("libjackpotlte-gl.dylib") - 1 &&
 +				    strncmp(base, "libjackpotlte-gl.dylib",
 +				    sizeof("libjackpotlte-gl.dylib") - 1) == 0) {
-+					printf("A8 GL: injecting %.*s (fallback) into %.*s
-+",
++					printf("A8 GL: injecting %.*s (fallback) into %.*s\n",
 +					    (int)liblen, library,
 +					    (int)(namelen > 64 ? 64 : namelen),
 +					    name != NULL ? name : "?");
