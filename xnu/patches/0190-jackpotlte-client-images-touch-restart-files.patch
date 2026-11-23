@@ -1,0 +1,1253 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0ca919b..6348d67 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/a5xelte_panel.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/jackpotlte_mali.c		standard
+ bsd/dev/a5xelte_usb.c			standard
++bsd/dev/a8_files.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
+ bsd/dev/a5xelte_bt.c			standard
+ bsd/dev/a5xelte_sensors.c		standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index dd3981a..c3113f8 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1192,16 +1192,49 @@ jtts_bus_recover(void)
+ }
+ 
+ 
+-/* START + 8-bit slave address.  True when the address was ACKed. */
++/* 0190: the repeated START of a register read in the vendor's order (see
++ * jtts_address).  a8tsrestart=0 puts back the old order; so does a run of
++ * failed reads (jtts_read_retry). */
++static int jtts_restart_new = -1;
++static unsigned jtts_fail_run;
++
++/* START, or mid-transfer a repeated START, + 8-bit slave address.  True when
++ * the address was ACKed. */
+ static bool
+-jtts_address(uint32_t mode, uint8_t addr8)
++jtts_address(uint32_t mode, uint8_t addr8, bool restart)
+ {
+-	a5touch_write(jt_ts_bus, JTTS_IICCON, JTTS_IICCON_INIT);
+-	a5touch_write(jt_ts_bus, JTTS_IICLC, JTTS_IICLC_VALUE);
+-	a5touch_write(jt_ts_bus, JTTS_IICSTAT, mode);
+-	a5touch_write(jt_ts_bus, JTTS_IICDS, addr8);
+-	delay(1);
+-	a5touch_write(jt_ts_bus, JTTS_IICSTAT, mode | JTTS_IICSTAT_START);
++	if (jtts_restart_new < 0) {
++		int value = 1;
++		(void)PE_parse_boot_argn("a8tsrestart", &value, sizeof(value));
++		jtts_restart_new = value != 0;
++	}
++	if (!restart || !jtts_restart_new) {
++		a5touch_write(jt_ts_bus, JTTS_IICCON, JTTS_IICCON_INIT);
++		a5touch_write(jt_ts_bus, JTTS_IICLC, JTTS_IICLC_VALUE);
++		a5touch_write(jt_ts_bus, JTTS_IICSTAT, mode);
++		a5touch_write(jt_ts_bus, JTTS_IICDS, addr8);
++		delay(1);
++		a5touch_write(jt_ts_bus, JTTS_IICSTAT, mode | JTTS_IICSTAT_START);
++	} else {
++		/* The register byte's interrupt is still pending, and the
++		 * controller holds SCL low until it is cleared.  Mode, address,
++		 * ACK on, START, and only then clear it: the S3C2440 manual's
++		 * repeated START and the vendor's s3c24xx_i2c_message_start()
++		 * (i2c-s3c2410.c).  Clearing it first (IICCON = INIT, as above)
++		 * let the transmitter go on with the register byte still in
++		 * IICDS while the mode and the data register were rewritten
++		 * under it, and about one read in ten left the IC holding SDA
++		 * low (jt 0189: 220 "bus busy" recoveries in 25 minutes).  The
++		 * pending bit reads as 1 and is written back as 1, which leaves
++		 * it alone. */
++		a5touch_write(jt_ts_bus, JTTS_IICSTAT, mode);
++		a5touch_write(jt_ts_bus, JTTS_IICDS, addr8);
++		delay(1);
++		a5touch_write(jt_ts_bus, JTTS_IICCON,
++		    a5touch_read(jt_ts_bus, JTTS_IICCON) | JTTS_IICCON_ACKEN);
++		a5touch_write(jt_ts_bus, JTTS_IICSTAT, mode | JTTS_IICSTAT_START);
++		jtts_clear_irq();
++	}
+ 	if (!jtts_wait_irq()) {
+ 		return false;
+ 	}
+@@ -1256,6 +1289,8 @@ jtts_rx(uint8_t *bytes, unsigned count)
+ static bool
+ jtts_read_reg(uint8_t reg, uint8_t *data, unsigned count)
+ {
++	static bool jtts_timed;
++	uint64_t began = mach_absolute_time();
+ 	bool ok = false;
+ 	int recovered = 0;
+ 	if (!count || count > JTTS_MAX_READ_BYTES) {
+@@ -1276,13 +1311,13 @@ retry:
+ 		}
+ 		delay(1);
+ 	}
+-	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1)) {
++	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1, false)) {
+ 		goto out;
+ 	}
+ 	if (!jtts_tx(&reg, 1)) {
+ 		goto out;
+ 	}
+-	if (!jtts_address(JTTS_IICSTAT_MASTER_RX, (JT_TS_SLAVE << 1) | 1u)) {
++	if (!jtts_address(JTTS_IICSTAT_MASTER_RX, (JT_TS_SLAVE << 1) | 1u, true)) {
+ 		goto out;
+ 	}
+ 	if (!jtts_rx(data, count)) {
+@@ -1291,6 +1326,14 @@ retry:
+ 	ok = true;
+ out:
+ 	jtts_stop();
++	if (ok && count == 8u && !jtts_timed) {
++		/* Once: how fast the bus really is.  11 bytes of 9 bits. */
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		jtts_timed = true;
++		printf("A8 TOUCH: i2c4 8-byte read took %llu us (~%llu kHz SCL)\n",
++		    ns / 1000, ns ? 99ull * 1000000ull / ns : 0);
++	}
+ 	return ok;
+ }
+ 
+@@ -1380,7 +1423,7 @@ retry:
+ 		}
+ 		delay(1);
+ 	}
+-	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1)) {
++	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1, false)) {
+ 		goto out;
+ 	}
+ 	if (!jtts_tx(&cmd, 1)) {
+@@ -1418,7 +1461,7 @@ retry:
+ 		}
+ 		delay(1);
+ 	}
+-	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1)) {
++	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1, false)) {
+ 		goto out;
+ 	}
+ 	if (!jtts_tx(bytes, count)) {
+@@ -1442,8 +1485,16 @@ jtts_read_retry(uint8_t reg, uint8_t *data, unsigned count)
+ 			delay(JTTS_READ_RETRY_US);
+ 		}
+ 		if (jtts_read_reg(reg, data, count)) {
++			jtts_fail_run = 0;
+ 			return true;
+ 		}
++		if (++jtts_fail_run == 32u && jtts_restart_new > 0) {
++			/* Not one read in 32: if the new repeated START is what
++			 * this IC does not take, go back to the old one. */
++			jtts_restart_new = 0;
++			printf("A8 TOUCH: 32 reads failed in a row with the new repeated START; "
++			    "back to the old order\n");
++		}
+ 	}
+ 	jt_ts_lost++;
+ 	return false;
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 985331f..32c2cd9 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -633,11 +633,18 @@ static struct {
+ 	uint8_t     line_coding[7];
+ 	char        line[256];
+ 	uint32_t    line_len;
+-	char        cmd[256];
+-	bool        cmd_ready;
+ 	uint64_t    rx_bytes, tx_bytes;
+ } a8g;
+ 
++/*
++ * Lines from the host wait here for the shell thread (a8s_cmd_thread).  One
++ * slot, as before, dropped every line that came while a command ran -- which
++ * is all of an fput's data.  The RX side only adds, the shell only takes.
++ */
++#define A8S_QUEUE       32
++static char a8s_queue[A8S_QUEUE][256];
++static volatile uint32_t a8s_qhead, a8s_qtail, a8s_qdropped;
++
+ static inline void
+ a8_dwc_wr(uint32_t off, uint32_t v)
+ {
+@@ -1377,10 +1384,12 @@ a8s_rx_done(void)
+ 				continue;
+ 			}
+ 			a8g.line[a8g.line_len] = 0;
+-			if (!a8g.cmd_ready) {
+-				memcpy(a8g.cmd, a8g.line, a8g.line_len + 1);
++			if (a8s_qhead - a8s_qtail < A8S_QUEUE) {
++				memcpy(a8s_queue[a8s_qhead % A8S_QUEUE], a8g.line, a8g.line_len + 1);
+ 				__asm__ volatile ("dmb ish" ::: "memory");
+-				a8g.cmd_ready = true;
++				a8s_qhead++;
++			} else {
++				a8s_qdropped++;
+ 			}
+ 			a8g.line_len = 0;
+ 		} else if (a8g.line_len < sizeof(a8g.line) - 1) {
+@@ -1582,12 +1591,25 @@ a8s_shot(unsigned scale)
+ 	printf("A8SHOT END\n");
+ }
+ 
++/* bsd/dev/a8_files.c */
++extern void a8f_get(const char *args);
++extern void a8f_put(const char *args);
++extern void a8f_data(const char *b64);
++extern void a8f_end(void);
++extern void a8f_ls(const char *args);
++extern void a8f_date(const char *args);
++
+ static void
+ a8s_command(const char *line)
+ {
+ 	const char *rest;
+ 	bool ok = true;
+ 
++	/* fput's data lines are not echoed: they are most of the traffic. */
++	if (a8s_word(line, "fd", &rest)) {
++		a8f_data(rest);
++		return;
++	}
+ 	printf("A8SH> %s\n", line);
+ 	if (a8s_word(line, "help", &rest)) {
+ 		printf("A8SH: help | ping | stat | top | ps | kill NAME|PID [SIG] | log (resend the ring) | "
+@@ -1595,6 +1617,9 @@ a8s_command(const char *line)
+ 		    "key power|up|down|home [MS] | wake | "
+ 		    "peek ADDR [WORDS] | poke ADDR VALUE | "
+ 		    "reboot [recovery|download]\n");
++		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | "
++		    "fput PATH SIZE CRC32 [MODE UID GID], fd BASE64..., fend "
++		    "(only under /private/var/) | date [SECONDS]\n");
+ 		printf("A8SH: X Y are panel pixels (1080x2220, as in shot x SCALE); "
+ 		    "numbers after tap/swipe/key/shot are decimal, peek/poke hex\n");
+ 	} else if (a8s_word(line, "ping", &rest)) {
+@@ -1764,6 +1789,19 @@ a8s_command(const char *line)
+ 		a8_usb_wr(va, off, (uint32_t)val);
+ 		printf("A8SH: %09llx: %08x -> %08x (reads %08x)\n", pa, before,
+ 		    (uint32_t)val, a8_usb_rd(va, off));
++	} else if (a8s_word(line, "fget", &rest)) {
++		a8f_get(rest);
++	} else if (a8s_word(line, "fput", &rest)) {
++		a8f_put(rest);
++	} else if (a8s_word(line, "fend", &rest)) {
++		a8f_end();
++	} else if (a8s_word(line, "fls", &rest)) {
++		a8f_ls(rest);
++	} else if (a8s_word(line, "date", &rest)) {
++		while (*rest == ' ') {
++			rest++;
++		}
++		a8f_date(rest);
+ 	} else if (a8s_word(line, "reboot", &rest)) {
+ 		while (*rest == ' ') {
+ 			rest++;
+@@ -1788,14 +1826,19 @@ a8s_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 	char line[256];
+ 
+ 	for (;;) {
+-		if (!a8g.cmd_ready) {
++		if (a8s_qtail == a8s_qhead) {
+ 			a8g_sleep_ms(20);
+ 			continue;
+ 		}
+ 		__asm__ volatile ("dmb ish" ::: "memory");
+-		strlcpy(line, a8g.cmd, sizeof(line));
++		strlcpy(line, a8s_queue[a8s_qtail % A8S_QUEUE], sizeof(line));
+ 		__asm__ volatile ("dmb ish" ::: "memory");
+-		a8g.cmd_ready = false;
++		a8s_qtail++;
++		if (a8s_qdropped != 0) {
++			printf("A8SH: %u lines were dropped (more than %u waiting)\n",
++			    a8s_qdropped, A8S_QUEUE);
++			a8s_qdropped = 0;
++		}
+ 		a8s_command(line);
+ 	}
+ }
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+new file mode 100644
+index 0000000..f182936
+--- /dev/null
++++ b/bsd/dev/a8_files.c
+@@ -0,0 +1,543 @@
++/*
++ * A8 2018: files and the clock from the USB console's kernel shell
++ * (a5xelte_usb.c, a8usbmode=1), so a setting on the iOS data volume can be
++ * read and changed while iOS runs, with no image to rebuild or flash.
++ *
++ *   fget PATH [OFFSET [LENGTH]]   the file as base64 lines, at most 512 KiB:
++ *       A8F GET PATH size S off O len N crc C
++ *       A8F: <base64 of 57 bytes>          (repeated)
++ *       A8F END PATH
++ *   fput PATH SIZE CRC32 [MODE UID GID]   then  fd BASE64 ... (repeated)  then  fend
++ *       Writes PATH.a8new, gives it the old file's mode and owner (or the
++ *       ones given), syncs it and renames it over PATH, so nothing ever reads
++ *       a half-written file.  Only under /private/var/ (the data volume);
++ *       the system's own files are not touched.
++ *   fls DIR                        names, types and sizes
++ *   date [SECONDS]                 the calendar, or set it (seconds since 1970, UTC)
++ *
++ * The CRC is the zlib/PNG CRC-32 of the whole file.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/stat.h>
++#include <sys/proc.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/dirent.h>
++#include <sys/uio.h>
++#include <sys/kauth.h>
++#include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <string.h>
++
++int a8_kernel_rename(const char *from, const char *to);         /* vfs_syscalls.c */
++void a8f_get(const char *args);
++void a8f_put(const char *args);
++void a8f_data(const char *b64);
++void a8f_end(void);
++void a8f_ls(const char *args);
++void a8f_date(const char *args);
++
++#define A8F_MAX_GET     (512u << 10)
++#define A8F_MAX_PUT     (1024u << 10)
++#define A8F_PATH        512u
++
++static const char a8f_b64[] =
++    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++static uint32_t
++a8f_crc32(uint32_t crc, const uint8_t *p, size_t n)
++{
++	crc = ~crc;
++	while (n--) {
++		crc ^= *p++;
++		for (int k = 0; k < 8; k++) {
++			crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++		}
++	}
++	return ~crc;
++}
++
++static int
++a8f_b64_value(char c)
++{
++	if (c >= 'A' && c <= 'Z') {
++		return c - 'A';
++	}
++	if (c >= 'a' && c <= 'z') {
++		return c - 'a' + 26;
++	}
++	if (c >= '0' && c <= '9') {
++		return c - '0' + 52;
++	}
++	if (c == '+') {
++		return 62;
++	}
++	if (c == '/') {
++		return 63;
++	}
++	return -1;
++}
++
++/* Next space-separated word of *p into out (bounded); false when none. */
++static bool
++a8f_word(const char **p, char *out, size_t size)
++{
++	size_t n = 0;
++
++	while (**p == ' ') {
++		(*p)++;
++	}
++	while (**p != 0 && **p != ' ') {
++		if (n + 1 < size) {
++			out[n++] = **p;
++		}
++		(*p)++;
++	}
++	out[n] = 0;
++	return n > 0;
++}
++
++static bool
++a8f_number(const char **p, int base, uint64_t *value)
++{
++	char word[24];
++	uint64_t v = 0;
++
++	if (!a8f_word(p, word, sizeof(word))) {
++		return false;
++	}
++	for (const char *c = word; *c; c++) {
++		int d;
++		if (*c >= '0' && *c <= '9') {
++			d = *c - '0';
++		} else if (base == 16 && *c >= 'a' && *c <= 'f') {
++			d = *c - 'a' + 10;
++		} else if (base == 16 && *c >= 'A' && *c <= 'F') {
++			d = *c - 'A' + 10;
++		} else {
++			return false;
++		}
++		if (d >= base) {
++			return false;
++		}
++		v = v * (uint64_t)base + (uint64_t)d;
++	}
++	*value = v;
++	return true;
++}
++
++void
++a8f_get(const char *args)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	char path[A8F_PATH];
++	uint64_t off = 0, len = 0;
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int error;
++
++	if (!a8f_word(&args, path, sizeof(path)) || path[0] != '/') {
++		printf("A8F GET error: fget PATH [OFFSET [LENGTH]] (absolute path)\n");
++		return;
++	}
++	if (*args && !a8f_number(&args, 10, &off)) {
++		printf("A8F GET error: bad offset\n");
++		return;
++	}
++	if (*args && !a8f_number(&args, 10, &len)) {
++		printf("A8F GET error: bad length\n");
++		return;
++	}
++	error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		printf("A8F GET error %d %s\n", error, path);
++		return;
++	}
++	if (vnode_vtype(vp) != VREG) {
++		vnode_close(vp, FREAD, ctx);
++		printf("A8F GET error: %s is not a file\n", path);
++		return;
++	}
++	(void)vnode_size(vp, &size, ctx);
++	if (off > (uint64_t)size) {
++		off = (uint64_t)size;
++	}
++	if (len == 0 || len > (uint64_t)size - off) {
++		len = (uint64_t)size - off;
++	}
++	if (len > A8F_MAX_GET) {
++		len = A8F_MAX_GET;
++	}
++	uint8_t *buf = len ? kalloc_data((vm_size_t)len, Z_WAITOK) : NULL;
++	if (len && buf == NULL) {
++		vnode_close(vp, FREAD, ctx);
++		printf("A8F GET error: no memory for %llu bytes\n", len);
++		return;
++	}
++	int resid = 0;
++	if (len) {
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)len, (off_t)off, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	vnode_close(vp, FREAD, ctx);
++	if (error) {
++		printf("A8F GET error %d reading %s\n", error, path);
++		kfree_data(buf, (vm_size_t)len);
++		return;
++	}
++	uint64_t got = len - (uint64_t)resid;
++	printf("A8F GET %s size %lld off %llu len %llu crc %08x\n", path, (long long)size, off, got,
++	    a8f_crc32(0, buf, (size_t)got));
++	for (uint64_t at = 0; at < got; at += 57) {
++		char out[4 + 76 + 1];
++		size_t o = 0;
++		uint64_t n = got - at < 57 ? got - at : 57;
++
++		for (uint64_t i = 0; i < n; i += 3) {
++			uint32_t v = (uint32_t)buf[at + i] << 16;
++			if (i + 1 < n) {
++				v |= (uint32_t)buf[at + i + 1] << 8;
++			}
++			if (i + 2 < n) {
++				v |= buf[at + i + 2];
++			}
++			out[o++] = a8f_b64[(v >> 18) & 63];
++			out[o++] = a8f_b64[(v >> 12) & 63];
++			out[o++] = i + 1 < n ? a8f_b64[(v >> 6) & 63] : '=';
++			out[o++] = i + 2 < n ? a8f_b64[v & 63] : '=';
++		}
++		out[o] = 0;
++		printf("A8F: %s\n", out);
++	}
++	printf("A8F END %s\n", path);
++	if (buf != NULL) {
++		kfree_data(buf, (vm_size_t)len);
++	}
++}
++
++/* The file being put, between fput and fend. */
++static struct {
++	char     path[A8F_PATH];
++	uint8_t *buf;
++	uint32_t size, have, crc, mode, uid, gid;
++	bool     owner;                 /* mode, uid and gid were given */
++	bool     bad;
++	uint32_t quad;                  /* base64 bits not yet a whole byte */
++	int      quad_bits;
++} a8f_put_state;
++
++static void
++a8f_put_reset(void)
++{
++	if (a8f_put_state.buf != NULL) {
++		kfree_data(a8f_put_state.buf, a8f_put_state.size ? a8f_put_state.size : 1);
++	}
++	bzero(&a8f_put_state, sizeof(a8f_put_state));
++}
++
++void
++a8f_put(const char *args)
++{
++	uint64_t size = 0, crc = 0, mode = 0, uid = 0, gid = 0;
++
++	a8f_put_reset();
++	if (!a8f_word(&args, a8f_put_state.path, sizeof(a8f_put_state.path)) ||
++	    !a8f_number(&args, 10, &size) || !a8f_number(&args, 16, &crc) || crc > 0xffffffffull) {
++		printf("A8F PUT error: fput PATH SIZE CRC32 [MODE UID GID]\n");
++		a8f_put_reset();
++		return;
++	}
++	if (*args) {
++		if (!a8f_number(&args, 8, &mode) || !a8f_number(&args, 10, &uid) ||
++		    !a8f_number(&args, 10, &gid) || mode > 07777) {
++			printf("A8F PUT error: MODE is octal, UID and GID decimal\n");
++			a8f_put_reset();
++			return;
++		}
++		a8f_put_state.owner = true;
++	}
++	/* The data volume only, and no way out of it. */
++	if (strncmp(a8f_put_state.path, "/private/var/", 13) != 0 ||
++	    strstr(a8f_put_state.path, "/../") != NULL || strstr(a8f_put_state.path, "/./") != NULL) {
++		printf("A8F PUT error: only files under /private/var/ (no . or ..): %s\n",
++		    a8f_put_state.path);
++		a8f_put_reset();
++		return;
++	}
++	if (size > A8F_MAX_PUT) {
++		printf("A8F PUT error: %llu bytes is more than %u\n", size, A8F_MAX_PUT);
++		a8f_put_reset();
++		return;
++	}
++	a8f_put_state.buf = kalloc_data(size ? (vm_size_t)size : 1, Z_WAITOK | Z_ZERO);
++	if (a8f_put_state.buf == NULL) {
++		printf("A8F PUT error: no memory for %llu bytes\n", size);
++		a8f_put_reset();
++		return;
++	}
++	a8f_put_state.size = (uint32_t)size;
++	a8f_put_state.crc = (uint32_t)crc;
++	a8f_put_state.mode = (uint32_t)mode;
++	a8f_put_state.uid = (uint32_t)uid;
++	a8f_put_state.gid = (uint32_t)gid;
++	printf("A8F PUT ready %s %u bytes\n", a8f_put_state.path, a8f_put_state.size);
++}
++
++void
++a8f_data(const char *b64)
++{
++	if (a8f_put_state.buf == NULL || a8f_put_state.bad) {
++		return;
++	}
++	for (const char *c = b64; *c; c++) {
++		int v;
++		if (*c == ' ' || *c == '=') {
++			continue;
++		}
++		v = a8f_b64_value(*c);
++		if (v < 0) {
++			a8f_put_state.bad = true;
++			printf("A8F PUT error: not base64 at '%c'\n", *c);
++			return;
++		}
++		a8f_put_state.quad = (a8f_put_state.quad << 6) | (uint32_t)v;
++		a8f_put_state.quad_bits += 6;
++		if (a8f_put_state.quad_bits >= 8) {
++			a8f_put_state.quad_bits -= 8;
++			if (a8f_put_state.have >= a8f_put_state.size) {
++				a8f_put_state.bad = true;
++				printf("A8F PUT error: more than %u bytes\n", a8f_put_state.size);
++				return;
++			}
++			a8f_put_state.buf[a8f_put_state.have++] =
++			    (uint8_t)(a8f_put_state.quad >> a8f_put_state.quad_bits);
++		}
++	}
++}
++
++/* Write path from buf: beside it first, then renamed over it. */
++static int
++a8f_write(const char *path, const uint8_t *buf, uint32_t size, bool owner, uint32_t mode,
++    uint32_t uid, uint32_t gid, const char **step)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	char temp[A8F_PATH + 8];
++	struct vnode_attr va;
++	vnode_t vp = NULLVP;
++	int error;
++
++	snprintf(temp, sizeof(temp), "%s.a8new", path);
++	/* The old file's mode and owner, unless they were given. */
++	*step = "stat";
++	if (!owner) {
++		mode = 0644;
++		uid = 0;
++		gid = 0;
++		if (vnode_lookup(path, 0, &vp, ctx) == 0) {
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_mode);
++			VATTR_WANTED(&va, va_uid);
++			VATTR_WANTED(&va, va_gid);
++			if (vnode_getattr(vp, &va, ctx) == 0) {
++				if (VATTR_IS_SUPPORTED(&va, va_mode)) {
++					mode = va.va_mode & ALLPERMS;
++				}
++				if (VATTR_IS_SUPPORTED(&va, va_uid)) {
++					uid = va.va_uid;
++				}
++				if (VATTR_IS_SUPPORTED(&va, va_gid)) {
++					gid = va.va_gid;
++				}
++			}
++			vnode_put(vp);
++			vp = NULLVP;
++		}
++	}
++	*step = "open";
++	error = vnode_open(temp, FWRITE | O_CREAT, (int)(mode & ALLPERMS), 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	/* vnode_open leaves O_TRUNC to its callers (wardevsa 0244): a stale
++	 * .a8new would keep its old tail. */
++	*step = "truncate";
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_data_size, 0);
++	error = vnode_setattr(vp, &va, ctx);
++	if (!error && size) {
++		int resid = 0;
++		*step = "write";
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)buf, (int)size, 0, UIO_SYSSPACE,
++		    IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++	}
++	if (!error) {
++		*step = "chown";
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, (mode_t)(mode & ALLPERMS));
++		VATTR_SET(&va, va_uid, (uid_t)uid);
++		VATTR_SET(&va, va_gid, (gid_t)gid);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	if (!error) {
++		*step = "fsync";
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	vnode_close(vp, FWRITE, ctx);
++	if (!error) {
++		*step = "rename";
++		error = a8_kernel_rename(temp, path);
++	}
++	return error;
++}
++
++void
++a8f_end(void)
++{
++	const char *step = "";
++	int error;
++
++	if (a8f_put_state.buf == NULL) {
++		printf("A8F PUT error: fend without fput\n");
++		return;
++	}
++	if (a8f_put_state.bad || a8f_put_state.have != a8f_put_state.size) {
++		printf("A8F PUT error: %u of %u bytes arrived%s; nothing written\n",
++		    a8f_put_state.have, a8f_put_state.size, a8f_put_state.bad ? " (bad data)" : "");
++		a8f_put_reset();
++		return;
++	}
++	uint32_t crc = a8f_crc32(0, a8f_put_state.buf, a8f_put_state.size);
++	if (crc != a8f_put_state.crc) {
++		printf("A8F PUT error: crc %08x, not %08x; nothing written\n", crc, a8f_put_state.crc);
++		a8f_put_reset();
++		return;
++	}
++	error = a8f_write(a8f_put_state.path, a8f_put_state.buf, a8f_put_state.size,
++	    a8f_put_state.owner, a8f_put_state.mode, a8f_put_state.uid, a8f_put_state.gid, &step);
++	if (error) {
++		printf("A8F PUT error %d at %s: %s\n", error, step, a8f_put_state.path);
++	} else {
++		printf("A8F PUT ok %s %u bytes crc %08x\n", a8f_put_state.path, a8f_put_state.size, crc);
++	}
++	a8f_put_reset();
++}
++
++void
++a8f_ls(const char *args)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	char path[A8F_PATH];
++	vnode_t vp = NULLVP;
++	int error, eof = 0, numdirent = 0, shown = 0;
++	off_t offset = 0;
++	const size_t bufsize = 8192;
++	char *buf;
++
++	if (!a8f_word(&args, path, sizeof(path)) || path[0] != '/') {
++		printf("A8F LS error: fls DIR (absolute path)\n");
++		return;
++	}
++	error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		printf("A8F LS error %d %s\n", error, path);
++		return;
++	}
++	if (vnode_vtype(vp) != VDIR) {
++		vnode_close(vp, FREAD, ctx);
++		printf("A8F LS error: %s is not a directory\n", path);
++		return;
++	}
++	buf = kalloc_data(bufsize, Z_WAITOK);
++	if (buf == NULL) {
++		vnode_close(vp, FREAD, ctx);
++		return;
++	}
++	printf("A8F LS %s\n", path);
++	while (!eof && shown < 2000) {
++		uio_t uio = uio_create(1, offset, UIO_SYSSPACE, UIO_READ);
++		if (uio == NULL) {
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), bufsize);
++		error = VNOP_READDIR(vp, uio, 0, &eof, &numdirent, ctx);
++		size_t got = bufsize - (size_t)uio_resid(uio);
++		offset = uio_offset(uio);
++		uio_free(uio);
++		if (error || got == 0) {
++			break;
++		}
++		for (size_t at = 0; at + __builtin_offsetof(struct dirent, d_name) <= got;) {
++			/* getdirentries()' records (VNOP_READDIR without the extended flag) */
++			const struct dirent *dp = (const struct dirent *)(void *)(buf + at);
++			size_t head = __builtin_offsetof(struct dirent, d_name);
++			uint16_t reclen = dp->d_reclen;
++			uint8_t type = dp->d_type;
++			size_t namlen = dp->d_namlen;
++			char name[256];
++			if ((size_t)reclen <= head || at + reclen > got) {
++				break;
++			}
++			if (namlen > reclen - head) {
++				namlen = reclen - head;
++			}
++			if (namlen > sizeof(name) - 1) {
++				namlen = sizeof(name) - 1;
++			}
++			memcpy(name, dp->d_name, namlen);
++			name[namlen] = 0;
++			at += reclen;
++			if (name[0] == 0 || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
++				continue;
++			}
++			off_t size = -1;
++			if (type == DT_REG) {
++				char full[A8F_PATH + 256];
++				vnode_t fvp = NULLVP;
++				snprintf(full, sizeof(full), "%s/%s", path, name);
++				if (vnode_lookup(full, 0, &fvp, ctx) == 0) {
++					(void)vnode_size(fvp, &size, ctx);
++					vnode_put(fvp);
++				}
++			}
++			printf("A8F: %c %lld %s\n", type == DT_DIR ? 'd' : type == DT_REG ? 'f' :
++			    type == DT_LNK ? 'l' : '?', (long long)size, name);
++			shown++;
++		}
++	}
++	printf("A8F LS END %s (%d)\n", path, shown);
++	kfree_data(buf, bufsize);
++	vnode_close(vp, FREAD, ctx);
++}
++
++void
++a8f_date(const char *args)
++{
++	clock_sec_t secs = 0;
++	clock_usec_t usecs = 0;
++	uint64_t want = 0;
++
++	if (*args && a8f_number(&args, 10, &want)) {
++		if (want < 1600000000ull || want > 4102444800ull) {
++			printf("A8SH: date: %llu is not a time between 2020 and 2100\n", want);
++			return;
++		}
++		clock_set_calendar_microtime((clock_sec_t)want, 0);
++		printf("A8SH: date set\n");
++	} else if (*args) {
++		printf("A8SH: date [SECONDS since 1970, UTC]\n");
++		return;
++	}
++	clock_get_calendar_microtime(&secs, &usecs);
++	printf("A8SH: date %lu (seconds since 1970, UTC)\n", (unsigned long)secs);
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..15f58c0 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9705,6 +9705,21 @@ renameat(__unused proc_t p, struct renameat_args *uap, __unused int32_t *retval)
+ 	           uap->tofd, uap->to, UIO_USERSPACE, 0);
+ }
+ 
++#if defined(JACKPOTLTE)
++/*
++ * The A8 USB console's fput (bsd/dev/a8_files.c): a file is written beside
++ * its target and renamed over it, so nothing ever reads it half written.
++ * Kernel paths, kernel credentials.
++ */
++int a8_kernel_rename(const char *from, const char *to);
++int
++a8_kernel_rename(const char *from, const char *to)
++{
++	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from),
++	           AT_FDCWD, CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
++#endif
++
+ /*
+  * Make a directory file.
+  *
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+index 1397cfb..cca74f3 100644
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -338,6 +338,13 @@ JackpotlteMaliUserClient::surfaceBuffer(struct jackpotlte_surface * request)
+ 		OSSafeReleaseNULL(s);
+ 		return kIOReturnNotFound;
+ 	}
++	/* A client's own pages that start partway into a page (IOSurfaceAddress,
++	 * IOSurfaceWrapClientImage): the GPU maps whole pages, so the buffer's
++	 * address would not be the first pixel's.  Not a buffer, then. */
++	if (s->wrapOffset != 0) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
+ 	/* Unlike the reference's IOSurface, ours has no shared state page at the
+ 	 * front: the pixels start at `offset` in the memory.  The buffer is made
+ 	 * from that offset on, so its address is the first pixel's. */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 08f38d7..6d7ee30 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -10,6 +10,9 @@
+  *   sel 0   create: scalar [parent id], struct in = serialized property
+  *           dictionary (binary or XML), struct out = lock result (0xa68)
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
++ *   sel 6   wrap client image: struct in 0x20 (address, width, height,
++ *           format, bytes per element, bytes per row, size), struct out =
++ *           lock result; IOSurfaceAddress at create is the same thing
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+@@ -39,10 +42,12 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceWrapClientImage    = 6,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -80,8 +85,11 @@ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++static uint32_t      sweet_surface_clients_logged;     /* creates/wraps over client memory */
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++static uint64_t      sweet_surface_client_wired;        /* clients' own pages held */
++#define SWEET_SURFACE_CLIENT_MAX        (512ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+@@ -92,6 +100,10 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (clientBytes != 0 && memory != NULL) {
++		memory->complete();             /* unwire the client's pages */
++		OSAddAtomic64(-(SInt64)clientBytes, (volatile SInt64 *)&sweet_surface_client_wired);
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -106,10 +118,13 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		/* The panel's memory is write-combined everywhere; a client's own
++		 * pages keep the cache mode the client maps them with. */
++		kernelMap = memory->map(kIOMapAnywhere | mapCache |
++		    (mapReadOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+-	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
++	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() + wrapOffset : 0;
+ }
+ 
+ static uint32_t *
+@@ -356,6 +371,97 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * Pixels that are already in the client's memory: IOSurfaceAddress at create,
++ * and IOSurfaceWrapClientImage (sel 6), which is what CoreAnimation's OpenGL
++ * ES renderer asks for every image it draws -- app icons, glyph masks,
++ * gradients.  Both used to be ignored: sel 6 was refused (backboardd then
++ * asked again, every image every frame: 135,000 refusals in 25 minutes on
++ * jt 0189), and its fallback, a create with IOSurfaceAddress, got fresh zero
++ * pages, so the home screen's icons and the widgets' pictures were drawn as
++ * nothing (the S7 port hit the same: wardevsa 0255, 0259, 0332).
++ *
++ * The surface IS the client's pages when they can be held (wired) -- what the
++ * client draws there later is then seen by everyone who maps the surface --
++ * and otherwise it is a copy of them taken now.  `need` is how many bytes from
++ * `at` the pixels span.  Runs in the client's own context (copyin).
++ * Boot-arg sweetwrap=0: always copy.
++ */
++static int sweet_surface_wrap_on = -1;
++
++static IOReturn
++sweet_surface_take_client(SweetSurface *s, task_t task, uint64_t at, uint64_t need,
++    bool *wrapped)
++{
++	uint64_t first = trunc_page_64(at);
++	uint64_t off = at - first;
++	uint64_t len;
++
++	*wrapped = false;
++	if (at == 0 || need == 0 || need > SWEET_SURFACE_MAX_ALLOC) {
++		return kIOReturnBadArgument;
++	}
++	if (sweet_surface_wrap_on < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("sweetwrap", &on, sizeof(on));
++		sweet_surface_wrap_on = on != 0;
++	}
++	len = round_page_64(off + need);
++	if (sweet_surface_wrap_on) {
++		uint64_t before = (uint64_t)OSAddAtomic64((SInt64)len,
++		    (volatile SInt64 *)&sweet_surface_client_wired);
++		if (before + len <= SWEET_SURFACE_CLIENT_MAX) {
++			/* Read-write if the client may write them, else for reading. */
++			static const IOOptionBits ways[2] = { kIODirectionInOut, kIODirectionOut };
++			for (int w = 0; w < 2; w++) {
++				IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(
++					(mach_vm_address_t)first, (mach_vm_size_t)len, ways[w], task);
++				if (md != NULL && md->prepare() == kIOReturnSuccess) {
++					s->memory = md;
++					s->clientBytes = len;
++					s->wrapOffset = (uint32_t)off;
++					s->mapReadOnly = (w == 1);
++					s->mapCache = kIOMapDefaultCache;
++					s->allocSize = (uint32_t)(len - off);
++					*wrapped = true;
++					return kIOReturnSuccess;
++				}
++				OSSafeReleaseNULL(md);
++			}
++		}
++		OSAddAtomic64(-(SInt64)len, (volatile SInt64 *)&sweet_surface_client_wired);
++	}
++
++	/* A copy: as much of it as can be read, page by page if need be. */
++	uint64_t size = round_page_64(need);
++	IOBufferMemoryDescriptor *mem = NULL;
++	if ((uint64_t)OSAddAtomic64((SInt64)size, (volatile SInt64 *)&sweet_surface_wired) + size <=
++	    SWEET_SURFACE_WIRED_MAX) {
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)size, page_size);
++	}
++	if (mem == NULL) {
++		OSAddAtomic64(-(SInt64)size, (volatile SInt64 *)&sweet_surface_wired);
++		return kIOReturnNoMemory;
++	}
++	uint8_t *dst = (uint8_t *)mem->getBytesNoCopy();
++	bzero(dst, (size_t)size);
++	if (copyin((user_addr_t)at, dst, (vm_size_t)need) != 0) {
++		for (uint64_t done = 0; done < need;) {
++			uint64_t n = PAGE_SIZE - ((at + done) & PAGE_MASK);
++			if (n > need - done) {
++				n = need - done;
++			}
++			(void)copyin((user_addr_t)(at + done), dst + done, (vm_size_t)n);
++			done += n;
++		}
++	}
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	s->allocSize = (uint32_t)size;
++	return kIOReturnSuccess;
++}
++
+ /* Per-client mapping of one surface. */
+ class SweetSurfaceRef : public OSObject {
+ 	OSDeclareDefaultStructors(SweetSurfaceRef);
+@@ -418,6 +524,7 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn wrapClientImage(IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -624,7 +731,8 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache |
++	    (s->mapReadOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -664,7 +772,7 @@ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x00, ref->data->getAddress() + s->wrapOffset);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -781,7 +889,30 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	uint64_t at = client != NULL ? client->unsigned64BitValue() : 0;
++	if (ret == kIOReturnSuccess && at != 0) {
++		/* Over the client's own pixels (see sweet_surface_take_client):
++		 * only as far as they go, not to the page-rounded allocation,
++		 * which can reach past the end of what the client allocated. */
++		uint64_t need = (uint64_t)s->offset +
++		    (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		bool wrapped = false;
++		if (s->planeCount != 0 || need <= s->offset || need > s->allocSize) {
++			need = s->allocSize;
++		}
++		ret = sweet_surface_take_client(s, fTask, at, need, &wrapped);
++		if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++		if (sweet_surface_clients_logged++ < 24 || ret != kIOReturnSuccess) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s create id %u %ux%u over client 0x%llx, %llu bytes: %s -> 0x%x\n",
++			    name, s->id, s->width, s->height, at, need,
++			    wrapped ? "its own pages" : "copied", ret);
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -818,6 +949,79 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/*
++ * IOSurfaceWrapClientImage: a surface around a picture in the caller's own
++ * memory.  The 32-byte request (danstronics' MiniIOSurface, seen on the S9):
++ *
++ *     u64 address; u32 width, height, pixel format, bytes per element,
++ *     bytes per row, size
++ *
++ * where size is the owner's (a mask's last row only as long as it is wide).
++ * The answer is a create's lock result.  The surface says pixel format 0:
++ * jackpotlte-gl then samples it through its copying path, which takes any
++ * stride and offset, instead of asking the GPU driver to map client pages
++ * that need not start on a page or a 64-byte row.
++ */
++IOReturn
++IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
++{
++	struct {
++		uint64_t address;
++		uint32_t width, height, format, bytesPerElement, bytesPerRow, size;
++	} req;
++	static uint32_t wraps, copies;
++	bool wrapped = false;
++	IOReturn ret;
++
++	static_assert(sizeof(req) == 32, "wrap request");
++	if (sweet_surf_in_size(args) < sizeof(req)) {
++		return kIOReturnBadArgument;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		if (args->structureInputDescriptor->readBytes(0, &req, sizeof(req)) != sizeof(req)) {
++			return kIOReturnBadArgument;
++		}
++	} else {
++		memcpy(&req, args->structureInput, sizeof(req));
++	}
++	if (req.address == 0 || req.width == 0 || req.height == 0 ||
++	    req.width > SWEET_SURFACE_MAX_DIM || req.height > SWEET_SURFACE_MAX_DIM ||
++	    req.bytesPerRow == 0 || req.bytesPerElement > 64 || req.size == 0 ||
++	    req.size > SWEET_SURFACE_MAX_ALLOC) {
++		return kIOReturnBadArgument;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return kIOReturnNoMemory;
++	}
++	s->width = req.width;
++	s->height = req.height;
++	s->bytesPerElement = (uint16_t)(req.bytesPerElement ? req.bytesPerElement : 4);
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = 0;
++	s->bytesPerRow = req.bytesPerRow;
++	ret = sweet_surface_take_client(s, fTask, req.address, req.size, &wrapped);
++	if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++		ret = kIOReturnNoResources;
++	}
++	uint32_t n = wrapped ? ++wraps : ++copies;
++	if (ret != kIOReturnSuccess || n <= 12 || (n & 4095) == 0) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET SURF: %s wrap id %u %ux%u fmt 0x%x bpe %u bpr %u size %u at 0x%llx: "
++		    "%s #%u -> 0x%x\n", name, s->id, req.width, req.height, req.format,
++		    req.bytesPerElement, req.bytesPerRow, req.size, req.address,
++		    wrapped ? "its own pages" : "copied", n, ret);
++	}
++	if (ret != kIOReturnSuccess) {
++		s->release();
++		return ret;
++	}
++	ret = returnSurface(s, args);   /* takes the creator's user count */
++	s->release();
++	return ret;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -839,6 +1043,9 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
++	case kSweetSurfaceWrapClientImage:
++		sweet_surf_log_once("sel", selector);
++		return wrapClientImage(args);
+ 	case kSweetSurfaceLookup: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
+@@ -893,8 +1100,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 				s->release();
+ 				return ret;
+ 			}
+-			IOLog("SWEET SURF: sel %u wants a %u-byte structure; "
+-			    "id %u is no surface\n", selector, out, id);
++			static uint32_t told;
++			if (told++ < 16 || (told & 4095) == 0) {
++				IOLog("SWEET SURF: sel %u wants a %u-byte structure; "
++				    "id %u is no surface (#%u)\n", selector, out, id, told);
++			}
+ 			sweet_surf_log_once("sel", selector);
+ 			return kIOReturnUnsupported;
+ 		}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..e6619ae 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -35,15 +35,21 @@ public:
+ 	uint32_t cacheMode, planeCount, parentID;
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+-	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
++	IOMemoryDescriptor       *memory;       /* pixels (buffer, physical, or a client's own pages) */
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	/* A client's own pages (IOSurfaceAddress, IOSurfaceWrapClientImage):
++	 * memory is those whole pages, prepared (wired) until the surface goes;
++	 * the first pixel is wrapOffset bytes into the first of them. */
++	uint64_t                  clientBytes;  /* wired client bytes; 0: not client memory */
++	uint32_t                  wrapOffset;
++	bool                      mapReadOnly;  /* the client may only read those pages */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+-	/* Kernel address of the pixels (mapped on first use), or 0. */
++	/* Kernel address of the first pixel (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
+ };
+ 
+diff --git a/osfmk/kern/clock.c b/osfmk/kern/clock.c
+index b58ad2e..ec82f51 100644
+--- a/osfmk/kern/clock.c
++++ b/osfmk/kern/clock.c
+@@ -73,6 +73,7 @@
+ #include <libkern/OSAtomic.h>
+ 
+ #include <IOKit/IOPlatformExpert.h>
++#include <pexpert/pexpert.h>
+ 
+ #include <machine/commpage.h>
+ #include <machine/config.h>
+@@ -1050,6 +1051,23 @@ clock_initialize_calendar(void)
+ #endif /* ENABLE_LEGACY_CLOCK_CODE */
+ 	//Get the UTC time and corresponding sys time
+ 	PEGetUTCTimeOfDay(&secs, &microsecs);
++#if defined(JACKPOTLTE)
++	/*
++	 * A8 2018: no RTC driver yet, so the calendar started at 0 -- iOS said
++	 * Wednesday, December 31, 1969.  Boot-arg a8time (seconds since 1970,
++	 * written when the boot image is made) is the earliest it can be; the
++	 * USB console's "date" sets the exact time later.
++	 */
++	{
++		uint64_t a8time = 0;
++
++		if (PE_parse_boot_argn("a8time", &a8time, sizeof(a8time)) &&
++		    (uint64_t)secs < a8time) {
++			secs = (clock_sec_t)a8time;
++			microsecs = 0;
++		}
++	}
++#endif
+ 	clock_get_system_microtime(&sys, &microsys);
+ 
+ #if ENABLE_LEGACY_CLOCK_CODE
