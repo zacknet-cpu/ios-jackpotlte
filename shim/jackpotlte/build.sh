@@ -34,8 +34,9 @@ mkdir -p out
 $CC $CFLAGS -c start.S -o out/start.o
 $CC $CFLAGS -c loader.c -o out/loader.o
 $CC $CFLAGS -c ../fdt.c -o out/fdt.o
+$CC $CFLAGS -c inflate.c -o out/inflate.o
 
-objs="out/loader.o out/fdt.o"
+objs="out/loader.o out/fdt.o out/inflate.o"
 
 # Runs wherever S-Boot puts it, with no relocation pass: only the header's
 # image_size (linked at 0) may be an absolute address.

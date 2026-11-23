@@ -78,6 +78,16 @@
  * even when the screen showed nothing. Set 0 to disable. */
 #define JT_CANARY_MS		8000U
 
+/* Phase 2 slots (loader.c slots_select): RAM records in the unused last page
+ * of the 20 MiB handover framebuffer reservation (DT reserved-memory
+ * dpu_fb_handover 0xec000000 + 0x1400000; the panel buffer and the flip
+ * buffer end at 0xed267000). A marker there survived a warm restart on the
+ * phone (2026-11-23). PMU INFORM0/1 must NOT be used: writing them broke the
+ * next boot's secondary CPU start. */
+#define JT_SLOT_FLAG_PA		0xed3ff000UL	/* "try B once", written by XNU */
+#define JT_SLOT_BOOT_PA		0xed3ff100UL	/* what the loader booted, for XNU */
+#define JT_PMU_RST_STAT		0x0404U		/* reset cause (bit 24 watchdog) */
+
 /* ---- Timer (SAM-K exynos7885.dtsi timer) ----
  * arm,armv8-timer, clock-frequency 26000000. The arch timer PPIs (with the
  * DT GIC numbering): secure phys 13, non-secure phys 14, virtual 11, hyp 10.

@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include "board.h"
 #include "../fdt.h"
+#include "inflate.h"
 #if JT_HAVE_FB
 #include "../font.h"
 #include "logo.h"
@@ -341,10 +342,231 @@ static uint64_t fail(const char *why)
 	return 0;
 }
 
-/* Print one "has/no <node>" line. Kept as a function (not a pointer table) so
- * the loader needs no absolute relocations at all: a table of string-literal
- * addresses is a link-time-address array, which cannot survive being loaded at
- * an arbitrary address with no relocation pass. */
+/* ---- Phase 2: two kernel slots (tools/jackpotlte/mkslots.py) ----
+ * The ramdisk may hold a "SWEETSLT" container instead of one SWEETXNU
+ * payload: two raw-deflated v1 payloads, each described by a record in its
+ * own 512-byte sector with its own CRC. The default slot is the good one with
+ * the highest generation. The running kernel can leave a "try slot N once"
+ * request at JT_SLOT_FLAG_PA; it is wiped here before that slot is even read,
+ * so a test kernel that hangs, panics or is force-restarted comes back on the
+ * default. Anything wrong with a slot (record CRC, size, data CRC, decode)
+ * also falls back. What was booted, and why, is left at JT_SLOT_BOOT_PA. */
+#define SLOT_MAGIC0	0x45455753U	/* "SWEE" */
+#define SLOT_MAGIC1	0x544c5354U	/* "TSLT" */
+#define SLOT_VERSION	2U
+#define SLOT_HDR	4096U
+#define SLOT_REC_OFF(i)	(512U * (1U + (uint32_t)(i)))
+#define SLOT_SCRATCH	0xa0000000UL	/* low bank, decoded payload */
+#define SLOT_MAX_PAYLOAD (64UL << 20)
+#define TRY_MAGIC	0x52543841U	/* "A8TR" */
+#define BOOT_MAGIC	0x54423841U	/* "A8BT" */
+
+/* Boot record reasons, also read by the kernel (bsd/dev/a8_slots.c). */
+#define WHY_DEFAULT	0U	/* no request: the default slot */
+#define WHY_TRY		1U	/* the requested slot, once */
+#define WHY_TRY_FAILED	2U	/* request refused, default instead */
+#define WHY_OTHER_GOOD	3U	/* default refused, the other good slot */
+
+static uint32_t rd32(uintptr_t a)
+{
+	return *(volatile uint32_t *)a;
+}
+
+static uint64_t rd64(uintptr_t a)
+{
+	return (uint64_t)rd32(a) | ((uint64_t)rd32(a + 4) << 32);
+}
+
+/* CRC-32 (zlib) over RAM. The MMU is off, so every load is an uncached
+ * Device access: read whole aligned words and fold them bytewise. */
+static uint32_t crc32_dev(uintptr_t p, uint64_t n)
+{
+	uint32_t c = 0xffffffffU;
+
+	for (; n >= 4 && !(p & 3); n -= 4, p += 4) {
+		c ^= *(volatile uint32_t *)p;
+		for (int k = 0; k < 32; k++)
+			c = (c >> 1) ^ (0xedb88320U & (0U - (c & 1U)));
+	}
+	for (; n; n--, p++) {
+		c ^= *(volatile uint8_t *)p;
+		for (int k = 0; k < 8; k++)
+			c = (c >> 1) ^ (0xedb88320U & (0U - (c & 1U)));
+	}
+	return c ^ 0xffffffffU;
+}
+
+static uint64_t ticks(void)
+{
+	uint64_t t;
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+	return t;
+}
+
+/* Milliseconds since an earlier ticks() value; 0 if CNTFRQ was never set. */
+static uint32_t ms_since(uint64_t t0)
+{
+	uint64_t frq;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+	return frq ? (uint32_t)((ticks() - t0) / (frq / 1000U)) : 0;
+}
+
+/* A slot record: present (CRC ok, not empty), good, generation. */
+static int slot_ok(uintptr_t rd, int i)
+{
+	uintptr_t r = rd + SLOT_REC_OFF(i);
+	return crc32_dev(r, 124) == rd32(r + 124) && rd64(r + 16) != 0;
+}
+
+static int slot_good(uintptr_t rd, int i)
+{
+	return slot_ok(rd, i) && rd32(rd + SLOT_REC_OFF(i) + 112) == 1;
+}
+
+static uint32_t slot_gen(uintptr_t rd, int i)
+{
+	return rd32(rd + SLOT_REC_OFF(i) + 44);
+}
+
+/* One slot: check it, decode it into SLOT_SCRATCH. 0 = ok. */
+static const char *slot_decode(uintptr_t rd, uint64_t len, int i,
+    uintptr_t dtb, uint64_t *plen)
+{
+	uintptr_t r = rd + SLOT_REC_OFF(i);
+	uint64_t off = rd64(r), cap = rd64(r + 8), csize = rd64(r + 16);
+	uint64_t usize = rd64(r + 24);
+	uint32_t codec = rd32(r + 32), crc_c = rd32(r + 36), crc_u = rd32(r + 40);
+	uint64_t dtb_end = dtb + __builtin_bswap32(rd32(dtb + 4));
+	extern char _head[], _end[];
+
+	if (crc32_dev(r, 124) != rd32(r + 124))
+		return "record CRC differs";
+	if (!csize)
+		return "empty";
+	if (codec != 1)
+		return "unknown codec";
+	if (off < SLOT_HDR || off > len || cap > len - off || csize > cap)
+		return "bad offset or size";
+	if (!usize || usize > SLOT_MAX_PAYLOAD)
+		return "bad payload size";
+	if (SLOT_SCRATCH + usize > LOW_RAM_END ||
+	    (SLOT_SCRATCH < rd + len && rd < SLOT_SCRATCH + usize) ||
+	    (SLOT_SCRATCH < dtb_end && dtb < SLOT_SCRATCH + usize) ||
+	    (SLOT_SCRATCH < (uintptr_t)_end && (uintptr_t)_head < SLOT_SCRATCH + usize))
+		return "scratch RAM overlaps";
+	out("crc...");
+	if (crc32_dev(rd + off, csize) != crc_c)
+		return "compressed CRC differs";
+	out(" inflate...");
+	uint64_t got = 0;
+	int err = jt_inflate((uint8_t *)SLOT_SCRATCH, usize, &got,
+	    (const uint8_t *)(rd + off), csize);
+	if (err || got != usize)
+		return "inflate failed";
+	out(" crc...");
+	if (crc32_dev(SLOT_SCRATCH, usize) != crc_u)
+		return "payload CRC differs";
+	out(" ok\n");
+	*plen = usize;
+	return 0;
+}
+
+static void slot_record(uint32_t slot, uint32_t reason, uint32_t seq,
+    uint32_t ms, uint32_t def, uint32_t gen)
+{
+	volatile uint32_t *b = (volatile uint32_t *)JT_SLOT_BOOT_PA;
+	uint32_t x = 0;
+
+	b[0] = BOOT_MAGIC;
+	b[1] = 2;
+	b[2] = slot;
+	b[3] = reason;
+	b[4] = seq;
+	b[5] = *(volatile uint32_t *)(JT_PMU_BASE + JT_PMU_RST_STAT);
+	b[6] = ms;
+	b[7] = def;
+	b[8] = gen;
+	b[9] = 0;
+	b[10] = 0;
+	for (int i = 0; i < 11; i++)
+		x ^= b[i];
+	b[11] = x ^ 0xffffffffU;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* 0: not a container (rd unchanged); 1: rd now points at the decoded
+ * payload; -1: nothing bootable (fail() already printed). */
+static int slots_select(uint64_t *rd_start, uint64_t *rd_end, uintptr_t dtb)
+{
+	uintptr_t rd = (uintptr_t)*rd_start;
+	uint64_t len = *rd_end - *rd_start, plen = 0;
+	volatile uint32_t *f = (volatile uint32_t *)JT_SLOT_FLAG_PA;
+	int want = -1, def = -1, order[3], n = 0;
+	uint32_t seq = 0, why[3];
+	uint64_t t0 = ticks();
+
+	if (len < SLOT_HDR || rd32(rd) != SLOT_MAGIC0 || rd32(rd + 4) != SLOT_MAGIC1)
+		return 0;
+	out("slots: container\n");
+	if (rd32(rd + 8) != SLOT_VERSION || rd32(rd + 12) != SLOT_HDR ||
+	    rd32(rd + 16) != 2 || crc32_dev(rd, 24) != rd32(rd + 24)) {
+		fail("slots: bad container header");
+		return -1;
+	}
+	if (f[0] == TRY_MAGIC && f[1] == 1 && f[2] < 2 &&
+	    f[4] == (f[0] ^ f[1] ^ f[2] ^ f[3] ^ 0xffffffffU)) {
+		want = (int)f[2];
+		seq = f[3];
+	}
+	/* Wipe the request before the slot is touched: it is good for one try. */
+	for (int i = 0; i < 8; i++)
+		f[i] = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	for (int i = 0; i < 2; i++)
+		if (slot_good(rd, i) && (def < 0 || slot_gen(rd, i) > slot_gen(rd, def)))
+			def = i;
+	if (want >= 0 && want != def) {
+		order[n] = want;
+		why[n++] = WHY_TRY;
+	}
+	if (def >= 0) {
+		order[n] = def;
+		why[n++] = want >= 0 && want != def ? WHY_TRY_FAILED : WHY_DEFAULT;
+		if (slot_good(rd, 1 - def) && 1 - def != want) {
+			order[n] = 1 - def;
+			why[n++] = WHY_OTHER_GOOD;
+		}
+	}
+	for (int k = 0; k < n; k++) {
+		int i = order[k];
+		const char *bad;
+
+		out(i ? "slots: slot 1" : "slots: slot 0");
+		out(why[k] == WHY_TRY ? " (try once)\n" : "\n");
+		bad = slot_decode(rd, len, i, dtb, &plen);
+		if (bad) {
+			out("slots: refused: ");
+			out(bad);
+			out("\n");
+			continue;
+		}
+		uint32_t ms = ms_since(t0);
+		slot_record((uint32_t)i, why[k], seq, ms,
+		    def < 0 ? 0xffffffffU : (uint32_t)def, slot_gen(rd, i));
+		out("slots: booting slot ");
+		dec((uint64_t)i);
+		out(", ");
+		dec(ms);
+		out(" ms\n");
+		*rd_start = SLOT_SCRATCH;
+		*rd_end = SLOT_SCRATCH + plen;
+		return 1;
+	}
+	fail("slots: nothing bootable");
+	return -1;
+}
+
 static void node_line(uintptr_t dtb, const char *name)
 {
 	out(fdt_has_node(dtb, name) ? "has " : "no  ");
@@ -481,6 +703,8 @@ uint64_t jt_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	out("\n");
 	if (rd_start < LOW_RAM_BASE || rd_end > LOW_RAM_END || rd_end <= rd_start)
 		return fail("initrd outside low RAM");
+	if (slots_select(&rd_start, &rd_end, dtb) < 0)
+		return 0;
 
 	const volatile struct payload *p = (const volatile struct payload *)rd_start;
 	uint64_t length = rd_end - rd_start;
