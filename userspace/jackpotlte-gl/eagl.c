@@ -44,7 +44,8 @@
  * glEGLImageTargetTexture2DOES, which 0003's OSMesa frontend hook turns into a
  * buffer of that surface (0154's 0x7e) - no copy, the display's memory itself.
  * A surface that cannot be one (not one plane of 32-bit BGRA pixels) is logged
- * and refused rather than copied: a copy would be a different picture and a
+ * and refused rather than copied, except -attachImage: of a 4-byte one-plane
+ * surface (Control Center masks), which is copied as BGRA: a
  * different bug.
  *
  * The present methods are what makes a drawn frame exist.  Apple's context
@@ -413,9 +414,15 @@ clean_surface(unsigned i, const char *why)
    size_t length;
    uint64_t t0;
 
-   if (IOSurfaceLock(shared[i].surface, SURFACE_LOCK_READ_ONLY, &seed) != 0) {
+   /*
+    * DC CIVAC writes the line back.  A read-only lock is not enough: CoreAnimation
+    * client images are often mapped prot 1/1 (tag 51), and the writeback is a
+    * SIGBUS (libjackpotlte-gl+0x78ec on the upload path that just noted them).
+    * Take a writable lock, or skip the flush.
+    */
+   if (IOSurfaceLock(shared[i].surface, 0, &seed) != 0) {
       if (cleans < 40)
-         say("cache: surface %u could not be locked (%s)", shared[i].id, why);
+         say("cache: surface %u not writable, skip dcache (%s)", shared[i].id, why);
       return;
    }
    base = IOSurfaceGetBaseAddress(shared[i].surface);
@@ -424,7 +431,7 @@ clean_surface(unsigned i, const char *why)
    if (base != NULL && length != 0)
       sys_dcache_flush(base, length);
    perf.clean += mach_absolute_time() - t0;
-   (void)IOSurfaceUnlock(shared[i].surface, SURFACE_LOCK_READ_ONLY, &seed);
+   (void)IOSurfaceUnlock(shared[i].surface, 0, &seed);
    cleans++;
    if (cleans <= 40 || cleans % 500 == 0)
       say("cache: cleaned surface %u, %zu bytes at %p (%s, %s), %lu cleans",
@@ -1318,9 +1325,22 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
    struct jackpotlte_eagl *e = context_of(self);
 
    (void)selector;
-   (void)inverted;
    if (e == NULL || surface == NULL)
       return NO;
+   if (surface_shareable(surface))
+      return surface_is_texture(e, surface, target, "-attachImage:");
+   /*
+    * Pixel-format 0, 4 bytes a pixel (Control Center corner masks and similar):
+    * not BGRA so surface_is_texture refuses them, which left square unclipped
+    * tiles (shot-0191-cc.png).  Copy as BGRA; do not note them as shared
+    * (surface_copy_texture does not), so clean_surface never touches them.
+    */
+   if (IOSurfaceGetPlaneCount(surface) == 0 &&
+       IOSurfaceGetBytesPerElement(surface) == 4) {
+      return surface_copy_texture(e, surface,
+            (int)IOSurfaceGetWidth(surface), (int)IOSurfaceGetHeight(surface),
+            GL_RGBA8, GL_BGRA, GL_UNSIGNED_BYTE, inverted, "-attachImage:");
+   }
    return surface_is_texture(e, surface, target, "-attachImage:");
 }
 
