@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index bb07eb0..63798f9 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -610,7 +610,9 @@ a8f_date(const char *args)
+  * /usr/local/lib/libjackpotlte-gl.dylib).  The root file must be an arm64
+  * Mach-O dylib; otherwise the boot-arg path is used and a line is logged.
+  */
+-#define A8_GL_ROOT_PATH    "/private/var/root/libjackpotlte-gl.dylib"
++/* 0198: under /private/var/mobile/Library, which backboardd (user mobile)
++ * can read; /private/var/root is 0700 root and dyld refused it (errno 13). */
++#define A8_GL_ROOT_PATH    "/private/var/mobile/Library/libjackpotlte-gl.dylib"
+ #define A8_GL_BASENAME     "libjackpotlte-gl.dylib"
+ #define A8_MH_MAGIC_64     0xFEEDFACFu
+ #define A8_MH_DYLIB        0x6u
