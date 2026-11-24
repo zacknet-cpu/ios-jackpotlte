@@ -1,0 +1,132 @@
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index 122b7c3..bb07eb0 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -35,6 +35,7 @@
+ #include <sys/kauth.h>
+ #include <kern/kalloc.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <string.h>
+ 
+ int a8_kernel_rename(const char *from, const char *to);         /* vfs_syscalls.c */
+@@ -45,6 +46,7 @@ void a8f_end(void);
+ void a8f_ls(const char *args);
+ void a8f_date(const char *args);
+ bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size);
++bool a8_fix_library_ok(void);
+ 
+ #define A8F_MAX_GET     (512u << 10)
+ #define A8F_MAX_PUT     (1024u << 10)
+@@ -698,4 +700,40 @@ a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_s
+ 	strlcpy(out, A8_GL_ROOT_PATH, out_size);
+ 	return true;
+ }
++
++/*
++ * 0196: the fix library for a8fix=1 (kern_exec.c) must be an arm64 Mach-O
++ * dylib before it goes into DYLD_INSERT_LIBRARIES, since dyld stops a program
++ * whose inserted library cannot be loaded. Checked at most every 10 s.
++ */
++#define A8_FIX_PATH        "/private/var/mobile/Library/libjackpotlte-fix.dylib"
++
++bool
++a8_fix_library_ok(void)
++{
++	static uint64_t checked;
++	static bool ok;
++	uint64_t now = mach_absolute_time(), ns = 0;
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx;
++
++	if (checked != 0) {
++		absolutetime_to_nanoseconds(now - checked, &ns);
++		if (ns < 10ull * NSEC_PER_SEC) {
++			return ok;
++		}
++	}
++	checked = now;
++	ctx = vfs_context_kernel();
++	if (vnode_open(A8_FIX_PATH, FREAD, 0, 0, &vp, ctx) != 0 || vp == NULLVP) {
++		ok = false;
++		return ok;
++	}
++	ok = a8_gl_header_ok(vp, ctx);
++	(void)vnode_close(vp, FREAD, ctx);
++	if (!ok) {
++		printf("A8 FIX: %s is not an arm64 Mach-O dylib; not inserted\n", A8_FIX_PATH);
++	}
++	return ok;
++}
+ #endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 8e0f02b..df37ffa 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5615,6 +5615,33 @@ static TUNABLE_STR(exec_inject_vars, 256, "jtexecenv", "");
+ 
+ #if defined(JACKPOTLTE)
+ extern bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size); /* a8_files.c */
++extern bool a8_fix_library_ok(void); /* a8_files.c */
++
++/*
++ * 0196: boot-arg a8fix=1 also inserts the userland fix library (typing lag:
++ * userspace/jackpotlte-fix) into every app, meaning every program whose path
++ * has ".app/" in it, as long as the file is an arm64 Mach-O dylib. The boot-arg
++ * line has no room for a list of apps (607 characters).
++ */
++#define A8_FIX_LIBRARY  "/private/var/mobile/Library/libjackpotlte-fix.dylib"
++static TUNABLE(uint32_t, exec_inject_fix, "a8fix", 0);
++
++static bool
++exec_inject_is_app(struct image_params *imgp)
++{
++	const char *path;
++
++	if (imgp->ip_strings == NULL) {
++		return false;
++	}
++	path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++	for (size_t i = 0; i < MAXPATHLEN && path[i] != 0; i++) {
++		if (path[i] == '.' && strncmp(path + i, ".app/", 5) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
+ #endif
+ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+@@ -5624,7 +5651,7 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 	size_t namelen, used;
+ 	bool any = false;
+ 
+-	if (*p == 0 || imgp->ip_ndp == NULL) {
++	if (imgp->ip_ndp == NULL) {
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
+@@ -5703,6 +5730,23 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 		    (int)(namelen > 200 ? 200 : namelen),
+ 		    name != NULL ? name : "(?)", any ? env : "(no match)");
+ 	}
++#if defined(JACKPOTLTE)
++	if (exec_inject_fix != 0 && exec_inject_is_app(imgp) && a8_fix_library_ok()) {
++		size_t fixlen = strlen(A8_FIX_LIBRARY);
++
++		if (used + 1 + fixlen < size) {
++			if (any) {
++				env[used++] = ':';
++			}
++			memcpy(env + used, A8_FIX_LIBRARY, fixlen);
++			used += fixlen;
++			env[used] = 0;
++			any = true;
++			printf("A8 FIX: into %.*s\n", (int)(namelen > 64 ? 64 : namelen),
++			    name != NULL ? name : "?");
++		}
++	}
++#endif
+ 	return any;
+ }
+ 
