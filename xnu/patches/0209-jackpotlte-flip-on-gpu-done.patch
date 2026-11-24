@@ -1,0 +1,270 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index c6fab7a..23cd28f 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1906,7 +1906,7 @@ a8s_command(const char *line)
+ 		/* 0203: "flip a" async SwapEnd, "flip s" synchronous again;
+ 		 * 0207: "flip g" / "flip n" a swap waits for the GPU or not */
+ 		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : *rest == 'a' ? 2 : *rest == 's' ? 3 :
+-		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : -1;
++		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : *rest == 'd' ? 6 : *rest == 'w' ? 7 : -1;
+ 		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
+ 	} else if (a8s_word(line, "date", &rest)) {
+ 		while (*rest == ' ') {
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index 1633645..f8dfc35 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -905,6 +905,8 @@ static uint64_t jt_queued_seq, jt_done_seq;
+ static bool jt_worker_started;
+ static LCK_MTX_DECLARE(jt_queue_lock, &jt_mali_lock_group);
+ 
++extern void sweet_fb_gpu_done(uint64_t seq);   /* SweetFramebuffer.cpp, 0209 */
++
+ static void
+ jt_mali_worker(void *parameter, wait_result_t result)
+ {
+@@ -933,6 +935,7 @@ jt_mali_worker(void *parameter, wait_result_t result)
+ 		lck_mtx_unlock(&jt_queue_lock);
+ 		wakeup((caddr_t)&jt_done_seq);
+ 		wakeup((caddr_t)&jt_queue_head);
++		sweet_fb_gpu_done(seq);         /* 0209: a flip that waited for this job */
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bac81c9..621e537 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -254,6 +254,18 @@ static uint64_t      a8_flip_settles, a8_flip_settle_us;
+ static int           a8_flip_gpu = -1;
+ static uint64_t      a8_flip_gpu_busy, a8_flip_gpu_us, a8_flip_gpu_late;
+ static uint64_t      a8_gpu_gates, a8_gpu_gate_us, a8_swap_quick;
++/* 0209: with async SwapEnd, a swap whose frame the GPU is still drawing does
++ * not wait for it: the flip is left to the GPU worker (sweet_fb_gpu_done(),
++ * called by jackpotlte_mali.c after every job) and programmed when the
++ * frame's last job is done, so the next frame's CPU work overlaps the GPU.
++ * The next frame's first GPU job still waits in sweet_fb_gpu_gate() until the
++ * panel took that flip.  Boot-arg a8flipdefer (default 1), console "flip d"
++ * (on) and "flip w" (wait as 0207); kern.a8_flip_defer tells the GL shim. */
++static int           a8_flip_defer = -1;
++static volatile uint64_t a8_defer_seq;          /* 0: no flip waits for the GPU */
++static uint32_t      a8_defer_addr, a8_defer_width, a8_defer_height;
++static uint64_t      a8_flip_deferred, a8_flip_defer_done, a8_gate_defer, a8_gate_defer_us;
++static IOSimpleLock *a8_scan_lock;
+ /* 0204: the software vsync follows the panel's frame starts (seen when an
+  * update is taken), so CoreAnimation's frames start right after the panel
+  * took the last one instead of anywhere in its refresh. */
+@@ -381,6 +393,11 @@ AppleCLCD::start(IOService *provider)
+ 	if (fPresentLock == NULL) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	if (a8_scan_lock == NULL) {
++		a8_scan_lock = IOSimpleLockAlloc();     /* 0209 */
++	}
++#endif
+ 	uint32_t offdim = 7;
+ 	if (PE_parse_boot_argn("a5fb_offdim", &offdim, sizeof(offdim))) {
+ 		sweet_fb_off_dim = offdim > 7 ? 7 : offdim;
+@@ -554,6 +571,7 @@ extern "C" int sweet_fb_flip_set(int on);
+ extern "C" uint64_t jackpotlte_mali_queued_seq(void);            /* jackpotlte_mali.c, 0207 */
+ extern "C" bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
+ extern "C" void sweet_fb_gpu_gate(void);
++extern "C" void sweet_fb_gpu_done(uint64_t seq);
+ 
+ #define A8_FB_RESERVED          0x1400000ull    /* reserved-memory framebuffer@0xEC000000 */
+ #define A8_IDMA0                0x148b1000ul
+@@ -586,6 +604,17 @@ a8_flip_gpu_on(void)
+ 	return a8_flip_gpu > 0;
+ }
+ 
++static bool
++a8_flip_defer_on(void)
++{
++	if (a8_flip_defer < 0) {
++		int on = 1;
++		PE_parse_boot_argn("a8flipdefer", &on, sizeof(on));
++		a8_flip_defer = on != 0;
++	}
++	return a8_flip_defer > 0 && a8_flip_gpu_on();
++}
++
+ /* Whether the panel has an update it has not taken yet (0203). */
+ static bool
+ a8_scan_pending(void)
+@@ -624,9 +653,22 @@ a8_scan_settle(void)
+ extern "C" void
+ sweet_fb_gpu_gate(void)
+ {
+-	uint32_t us;
++	uint32_t us = 0;
+ 
+-	if (!a8_flip_async || !a8_flip_gpu_on() || !a8_scan_pending()) {
++	if (!a8_flip_async || !a8_flip_gpu_on()) {
++		return;
++	}
++	/* 0209: the last frame's flip still waits for its GPU work, which is
++	 * queued ahead of this job: the worker programs it when that is done. */
++	while (a8_defer_seq != 0 && us < 50000) {
++		IODelay(50);
++		us += 50;
++	}
++	if (us != 0) {
++		a8_gate_defer++;
++		a8_gate_defer_us += us;
++	}
++	if (!a8_scan_pending()) {
+ 		return;
+ 	}
+ 	us = a8_scan_settle();
+@@ -634,6 +676,37 @@ sweet_fb_gpu_gate(void)
+ 	a8_gpu_gate_us += us;
+ }
+ 
++/* Point DPP0 at a buffer and ask for the update (0191); a8_scan_lock held. */
++static void
++a8_scan_program(uint32_t height, uint32_t addr, uint32_t width)
++{
++	*(volatile uint32_t *)(a8_idma + A8_IDMA_SRC_SIZE) = (height << 16) | width;
++	*(volatile uint32_t *)(a8_idma + A8_IDMA_ADDR_Y8) = addr;
++	*(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) = A8_DECON_UPDATE;
++	a8_shown_addr = addr;
++	a8_shown_width = width;
++	a8_flips++;
++}
++
++/* 0209: called by the GPU worker after job `seq` is done (and by a swap that
++ * finds the GPU done meanwhile): programs a flip that waited for it. */
++extern "C" void
++sweet_fb_gpu_done(uint64_t seq)
++{
++	if (a8_defer_seq == 0 || seq < a8_defer_seq || a8_scan_lock == NULL) {
++		return;
++	}
++	IOSimpleLockLock(a8_scan_lock);
++	if (a8_defer_seq != 0 && seq >= a8_defer_seq) {
++		if (a8_defer_addr != a8_shown_addr || a8_defer_width != a8_shown_width) {
++			a8_scan_program(a8_defer_height, a8_defer_addr, a8_defer_width);
++		}
++		a8_defer_seq = 0;
++		a8_flip_defer_done++;
++	}
++	IOSimpleLockUnlock(a8_scan_lock);
++}
++
+ /* 0207: before a swap points the panel at a buffer, the GPU finishes what is
+  * queued, which includes the frame being presented (at most 50 ms). */
+ static void
+@@ -664,9 +737,6 @@ a8_flip_gpu_wait(void)
+ static void
+ a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
+ {
+-	if (wait) {
+-		a8_flip_gpu_wait();     /* 0207: a swap; not the claim/release paths */
+-	}
+ 	if (a8_idma == 0) {
+ 		a8_idma = ml_io_map(A8_IDMA0, 0x1000);
+ 		a8_decon = ml_io_map(A8_DECON, 0x1000);
+@@ -677,6 +747,38 @@ a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
+ 		a8_shown_addr = *(volatile uint32_t *)(a8_idma + A8_IDMA_ADDR_Y8);
+ 		a8_shown_width = *(volatile uint32_t *)(a8_idma + A8_IDMA_SRC_SIZE) & 0xffffu;
+ 	}
++	/* 0209: async, and the GPU is still drawing what is presented: leave
++	 * the flip to the GPU worker and return. */
++	if (wait && a8_flip_async && a8_flip_defer_on() && a8_scan_lock != NULL) {
++		uint64_t seq = jackpotlte_mali_queued_seq();
++
++		if (seq != 0 && !jackpotlte_mali_wait(seq, 0)) {
++			if (a8_defer_seq != 0) {
++				/* the last frame's flip still waits (two frames queued) */
++				(void)jackpotlte_mali_wait(a8_defer_seq, 50ull * NSEC_PER_MSEC);
++				sweet_fb_gpu_done(a8_defer_seq);
++			}
++			(void)a8_scan_settle();         /* one update in flight at most */
++			IOSimpleLockLock(a8_scan_lock);
++			a8_defer_addr = addr;
++			a8_defer_width = width;
++			a8_defer_height = fb->fHeight;
++			a8_defer_seq = seq;
++			IOSimpleLockUnlock(a8_scan_lock);
++			a8_flip_deferred++;
++			if (jackpotlte_mali_wait(seq, 0)) {
++				sweet_fb_gpu_done(seq); /* done meanwhile: the worker may have looked already */
++			}
++			return;
++		}
++	}
++	if (wait) {
++		a8_flip_gpu_wait();     /* 0207: a swap; not the claim/release paths */
++		if (a8_defer_seq != 0) {
++			/* 0209: the GPU is idle now: an older deferred flip goes first */
++			sweet_fb_gpu_done(a8_defer_seq);
++		}
++	}
+ 	if (addr == a8_shown_addr && width == a8_shown_width) {
+ 		return;
+ 	}
+@@ -688,12 +790,13 @@ a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
+ 			a8_flip_settle_us += us;
+ 		}
+ 	}
+-	*(volatile uint32_t *)(a8_idma + A8_IDMA_SRC_SIZE) = (fb->fHeight << 16) | width;
+-	*(volatile uint32_t *)(a8_idma + A8_IDMA_ADDR_Y8) = addr;
+-	*(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) = A8_DECON_UPDATE;
+-	a8_shown_addr = addr;
+-	a8_shown_width = width;
+-	a8_flips++;
++	if (a8_scan_lock != NULL) {
++		IOSimpleLockLock(a8_scan_lock);
++	}
++	a8_scan_program(fb->fHeight, addr, width);
++	if (a8_scan_lock != NULL) {
++		IOSimpleLockUnlock(a8_scan_lock);
++	}
+ 	if (wait && !a8_flip_async) {
+ 		int i;
+ 		for (i = 0; i < 200 && *(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) != 0; i++) {
+@@ -902,6 +1005,11 @@ sweet_fb_flip_set(int on)
+ 		a8_flip_gpu = on == 4;
+ 		on = -1;
+ 	}
++	if (on == 6 || on == 7) {                       /* 0209: "flip d" / "flip w" */
++		(void)a8_flip_defer_on();
++		a8_flip_defer = on == 6;
++		on = -1;
++	}
+ 	if (on >= 0) {
+ 		(void)a8_flip_on();
+ 		if (fb != NULL) {
+@@ -921,6 +1029,9 @@ sweet_fb_flip_set(int on)
+ 	    "%llu jobs held for the panel (%llu us); %llu quick swaps shown at once\n",
+ 	    a8_flip_gpu_on() ? "on" : "off", a8_flip_gpu_busy, a8_flip_gpu_us, a8_flip_gpu_late,
+ 	    a8_gpu_gates, a8_gpu_gate_us, a8_swap_quick);
++	IOLog("A8 FLIP: deferred flips %s: %llu left to the GPU worker, %llu done by it; "
++	    "%llu jobs waited for one (%llu us)\n", a8_flip_defer_on() ? "on" : "off",
++	    a8_flip_deferred, a8_flip_defer_done, a8_gate_defer, a8_gate_defer_us);
+ 	return a8_flip_on();
+ }
+ 
+@@ -975,6 +1086,20 @@ a8_flip_wait_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
+ SYSCTL_PROC(_kern, OID_AUTO, a8_flip_wait,
+     CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, a8_flip_wait_sysctl, "IU", "wait until the panel took its last update");
++
++/* 0209: 1 when a swap may leave its flip to the GPU worker (the shim may then
++ * end a frame with glFlush instead of glFinish). */
++static int
++a8_flip_defer_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++	int value = (a8_flip_defer_on() && a8_scan_lock != NULL) ? 1 : 0;
++
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++SYSCTL_PROC(_kern, OID_AUTO, a8_flip_defer,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, a8_flip_defer_sysctl, "I", "a swap may leave its flip to the GPU worker");
+ #endif
+ 
+ static uint32_t sweet_fb_swaps_logged;
