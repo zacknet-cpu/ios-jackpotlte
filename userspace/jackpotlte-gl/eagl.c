@@ -356,6 +356,8 @@ static struct {
    unsigned long frames, draws;
    unsigned long gaps[5];              /* <=17, <=34, <=50, <=100, >100 ms */
    uint64_t wait, wait_max, flush, clean;      /* mach ticks */
+   uint64_t build, between;            /* glca6: first draw -> frame end, frame end -> next first draw */
+   uint64_t frame_start, frame_done;   /* mach time of this frame's first draw, of the last frame's end */
 } perf;
 static unsigned long perf_lines;
 
@@ -402,15 +404,22 @@ perf_frame(void)
    if (perf_lines++ < 3000)
       say("perf: %llu ms, %lu frames, %lu draws (%lu a frame); gaps <=17/34/50/100/more ms: "
           "%lu/%lu/%lu/%lu/%lu; GPU wait %llu us a frame (max %llu), flush %llu us a "
-          "frame, cache %llu us a frame; jtglflush=%d jtglsync=%d",
+          "frame, cache %llu us a frame; build %llu us, between %llu us a frame; jtglflush=%d jtglsync=%d",
           (unsigned long long)(us / 1000), n, perf.draws, perf.draws / n,
           perf.gaps[0], perf.gaps[1], perf.gaps[2], perf.gaps[3], perf.gaps[4],
           (unsigned long long)(ticks_us(perf.wait) / n),
           (unsigned long long)ticks_us(perf.wait_max),
           (unsigned long long)(ticks_us(perf.flush) / n),
           (unsigned long long)(ticks_us(perf.clean) / n),
+          (unsigned long long)(ticks_us(perf.build) / n),
+          (unsigned long long)(ticks_us(perf.between) / n),
           flush_mode(), sync_mode());
-   memset(&perf, 0, sizeof(perf));
+   {
+      uint64_t done = perf.frame_done;
+
+      memset(&perf, 0, sizeof(perf));
+      perf.frame_done = done;
+   }
    perf.start = now;
    perf.last = now;
 }
@@ -556,6 +565,8 @@ frame_end(const char *why, int finished)
    if (sync_mode() == 0 || !frame_drawn)
       return;
    frame_drawn = 0;
+   if (perf.frame_start != 0)
+      perf.build += mach_absolute_time() - perf.frame_start;
    if (!finished) {
       void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
 
@@ -577,6 +588,7 @@ frame_end(const char *why, int finished)
       }
    }
    frames++;
+   perf.frame_done = mach_absolute_time();
    if (frames <= 30 || frames % 300 == 0)
       say("frame %lu ended by %s: %lu draws, %u render targets cleaned, "
           "%lu GPU waits, %u surfaces kept, %lu let go", frames, why, draws,
@@ -604,6 +616,11 @@ jackpotlte_gl_after_draw(void)
 
    draws++;
    perf.draws++;
+   if (!frame_drawn) {
+      perf.frame_start = mach_absolute_time();
+      if (perf.frame_done != 0)
+         perf.between += perf.frame_start - perf.frame_done;
+   }
    frame_drawn = 1;
    if (mode != 0)
       shared_sync();
