@@ -1,0 +1,192 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 451bdd1..0ba5e2b 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1894,7 +1894,8 @@ a8s_command(const char *line)
+ 		while (*rest == ' ') {
+ 			rest++;
+ 		}
+-		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : -1;
++		/* 0203: "flip a" async SwapEnd, "flip s" synchronous again */
++		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : *rest == 'a' ? 2 : *rest == 's' ? 3 : -1;
+ 		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
+ 	} else if (a8s_word(line, "date", &rest)) {
+ 		while (*rest == ' ') {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 71cf1af..91a9c16 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -53,6 +53,10 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <sys/proc.h>
+ #include <libkern/OSAtomic.h>
+ #include <string.h>
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#endif
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c */
+ #endif
+@@ -236,6 +240,11 @@ static uint64_t      a8_scan_phys;
+ static uint32_t      a8_shown_addr, a8_shown_width;
+ static uint64_t      a8_flips, a8_flip_late;
+ static void a8_scan_to_panel(AppleCLCD *fb, bool copy);
++/* 0203: SwapEnd hands the panel its new buffer and returns (async), instead of
++ * waiting for the frame that takes it; jackpotlte-gl waits for that frame
++ * (kern.a8_flip_wait) only right before its next frame goes to the GPU. */
++static volatile int  a8_flip_async;
++static uint64_t      a8_flip_settles, a8_flip_settle_us;
+ #endif
+ static volatile int sweet_fb_requested_off_state;
+ static uint32_t sweet_fb_off_dim = 7;
+@@ -543,8 +552,32 @@ a8_flip_on(void)
+ 	return a8_flip > 0;
+ }
+ 
++/* Whether the panel has an update it has not taken yet (0203). */
++static bool
++a8_scan_pending(void)
++{
++	return a8_decon != 0 && *(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) != 0;
++}
++
++/* Wait, at most 20 ms, until the panel took the last update; the
++ * microseconds waited. */
++static uint32_t
++a8_scan_settle(void)
++{
++	uint32_t us = 0;
++
++	while (us < 20000 && a8_scan_pending()) {
++		IODelay(50);
++		us += 50;
++	}
++	if (us >= 20000 && a8_flip_late++ < 8) {
++		IOLog("A8 FLIP: the display took no update in 20 ms (flip %llu, async)\n", a8_flips);
++	}
++	return us;
++}
++
+ /* Show a buffer: physical address and full width in pixels.  Waits for the
+- * frame that takes it when wait is true. */
++ * frame that takes it when wait is true (and SwapEnd is not async, 0203). */
+ static void
+ a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
+ {
+@@ -561,13 +594,21 @@ a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
+ 	if (addr == a8_shown_addr && width == a8_shown_width) {
+ 		return;
+ 	}
++	if (a8_flip_async) {
++		/* one update in flight at most: one not yet taken is not replaced */
++		uint32_t us = a8_scan_settle();
++		if (us != 0) {
++			a8_flip_settles++;
++			a8_flip_settle_us += us;
++		}
++	}
+ 	*(volatile uint32_t *)(a8_idma + A8_IDMA_SRC_SIZE) = (fb->fHeight << 16) | width;
+ 	*(volatile uint32_t *)(a8_idma + A8_IDMA_ADDR_Y8) = addr;
+ 	*(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) = A8_DECON_UPDATE;
+ 	a8_shown_addr = addr;
+ 	a8_shown_width = width;
+ 	a8_flips++;
+-	if (wait) {
++	if (wait && !a8_flip_async) {
+ 		int i;
+ 		for (i = 0; i < 200 && *(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) != 0; i++) {
+ 			IODelay(100);
+@@ -646,16 +687,25 @@ sweet_fb_scanout_release(SweetSurface *s)
+ 	if (fb != NULL && a8_idma != 0 && a8_shown_addr == (uint32_t)a8_scan_phys) {
+ 		a8_scan_show(fb, (uint32_t)fb->fPhys, fb->fRowBytes / 4, false);
+ 	}
++	/* 0203: the backboardd that asked for async SwapEnd is gone; the next
++	 * one asks again if its shim waits for the panel itself */
++	a8_flip_async = 0;
+ 	a8_scan_owner = NULL;
+ 	IOLog("A8 FLIP: the second buffer is free again (%llu flips)\n", a8_flips);
+ }
+ 
+-/* Console "flip 0|1" (bsd/dev/a5xelte_usb.c); -1 only reports. */
++/* Console "flip 0|1|a|s" (bsd/dev/a5xelte_usb.c): 0 and 1 turn flipping off
++ * and on, 2 (a) makes SwapEnd async and 3 (s) synchronous again (0203); -1
++ * only reports. */
+ extern "C" int
+ sweet_fb_flip_set(int on)
+ {
+ 	AppleCLCD *fb = sweet_fb_main;
+ 
++	if (on == 2 || on == 3) {
++		a8_flip_async = on == 2;
++		on = -1;
++	}
+ 	if (on >= 0) {
+ 		(void)a8_flip_on();
+ 		if (fb != NULL) {
+@@ -667,10 +717,64 @@ sweet_fb_flip_set(int on)
+ 			IOLockUnlock(fb->fPresentLock);
+ 		}
+ 	}
+-	IOLog("A8 FLIP: %s, %llu flips, %llu late, second buffer %s\n", a8_flip_on() ? "on" : "off",
+-	    a8_flips, a8_flip_late, a8_scan_owner != NULL ? "in use" : "free");
++	IOLog("A8 FLIP: %s, %llu flips, %llu late, second buffer %s; SwapEnd %s, %llu waited "
++	    "for the update before (%llu us)\n", a8_flip_on() ? "on" : "off",
++	    a8_flips, a8_flip_late, a8_scan_owner != NULL ? "in use" : "free",
++	    a8_flip_async ? "async" : "waits for the panel", a8_flip_settles, a8_flip_settle_us);
+ 	return a8_flip_on();
+ }
++
++/*
++ * 0203 sysctls for jackpotlte-gl (backboardd):
++ *   kern.a8_flip_async  1: SwapEnd returns once the panel has its new buffer
++ *                       address, without waiting for the frame that takes it.
++ *   kern.a8_flip_wait   (read) waits, at most 20 ms, until the panel took the
++ *                       last update and answers the microseconds waited.  The
++ *                       shim reads it right before a frame goes to the GPU, so
++ *                       the GPU never draws into the buffer the panel still
++ *                       shows, while the CPU work of the frame ran meanwhile.
++ */
++static int
++a8_flip_async_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++	int value = a8_flip_async, error;
++
++	error = SYSCTL_OUT(req, &value, sizeof(value));
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	error = SYSCTL_IN(req, &value, sizeof(value));
++	if (error != 0) {
++		return error;
++	}
++	if (value != 0 && value != 1) {
++		return EINVAL;
++	}
++	if (a8_flip_async != value) {
++		a8_flip_async = value;
++		IOLog("A8 FLIP: SwapEnd %s\n", value ? "async (kern.a8_flip_async)" : "waits for the panel");
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, a8_flip_async,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, a8_flip_async_sysctl, "I", "SwapEnd does not wait for the panel");
++
++static int
++a8_flip_wait_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++	uint32_t us = 0;
++
++	if (req->oldptr != USER_ADDR_NULL) {
++		us = a8_scan_settle();
++	}
++	return SYSCTL_OUT(req, &us, sizeof(us));
++}
++SYSCTL_PROC(_kern, OID_AUTO, a8_flip_wait,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, a8_flip_wait_sysctl, "IU", "wait until the panel took its last update");
+ #endif
+ 
+ static uint32_t sweet_fb_swaps_logged;
