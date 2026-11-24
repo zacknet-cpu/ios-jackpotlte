@@ -106,7 +106,7 @@ echo "--- host copy of the surface-copy test ---"
 # host build.
 # -lobjc: eagl.c installs its methods with the ObjC runtime, and the host
 # link does not bring it in on its own.
-clang "${common[@]}" -o "$out/test_surface_copy" "$gl/test_surface_copy.c" -lobjc
+clang "${common[@]}" -o "$out/test_surface_copy" "$gl/test_surface_copy.c" "$gl/ca_fixes.c" -lobjc
 
 echo "--- arm64 iOS libjackpotlte.a ---"
 obj=$out/.obj
