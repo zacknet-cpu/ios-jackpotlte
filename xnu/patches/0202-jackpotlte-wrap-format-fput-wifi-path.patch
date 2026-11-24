@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index a433503..24e6da2 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -295,7 +295,10 @@
+ /* Where the firmware + configuration are expected at runtime.  The vendor
+  * driver reads mx140.bin and the *.hcf config from a base directory
+  * (mx140_file.c:38, 96-98); on iOS the staged iOS root supplies them. */
+-#define A5SCSC_FW_PATH          "/private/var/wifi/mx140.bin"
++/* 0202: under /private/var/mobile/Library, a directory that exists (the USB
++ * console's fput writes files but makes no directories; /private/var/wifi
++ * is not on the A8's iOS data volume). */
++#define A5SCSC_FW_PATH          "/private/var/mobile/Library/mx140.bin"
+ 
+ /* ---- transport API --------------------------------------------------------
+  * The transport below the services.  a5scsc_transport_up() is idempotent and
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index 63798f9..6bf7030 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -49,7 +49,7 @@ bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t
+ bool a8_fix_library_ok(void);
+ 
+ #define A8F_MAX_GET     (512u << 10)
+-#define A8F_MAX_PUT     (1024u << 10)
++#define A8F_MAX_PUT     (4096u << 10)    /* 0202: mx140.bin is 1360017 bytes */
+ #define A8F_PATH        512u
+ 
+ static const char a8f_b64[] =
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index bde2426..ac8f925 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -94,6 +94,8 @@ static uint64_t      sweet_surface_client_wired;        /* clients' own pages he
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
+ extern "C" IOMemoryDescriptor *sweet_fb_scanout_claim(SweetSurface *s);    /* SweetFramebuffer.cpp */
+ extern "C" void sweet_fb_scanout_release(SweetSurface *s);
++#include <sys/sysctl.h>
++#include <sys/errno.h>
+ #endif
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -1024,6 +1026,7 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 	s->bytesPerElement = (uint16_t)(req.bytesPerElement ? req.bytesPerElement : 4);
+ 	s->elementWidth = s->elementHeight = 1;
+ 	s->pixelFormat = 0;
++	s->wrapFormat = req.format;
+ 	s->bytesPerRow = req.bytesPerRow;
+ 	ret = sweet_surface_take_client(s, fTask, req.address, req.size, &wrapped);
+ 	if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
+@@ -1038,6 +1041,28 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 		    req.bytesPerElement, req.bytesPerRow, req.size, req.address,
+ 		    wrapped ? "its own pages" : "copied", n, ret);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	{
++		/* one line for the first wrap of each pixel format (0202) */
++		static uint32_t seen[16];
++		static uint32_t nseen;
++		bool known = false;
++
++		for (uint32_t i = 0; i < nseen; i++) {
++			known |= (seen[i] == req.format);
++		}
++		if (!known && nseen < 16) {
++			char name[32];
++
++			seen[nseen++] = req.format;
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: first wrap as '%c%c%c%c' (0x%x): %s id %u %ux%u bpe %u bpr %u\n",
++			    (char)(req.format >> 24), (char)(req.format >> 16), (char)(req.format >> 8),
++			    (char)req.format, req.format, name, s->id, req.width, req.height,
++			    req.bytesPerElement, req.bytesPerRow);
++		}
++	}
++#endif
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
+ 		return ret;
+@@ -1047,6 +1072,43 @@ IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++/*
++ * 0202: kern.a8_wrap_format.  A wrapped surface says pixel format 0, so the GL
++ * shim (jackpotlte-gl, in backboardd) copies its pixels instead of mapping a
++ * client's pages, but then it could not tell what the bytes are: the apps' SF
++ * Symbols are A,B,G,R, which glca9f had to guess from the premultiplied rule.
++ * Write a surface id, read the format IOSurfaceWrapClientImage was given
++ * (0: the surface is not a wrap; ENOENT: no surface with that id).
++ */
++static int
++sweet_wrap_format_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++	uint32_t id = 0, fmt;
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return EINVAL;
++	}
++	error = SYSCTL_IN(req, &id, sizeof(id));
++	if (error != 0) {
++		return error;
++	}
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL) {
++		return ENOENT;
++	}
++	fmt = s->wrapFormat;
++	s->release();
++	return SYSCTL_OUT(req, &fmt, sizeof(fmt));
++}
++SYSCTL_PROC(_kern, OID_AUTO, a8_wrap_format,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, sweet_wrap_format_sysctl, "IU",
++    "IOSurfaceWrapClientImage pixel format of a surface id");
++#endif
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index e6619ae..4275414 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -45,6 +45,9 @@ public:
+ 	uint64_t                  clientBytes;  /* wired client bytes; 0: not client memory */
+ 	uint32_t                  wrapOffset;
+ 	bool                      mapReadOnly;  /* the client may only read those pages */
++	/* IOSurfaceWrapClientImage's own pixel format (pixelFormat says 0, so the
++	 * GL shim copies the pixels; kern.a8_wrap_format tells it what they are) */
++	uint32_t                  wrapFormat;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
