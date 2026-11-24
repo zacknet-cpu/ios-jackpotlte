@@ -365,10 +365,14 @@ static struct {
 static unsigned
 cpu_now(void)
 {
+#if defined(__arm64__) || defined(__aarch64__)
    uint64_t v;
 
    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(v));
    return (unsigned)(v & 7);
+#else
+   return 0;                           /* (the host test build) */
+#endif
 }
 static unsigned long perf_lines;
 
