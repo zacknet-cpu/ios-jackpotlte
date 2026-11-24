@@ -104,6 +104,17 @@ typedef struct os_log_message_s *os_log_message_t;
 typedef void (^os_log_hook_t)(unsigned char type, os_log_message_t message);
 extern os_log_hook_t os_log_set_hook(unsigned char level, os_log_hook_t hook);
 extern char *os_log_copy_message_string(os_log_message_t message);
+/* v9: the symbol test (CoreGraphics and CoreFoundation, from their .tbd) */
+extern unsigned long CGImageGetWidth(void *image);
+extern unsigned long CGImageGetHeight(void *image);
+extern unsigned long CGImageGetBytesPerRow(void *image);
+extern unsigned long CGImageGetBitsPerPixel(void *image);
+extern unsigned int CGImageGetBitmapInfo(void *image);
+extern void *CGImageGetDataProvider(void *image);
+extern void *CGDataProviderCopyData(void *provider);
+extern const unsigned char *CFDataGetBytePtr(void *data);
+extern long CFDataGetLength(void *data);
+extern void CFRelease(void *object);
 
 static void
 fix_put(const char *s)
@@ -911,6 +922,128 @@ dump_view(id view, int depth)
 		dump_view(at(subviews, sel_registerName("objectAtIndex:"), i), depth + 1);
 }
 
+/*
+ * v9: what an SF Symbol rasterizes to in this process.  Apps' symbols reach
+ * the display server as surfaces with alpha 0 everywhere (glca9 log), so the
+ * question is whether UIKit/CoreUI draw anything at all here.  Run with the
+ * view dump (console "kill NAME 30" on a tee'd process): for a few symbols,
+ * the UIImage's size, its own CGImage if it has one, and a 3x render through
+ * UIGraphicsImageRenderer, each as "bytes, nonzero bytes, largest byte".
+ */
+static id sym_image;
+
+static void
+sym_scan(const char *name, const char *what, void *cg)
+{
+	struct vline l;
+	void *data;
+	const unsigned char *p;
+	long n, nonzero = 0;
+	unsigned best = 0;
+
+	l.n = 0;
+	vl_str(&l, "A8SYM ");
+	vl_str(&l, name);
+	vl_str(&l, " ");
+	vl_str(&l, what);
+	if (cg == 0) {
+		vl_str(&l, ": none\n");
+		write(2, l.b, l.n);
+		return;
+	}
+	vl_str(&l, ": ");
+	vl_num(&l, (double)CGImageGetWidth(cg));
+	vl_str(&l, "x");
+	vl_num(&l, (double)CGImageGetHeight(cg));
+	vl_str(&l, " bpp ");
+	vl_num(&l, (double)CGImageGetBitsPerPixel(cg));
+	vl_str(&l, " info ");
+	vl_num(&l, (double)CGImageGetBitmapInfo(cg));
+	data = CGImageGetDataProvider(cg) ? CGDataProviderCopyData(CGImageGetDataProvider(cg)) : 0;
+	if (data == 0) {
+		vl_str(&l, ", no data\n");
+		write(2, l.b, l.n);
+		return;
+	}
+	p = CFDataGetBytePtr(data);
+	n = CFDataGetLength(data);
+	for (long i = 0; p != 0 && i < n; i++) {
+		if (p[i] != 0) {
+			nonzero++;
+			if (p[i] > best)
+				best = p[i];
+		}
+	}
+	CFRelease(data);
+	vl_str(&l, ", bytes ");
+	vl_num(&l, (double)n);
+	vl_str(&l, " nonzero ");
+	vl_num(&l, (double)nonzero);
+	vl_str(&l, " max ");
+	vl_num(&l, (double)best);
+	vl_str(&l, "\n");
+	write(2, l.b, l.n);
+}
+
+static void
+symbol_test(void)
+{
+	static const char *const names[] = { "chevron.backward", "magnifyingglass", "checkmark",
+	                                     "sun.max", "phone.fill" };
+	Class image = objc_getClass("UIImage"), string = objc_getClass("NSString");
+	Class renderer = objc_getClass("UIGraphicsImageRenderer");
+	id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+	id (*named)(Class, SEL, id) = (id (*)(Class, SEL, id))objc_msgSend;
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	void *(*cgimage)(id, SEL) = (void *(*)(id, SEL))objc_msgSend;
+	id (*init_size)(id, SEL, double, double) = (id (*)(id, SEL, double, double))objc_msgSend;
+	id (*draw)(id, SEL, void *) = (id (*)(id, SEL, void *))objc_msgSend;
+	fix_size (*size)(id, SEL) = (fix_size (*)(id, SEL))objc_msgSend;
+
+	if (image == 0 || string == 0)
+		return;
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		id img = named(image, sel_registerName("systemImageNamed:"),
+		               make(string, sel_registerName("stringWithUTF8String:"), names[i]));
+		struct vline l;
+
+		l.n = 0;
+		if (img == 0) {
+			vl_str(&l, "A8SYM ");
+			vl_str(&l, names[i]);
+			vl_str(&l, ": no image\n");
+			write(2, l.b, l.n);
+			continue;
+		}
+		{
+			fix_size sz = size(img, sel_registerName("size"));
+
+			vl_str(&l, "A8SYM ");
+			vl_str(&l, names[i]);
+			vl_str(&l, ": size ");
+			vl_num(&l, sz.w);
+			vl_str(&l, "x");
+			vl_num(&l, sz.h);
+			vl_str(&l, " pt\n");
+			write(2, l.b, l.n);
+			sym_scan(names[i], "own CGImage", cgimage(img, sel_registerName("CGImage")));
+			if (renderer != 0 && sz.w > 0 && sz.h > 0) {
+				id r = init_size(get((id)renderer, sel_registerName("alloc")),
+				                 sel_registerName("initWithSize:"), sz.w, sz.h);
+				id out;
+
+				sym_image = img;
+				out = draw(r, sel_registerName("imageWithActions:"), (void *)^(id context) {
+					(void)context;
+					((void (*)(id, SEL, double, double))objc_msgSend)(sym_image,
+					    sel_registerName("drawAtPoint:"), 0.0, 0.0);
+				});
+				sym_scan(names[i], "rendered", out ? cgimage(out, sel_registerName("CGImage")) : 0);
+			}
+		}
+	}
+}
+
 static void
 dump_windows(void *context)
 {
@@ -938,6 +1071,7 @@ dump_windows(void *context)
 	for (unsigned long i = 0; i < n; i++)
 		dump_view(at(windows, sel_registerName("objectAtIndex:"), i), 0);
 	log_line(0x00, "A8VIEW end");
+	symbol_test();
 }
 
 static void
