@@ -48,6 +48,11 @@ extern void NSSetUncaughtExceptionHandler(void (*handler)(id exception));
 extern int sysctlbyname(const char *name, void *oldp, unsigned long *oldlenp, void *newp, unsigned long newlen);
 extern const char *getprogname(void);
 extern const char *method_getTypeEncoding(Method m);
+extern void *MGCopyAnswer(void *key);
+typedef unsigned long long dispatch_time_t;
+extern dispatch_time_t dispatch_time(dispatch_time_t when, long long delta);
+extern void dispatch_after_f(dispatch_time_t when, void *queue, void *context, void (*work)(void *));
+extern char _dispatch_main_q;
 
 static void
 fix_put(const char *s)
@@ -317,6 +322,112 @@ fix_image_added(const void *mh, long slide)
 	bl_apply();
 }
 
+/* ---- what UIKit and MobileGestalt think the screen is (a8fix-screen log) ---- */
+
+typedef struct { double x, y, w, h; } fix_rect;
+
+static void
+fix_num(double v)
+{
+	char b[32];
+	int n = 0;
+	long long whole;
+	int frac;
+
+	if (v < 0) {
+		b[n++] = '-';
+		v = -v;
+	}
+	whole = (long long)v;
+	frac = (int)((v - (double)whole) * 1000.0 + 0.5);
+	if (frac >= 1000) {
+		whole++;
+		frac -= 1000;
+	}
+	{
+		char t[24];
+		int k = 0;
+
+		do {
+			t[k++] = (char)('0' + whole % 10);
+			whole /= 10;
+		} while (whole > 0 && k < 20);
+		while (k > 0)
+			b[n++] = t[--k];
+	}
+	b[n++] = '.';
+	b[n++] = (char)('0' + frac / 100);
+	b[n++] = (char)('0' + frac / 10 % 10);
+	b[n++] = (char)('0' + frac % 10);
+	b[n] = 0;
+	fix_put(b);
+}
+
+static void
+fix_mg(const char *key)
+{
+	id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+	Class string = objc_getClass("NSString");
+	id k;
+	void *v;
+
+	if (string == 0)
+		return;
+	k = make(string, sel_registerName("stringWithUTF8String:"), key);
+	v = MGCopyAnswer((void *)k);
+	fix_put(" ");
+	fix_put(key);
+	fix_put("=");
+	fix_put(v ? fix_utf8((id)v) : "(none)");
+}
+
+static void
+fix_screen_report(void *context)
+{
+	Class ui = objc_getClass("UIScreen");
+	id (*get)(Class, SEL) = (id (*)(Class, SEL))objc_msgSend;
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+	id screen;
+	fix_rect r;
+
+	(void)context;
+	fix_put("A8FIX screen: ");
+	fix_put(getprogname());
+	if (ui != 0 && (screen = get(ui, sel_registerName("mainScreen"))) != 0 &&
+	    ((signed char (*)(id, SEL, SEL))objc_msgSend)(screen, sel_registerName("respondsToSelector:"),
+	    sel_registerName("_referenceBounds"))) {
+		r = rect(screen, sel_registerName("bounds"));
+		fix_put(" bounds ");
+		fix_num(r.w);
+		fix_put("x");
+		fix_num(r.h);
+		fix_put(" scale ");
+		fix_num(dbl(screen, sel_registerName("scale")));
+		fix_put(" nativeScale ");
+		fix_num(dbl(screen, sel_registerName("nativeScale")));
+		r = rect(screen, sel_registerName("nativeBounds"));
+		fix_put(" nativeBounds ");
+		fix_num(r.w);
+		fix_put("x");
+		fix_num(r.h);
+		r = rect(screen, sel_registerName("_referenceBounds"));
+		fix_put(" referenceBounds ");
+		fix_num(r.w);
+		fix_put("x");
+		fix_num(r.h);
+	}
+	fix_put("\nA8FIX gestalt:");
+	fix_mg("main-screen-width");
+	fix_mg("main-screen-height");
+	fix_mg("main-screen-scale");
+	fix_mg("ArtworkDeviceSubType");
+	fix_mg("ArtworkTraits");
+	fix_mg("DeviceClassNumber");
+	fix_mg("ProductType");
+	fix_put("\n");
+}
+
 __attribute__((constructor)) static void
 fix_init(void)
 {
@@ -325,4 +436,6 @@ fix_init(void)
 	bl_apply();
 	/* (Control Center's module is a bundle loaded later: keep looking) */
 	_dyld_register_func_for_add_image(fix_image_added);
+	/* what the screen is, once UIKit is up (seen with the console's tee) */
+	dispatch_after_f(dispatch_time(0, 8000000000LL), &_dispatch_main_q, 0, fix_screen_report);
 }

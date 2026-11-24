@@ -10,6 +10,6 @@ clang --target=arm64-apple-ios16.0 -O2 -Wall -Wextra -Werror -fno-stack-protecto
     -fno-builtin -nostdlib -c "$here/fix.c" -o "$out.o"
 "$ld" -arch arm64 -platform_version ios 16.0 16.0 -dylib -adhoc_codesign \
     -install_name /private/var/mobile/Library/libjackpotlte-fix.dylib \
-    -o "$out" "$out.o" "$here/libobjc.tbd" "$here/libSystem.tbd" "$here/Foundation.tbd"
+    -o "$out" "$out.o" "$here/libobjc.tbd" "$here/libSystem.tbd" "$here/Foundation.tbd" "$here/libMobileGestalt.tbd"
 rm -f "$out.o"
 echo "$out: $(stat -c %s "$out") bytes"
