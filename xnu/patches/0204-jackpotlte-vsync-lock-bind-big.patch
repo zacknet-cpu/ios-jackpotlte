@@ -1,0 +1,194 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 0ba5e2b..daf1dfe 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1622,6 +1622,7 @@ extern void a8f_end(void);
+ extern void a8f_ls(const char *args);
+ extern void a8f_date(const char *args);
+ extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
++extern int sweet_fb_vsync_lock_set(int on);     /* SweetFramebuffer.cpp, 0204 */
+ /* 0192 */
+ extern void a8_acpm_command(const char *args);  /* a8_acpm.c */
+ extern void a8_dvfs_command(const char *args);
+@@ -1890,6 +1891,13 @@ a8s_command(const char *line)
+ 		a8f_end();
+ 	} else if (a8s_word(line, "fls", &rest)) {
+ 		a8f_ls(rest);
++	} else if (a8s_word(line, "vlock", &rest)) {
++		/* 0204: the software vsync locked to the panel's frame starts */
++		while (*rest == ' ') {
++			rest++;
++		}
++		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : -1;
++		printf("A8SH: vlock %s\n", sweet_fb_vsync_lock_set(on) ? "on" : "off");
+ 	} else if (a8s_word(line, "flip", &rest)) {
+ 		while (*rest == ' ') {
+ 			rest++;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 91a9c16..63ada96 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -245,6 +245,13 @@ static void a8_scan_to_panel(AppleCLCD *fb, bool copy);
+  * (kern.a8_flip_wait) only right before its next frame goes to the GPU. */
+ static volatile int  a8_flip_async;
+ static uint64_t      a8_flip_settles, a8_flip_settle_us;
++/* 0204: the software vsync follows the panel's frame starts (seen when an
++ * update is taken), so CoreAnimation's frames start right after the panel
++ * took the last one instead of anywhere in its refresh. */
++static volatile uint64_t a8_vsync_seen;         /* mach time of a frame start seen */
++static int           a8_vsync_lock = -1;        /* boot-arg a8vlock (default 1), console "vlock" */
++static uint64_t      a8_vsync_locked, a8_vsync_seens;
++static uint32_t      a8_vsync_next_us(void);
+ #endif
+ static volatile int sweet_fb_requested_off_state;
+ static uint32_t sweet_fb_off_dim = 7;
+@@ -447,7 +454,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	sender->setTimeoutUS(a8_vsync_next_us());
++#else
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++#endif
+ }
+ 
+ void
+@@ -565,10 +576,17 @@ static uint32_t
+ a8_scan_settle(void)
+ {
+ 	uint32_t us = 0;
++	bool pending = a8_scan_pending();
+ 
+-	while (us < 20000 && a8_scan_pending()) {
++	while (us < 20000 && pending) {
+ 		IODelay(50);
+ 		us += 50;
++		pending = a8_scan_pending();
++	}
++	if (us != 0 && !pending) {
++		/* seen to within 50 us: the panel started a frame (0204) */
++		a8_vsync_seen = mach_absolute_time();
++		a8_vsync_seens++;
+ 	}
+ 	if (us >= 20000 && a8_flip_late++ < 8) {
+ 		IOLog("A8 FLIP: the display took no update in 20 ms (flip %llu, async)\n", a8_flips);
+@@ -613,6 +631,10 @@ a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
+ 		for (i = 0; i < 200 && *(volatile uint32_t *)(a8_decon + A8_DECON_SHADOW_REQ) != 0; i++) {
+ 			IODelay(100);
+ 		}
++		if (i > 0 && i < 200) {
++			a8_vsync_seen = mach_absolute_time();     /* 0204 */
++			a8_vsync_seens++;
++		}
+ 		if (i == 200 && a8_flip_late++ < 8) {
+ 			IOLog("A8 FLIP: the display took no update in 20 ms (flip %llu)\n", a8_flips);
+ 		}
+@@ -694,6 +716,107 @@ sweet_fb_scanout_release(SweetSurface *s)
+ 	IOLog("A8 FLIP: the second buffer is free again (%llu flips)\n", a8_flips);
+ }
+ 
++static bool
++a8_vsync_lock_on(void)
++{
++	if (a8_vsync_lock < 0) {
++		int on = 1;
++
++		PE_parse_boot_argn("a8vlock", &on, sizeof(on));
++		a8_vsync_lock = on != 0;
++	}
++	return a8_vsync_lock > 0;
++}
++
++/*
++ * 0204: when the next software vsync fires.  The panel's frame starts are
++ * seen when an update is taken (a8_scan_settle, the synchronous wait); the
++ * next tick is put just after the panel's next frame start, moved by at most
++ * 2 ms a tick so the timestamps CoreAnimation gets stay even.  Nothing seen
++ * for a quarter second (no frames): the plain 60 Hz tick.
++ */
++static uint32_t
++a8_vsync_next_us(void)
++{
++	const int32_t period = SWEET_FB_VSYNC_US, lead = 400;
++	uint64_t seen = a8_vsync_seen, now = mach_absolute_time(), ns = 0;
++	int32_t phase, until;
++
++	if (!a8_vsync_lock_on() || seen == 0 || now <= seen) {
++		return SWEET_FB_VSYNC_US;
++	}
++	absolutetime_to_nanoseconds(now - seen, &ns);
++	if (ns > 250000000ull) {
++		return SWEET_FB_VSYNC_US;
++	}
++	phase = (int32_t)((ns / 1000) % (uint64_t)period);     /* us since the panel's last frame start */
++	until = period - phase + lead;                          /* just after its next one */
++	if (until < period / 2) {
++		until += period;
++	}
++	if (until < period - 2000) {
++		until = period - 2000;
++	}
++	if (until > period + 2000) {
++		until = period + 2000;
++	}
++	a8_vsync_locked++;
++	return (uint32_t)until;
++}
++
++/* Console "vlock 0|1" (bsd/dev/a5xelte_usb.c); -1 only reports. */
++extern "C" int
++sweet_fb_vsync_lock_set(int on)
++{
++	(void)a8_vsync_lock_on();
++	if (on == 0 || on == 1) {
++		a8_vsync_lock = on;
++	}
++	IOLog("A8 VSYNC: %s to the panel, %llu ticks placed, %llu frame starts seen\n",
++	    a8_vsync_lock_on() ? "locked" : "not locked", a8_vsync_locked, a8_vsync_seens);
++	return a8_vsync_lock_on();
++}
++
++/*
++ * 0204: kern.a8_bind_big.  Write 6 or 7 to bind the calling thread to that
++ * Cortex-A73 (the ADT's cpus 6 and 7), -1 to unbind; read the bound cpu.
++ * jackpotlte-gl binds CoreAnimation's render thread (glca14): its frame
++ * building ran on whichever A53 the single processor set gave it.
++ */
++extern "C" kern_return_t sysctl_thread_bind_cpuid(int32_t cpuid);     /* sched_prim.c */
++extern "C" int32_t sysctl_get_bound_cpuid(void);
++static uint32_t a8_binds;
++
++static int
++a8_bind_big_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++	int32_t cpu = sysctl_get_bound_cpuid(), value = 0;
++	int changed = 0;
++	int error = sysctl_io_number(req, cpu, sizeof(cpu), &value, &changed);
++
++	if (error != 0 || !changed) {
++		return error;
++	}
++	if (value != -1 && value != 6 && value != 7) {
++		return EINVAL;
++	}
++	if (sysctl_thread_bind_cpuid(value) != KERN_SUCCESS) {
++		return ENOTSUP;
++	}
++	if (a8_binds++ < 16) {
++		char name[32];
++
++		proc_selfname(name, sizeof(name));
++		IOLog("A8 BIND: a thread of %s %s\n", name, value < 0 ? "unbound" :
++		    value == 6 ? "bound to cpu 6 (A73)" : "bound to cpu 7 (A73)");
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, a8_bind_big,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, a8_bind_big_sysctl, "I", "bind the calling thread to an A73 (6, 7) or unbind (-1)");
++
+ /* Console "flip 0|1|a|s" (bsd/dev/a5xelte_usb.c): 0 and 1 turn flipping off
+  * and on, 2 (a) makes SwapEnd async and 3 (s) synchronous again (0203); -1
+  * only reports. */
