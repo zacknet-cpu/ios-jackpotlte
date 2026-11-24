@@ -81,6 +81,7 @@ static struct {
    void (*get_tex_level_parameteriv)(GLenum, GLint, GLenum, GLint *);
    void (*get_framebuffer_attachment_parameteriv)(GLenum, GLenum, GLenum, GLint *);
    void (*get_vertex_attribiv)(GLuint, GLenum, GLint *);
+   void (*get_vertex_attrib_pointerv)(GLuint, GLenum, void **);
    void (*enable_vertex_attrib_array)(GLuint);
    void (*disable_vertex_attrib_array)(GLuint);
    void (*uniform4fv)(GLint, GLsizei, const GLfloat *);
@@ -155,6 +156,7 @@ load(void)
    PROC(get_tex_level_parameteriv, "glGetTexLevelParameteriv");
    PROC(get_framebuffer_attachment_parameteriv, "glGetFramebufferAttachmentParameteriv");
    PROC(get_vertex_attribiv, "glGetVertexAttribiv");
+   PROC(get_vertex_attrib_pointerv, "glGetVertexAttribPointerv");
    PROC(enable_vertex_attrib_array, "glEnableVertexAttribArray");
    PROC(disable_vertex_attrib_array, "glDisableVertexAttribArray");
    PROC(uniform4fv, "glUniform4fv");
@@ -643,6 +645,41 @@ static const char blur4_fragment[] =
    "      texture(texture0, middle + places[2]) + texture(texture0, middle + places[3]));\n"
    "}\n";
 
+/*
+ * glca4: "ds8" (28) as this renderer uses it shrinks by 32, not 8: the screen
+ * (1080x2220, its coordinates 0..1088 x 0..2240) into 34x70 for Control
+ * Center's backdrop, 14x14 out of 448x448 for the dock's; and the blur that
+ * should follow ("sb3", 40) is a function the OpenGL ES renderer has no shader
+ * for, so nothing smooths the result before it is stretched back 32 times.
+ * Sixteen samples of a 1024-pixel block made it blocky and made it shimmer.
+ * Here each output pixel is a Gaussian average over 3 x 3 output pixels' worth
+ * of the source (sigma 0.75 of one), 16 x 16 bilinear samples: the small
+ * picture is already blurred, and stretched it is a smooth frosted backdrop.
+ * `reach`: source pixels per output pixel, from the draw's own vertices.
+ */
+static const char wide_fragment[] =
+   "#version 300 es\n"
+   "uniform highp sampler2D texture0;\n"
+   "uniform highp float reach;\n"
+   "in lowp vec4 color;\n"
+   "in highp vec2 texcoord;\n"
+   "out highp vec4 result;\n"
+   "void main() {\n"
+   "  highp vec2 size = vec2(textureSize(texture0, 0));\n"
+   "  highp float step = reach * 3. / 16., sigma = reach * .75;\n"
+   "  highp vec4 sum = vec4(0.);\n"
+   "  highp float weights = 0.;\n"
+   "  for (int j = 0; j < 16; j++) {\n"
+   "    for (int i = 0; i < 16; i++) {\n"
+   "      highp vec2 at = (vec2(float(i), float(j)) - 7.5) * step;\n"
+   "      highp float w = exp(-dot(at, at) / (2. * sigma * sigma));\n"
+   "      sum += w * texture(texture0, (texcoord + at) / size);\n"
+   "      weights += w;\n"
+   "    }\n"
+   "  }\n"
+   "  result = sum / weights;\n"
+   "}\n";
+
 static const char box_fragment[] =
    "#version 300 es\n"
    "uniform lowp sampler2D texture0;\n"
@@ -813,7 +850,9 @@ struct our_program {
    GLint numbers;      /* "colours" or "places", -1 if none */
    int tried;
 };
-static struct our_program plain, table, vibrant, masking, blur4, box;
+static struct our_program plain, table, vibrant, masking, blur4, box, wide;
+static GLint wide_reach = -1;          /* its "reach" uniform */
+static int wide_on = 1;                /* a8gl-wide "0": the 16-sample stand-in instead */
 
 static void
 make_program(struct our_program *our, const char *fragment, const char *numbers, const char *what)
@@ -893,6 +932,50 @@ struct plain_state {
    GLboolean blended;   /* blending was on and our program blends itself */
 };
 
+/* how many source pixels one target pixel of a no-program draw covers: from
+ * its first vertices' places (attribute 0, target pixels) and texture
+ * coordinates (attribute 2, source pixels), both client arrays; 0 if unknown */
+static float
+vertex_float(GLuint index, unsigned vertex, unsigned component)
+{
+   GLint size = 0, type = 0, stride = 0, buffer = 0;
+   void *pointer = NULL;
+
+   gl.get_vertex_attribiv(index, 0x8623 /* SIZE */, &size);
+   gl.get_vertex_attribiv(index, 0x8625 /* TYPE */, &type);
+   gl.get_vertex_attribiv(index, 0x8624 /* STRIDE */, &stride);
+   gl.get_vertex_attribiv(index, 0x889f /* BUFFER_BINDING */, &buffer);
+   gl.get_vertex_attrib_pointerv(index, 0x8645 /* POINTER */, &pointer);
+   if (buffer != 0 || pointer == NULL || type != 0x1406 /* FLOAT */ || (GLint)component >= size)
+      return 0;
+   if (stride == 0)
+      stride = size * 4;
+   return ((const float *)(const void *)((const char *)pointer + (size_t)stride * vertex))[component];
+}
+
+static float
+reach_of_draw(void)
+{
+   float best = 0;
+
+   if (gl.get_vertex_attrib_pointerv == NULL)
+      return 0;
+   for (unsigned a = 0; a < 3; a++) {
+      unsigned b = (a + 1) % 3;
+      float px = vertex_float(0, b, 0) - vertex_float(0, a, 0), py = vertex_float(0, b, 1) - vertex_float(0, a, 1);
+      float tx = vertex_float(2, b, 0) - vertex_float(2, a, 0), ty = vertex_float(2, b, 1) - vertex_float(2, a, 1);
+      float p = px * px + py * py, t = tx * tx + ty * ty;
+
+      if (p > .25f && t > 0) {
+         float r = __builtin_sqrtf(t / p);
+
+         if (r > best)
+            best = r;
+      }
+   }
+   return best > 64 ? 64 : best;
+}
+
 /* a census: each function the first time it is met with no program */
 static void
 census(unsigned function, const char *how)
@@ -914,6 +997,7 @@ plain_begin(void *context, struct plain_state *state)
    GLint program = 0, texture0 = 0, texture1 = 0, rows = 0;
    struct our_program *our = NULL;
    unsigned function;
+   float reach = 0;
 
    if (!plain_on)
       return false;
@@ -954,6 +1038,13 @@ plain_begin(void *context, struct plain_state *state)
       if (!blur4.tried)
          make_program(&blur4, blur4_fragment, "places", "four samples around a point");
       our = &blur4;
+   } else if (function == FUNCTION_DOWNSAMPLE_8 && wide_on && (reach = reach_of_draw()) > 1.5f) {
+      if (!wide.tried) {
+         make_program(&wide, wide_fragment, NULL, "a wide Gaussian downsample");
+         if (wide.program != 0)
+            wide_reach = gl.get_uniform_location(wide.program, "reach");
+      }
+      our = &wide;
    } else if (function == FUNCTION_DOWNSAMPLE_8 && function_given[function] == 8) {
       if (!box.tried)
          make_program(&box, box_fragment, "places", "eight times smaller");
@@ -989,6 +1080,8 @@ plain_begin(void *context, struct plain_state *state)
       gl.uniform4fv(our->numbers, 5, function_values[function]);
    else if (our == &blur4 || our == &box)
       gl.uniform2fv(our->numbers, 4, function_values[function]);
+   else if (our == &wide)
+      gl.uniform1f(wide_reach, reach);
    state->blended = 0;
    if (our == &vibrant && gl.is_enabled(GL_BLEND)) {
       state->blended = 1;      /* the program mixes by itself */
@@ -1003,7 +1096,8 @@ plain_begin(void *context, struct plain_state *state)
                     our == &table ? "drawn through the table (home indicator)" :
                     our == &vibrant ? "drawn with our vibrant colour matrix" :
                     our == &masking ? "drawn with our premultiplied colour matrix" :
-                    our == &blur4 ? "drawn with our four-sample blur" : "drawn with our 8x downsample");
+                    our == &blur4 ? "drawn with our four-sample blur" :
+                    our == &wide ? "drawn with our wide Gaussian downsample" : "drawn with our 8x downsample");
    return true;
 }
 
@@ -1075,9 +1169,14 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
          shapes_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
             fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-wide", "r");
+         wide_on = !(f != NULL && fgetc(f) == '0');
+         if (f != NULL)
+            fclose(f);
       }
-      say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s%s", glsl_on ? "on" : "off",
-          plain_on ? "on" : "off", shapes_on ? "on" : "off", debug_shape ? ", SHAPE DEBUG (a8gl-dbg-shape)" : "");
+      say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s, wide downsample %s%s",
+          glsl_on ? "on" : "off", plain_on ? "on" : "off", shapes_on ? "on" : "off", wide_on ? "on" : "off",
+          debug_shape ? ", SHAPE DEBUG (a8gl-dbg-shape)" : "");
       if (access("/private/var/mobile/Library/a8gl-nohooks", F_OK) != 0)
          hook_coreanimation();
    }
