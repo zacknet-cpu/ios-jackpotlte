@@ -533,8 +533,11 @@ shared_forget(void *owner, int texture)
 static void
 shared_sync(void)
 {
+   static unsigned long calls;
    unsigned i;
-   int every = draws % SYNC_EVERY == 0;
+   /* the safety net: every surface now and then (every 120 draws, or every
+    * 30 frames when this runs once a frame) */
+   int every = ++calls % (flush_mode() == 0 ? 30 : SYNC_EVERY) == 0;
 
    for (i = 0; i < SHARED_MAX; i++) {
       uint32_t seed;
