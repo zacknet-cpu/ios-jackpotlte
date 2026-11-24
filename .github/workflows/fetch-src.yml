@@ -1,0 +1,42 @@
+name: fetch-src
+
+# One-off source fetch for reading in the cloud session (which cannot reach
+# archive.mesa3d.org). Commits only the files named below to branch mesa-src.
+on:
+  push:
+    branches: [src-fetch]
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mesa 25.0.7 panfrost preload and drm sources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tarball=mesa-25.0.7.tar.xz
+          curl -sSL --fail -o "$tarball" "https://archive.mesa3d.org/$tarball"
+          echo "592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6  $tarball" | sha256sum -c --quiet
+          tar xJf "$tarball"
+          src=mesa-25.0.7
+          mkdir out
+          # every file that names the preload function or the bifrost preload
+          # descriptors, plus the panfrost kmod/drm glue
+          grep -rlE "preload_fb_part|pan_preload_fb|fb_preload|GENX\(pan_preload" "$src/src/panfrost" "$src/src/gallium/drivers/panfrost" | sort -u > out/preload-files.txt || true
+          ls "$src/src/panfrost/lib/kmod" > out/kmod-files.txt || true
+          cat out/preload-files.txt
+          while read -r f; do
+            mkdir -p "out/$(dirname "${f#$src/}")"
+            cp "$f" "out/${f#$src/}"
+          done < out/preload-files.txt
+          mkdir -p out/src/panfrost/lib/kmod
+          cp "$src"/src/panfrost/lib/kmod/*.c "$src"/src/panfrost/lib/kmod/*.h out/src/panfrost/lib/kmod/ 2>/dev/null || true
+          cd out
+          git init -q
+          git checkout -q -b mesa-src
+          git add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "mesa 25.0.7 panfrost preload + kmod sources (reading copy)"
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}" mesa-src
