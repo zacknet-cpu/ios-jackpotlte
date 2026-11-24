@@ -1,0 +1,359 @@
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index c703ffa..cf7f4de 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -58,6 +58,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <sys/uio.h>
++#include <string.h>
+ #include <sys/vnode.h>
+ #include <sys/attr.h>
+ #include <kern/clock.h>
+@@ -970,43 +971,170 @@ a5scsc_pmu_mem_windows(void)
+ 	    A5SCSC_BTABOX_SIZE >> 12);
+ }
+ 
++/* 0208: the PMU's view, one line (vendor bits: mif_reg_S5E7885.h:46-131). */
++static void
++a5scsc_pmu_snapshot(const char *when)
++{
++	uint32_t cs = a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_STATUS);
++
++	printf("A5XELTE SCSC: %s: CTRL_NS 0x%08x CTRL_S 0x%08x STAT 0x%08x seq cfg 0x%08x state 0x%02x\n",
++	    when, a5scsc_rd(a5scsc.pmu, A5SCSC_WIFI_CTRL_NS),
++	    a5scsc_rd(a5scsc.pmu, A5SCSC_WIFI_CTRL_S),
++	    a5scsc_rd(a5scsc.pmu, A5SCSC_WIFI_STAT),
++	    a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_CONFIGURATION),
++	    (cs & A5SCSC_CENTRAL_SEQ_STATES) >> 16);
++}
++
++/* 0208: the boot mailboxes and the firmware's panic records (vendor
++ * print_mailboxes(), mxman.c; panic-record offsets at header bytes 176/180,
++ * fwhdr.c:29-30). */
++static void
++a5scsc_fail_dump(const char *when)
++{
++	a5scsc_pmu_snapshot(when);
++	if (a5scsc.mbox_mapped) {
++		vm_offset_t r = a5scsc.mbox_r4, m = a5scsc.mbox_m4;
++
++		printf("A5XELTE SCSC: %s: R4 ISSR0-3 0x%08x 0x%08x 0x%08x 0x%08x INTMSR0 0x%08x; "
++		    "M4 ISSR0-3 0x%08x 0x%08x 0x%08x 0x%08x\n", when,
++		    a5scsc_rd(r, A5SCSC_ISSR(0)), a5scsc_rd(r, A5SCSC_ISSR(1)),
++		    a5scsc_rd(r, A5SCSC_ISSR(2)), a5scsc_rd(r, A5SCSC_ISSR(3)),
++		    a5scsc_rd(r, A5SCSC_INTMSR0),
++		    a5scsc_rd(m, A5SCSC_ISSR(0)), a5scsc_rd(m, A5SCSC_ISSR(1)),
++		    a5scsc_rd(m, A5SCSC_ISSR(2)), a5scsc_rd(m, A5SCSC_ISSR(3)));
++	}
++	if (a5scsc.mif_mapped && a5scsc.fw_loaded) {
++		uint32_t r4p = a5scsc_mif_rd32(176), m4p = a5scsc_mif_rd32(180);
++
++		printf("A5XELTE SCSC: %s: panic records R4 at 0x%x: 0x%08x 0x%08x 0x%08x 0x%08x, "
++		    "M4 at 0x%x: 0x%08x 0x%08x\n", when, r4p,
++		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p) : 0,
++		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p + 4) : 0,
++		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p + 8) : 0,
++		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p + 12) : 0, m4p,
++		    m4p + 8 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(m4p) : 0,
++		    m4p + 8 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(m4p + 4) : 0);
++	}
++}
++
++/*
++ * 0208: exynos_acpm_set_flag() (cal-if/acpm_dvfs.c:17-42 of the A8's own
++ * kernel): {id 7, 1, SET_FLAG (6), 0} on the acpm_dvfs channel (FDT
++ * /acpm_dvfs acpm-ipc-channel = 5), sent "immediately prior to reset release,
++ * ... to ensure BUCK2 gets the right voltage" (platform_mif.c:579-584).
++ * Boot-arg a8wififlag=0 leaves it out; console "scsc start f" sends it.
++ */
++extern int a8_acpm_send(uint32_t channel, uint32_t cmd[4]);    /* a8_acpm.c, 0208 */
++#define A5SCSC_ACPM_DVFS_CHANNEL        5u
++
++static void
++a5scsc_acpm_flag(void)
++{
++	uint32_t cmd[4] = { 7, 1, 6, 0 };
++	int err = a8_acpm_send(A5SCSC_ACPM_DVFS_CHANNEL, cmd);
++
++	printf("A5XELTE SCSC: ACPM SET_FLAG (channel %u): %s %d, 0x%08x 0x%08x 0x%08x 0x%08x\n",
++	    A5SCSC_ACPM_DVFS_CHANNEL, err ? "error" : "answered", err, cmd[0], cmd[1], cmd[2], cmd[3]);
++}
++
++static bool
++a5scsc_bootarg_on(const char *name, int dflt)
++{
++	int v = dflt;
++
++	(void)PE_parse_boot_argn(name, &v, sizeof(v));
++	return v != 0;
++}
++
++/*
++ * The vendor's release (platform_mif_reset(0) + platform_mif_pmu_reset_release,
++ * platform_mif.c:401-424, 529-584 of the A8's kernel): memory windows, the
++ * ACPM flag, then WIFI_PWRON = 1, WIFI_RESET_SET = 0, WIFI_START = 1 inside
++ * exynos_pmu_shared_reg_enable/disable (the external regulator shared with the
++ * modem; its vote bit, PMU 0x3648 bit 2, already reads set on this phone).
++ * The low-power settings and the wait for sequencer state 0x80 belong to the
++ * vendor's HOLD path (platform_mif_pmu_reset), not to the release: 0x80 is
++ * what the hold waits for.  Until 0207 this driver did both before the
++ * release and called 0x80 "up"; boot-arg a8wifilp=1 puts the low-power writes
++ * back.
++ */
+ static int
+-a5scsc_pmu_reset_release(void)
++a5scsc_pmu_release(bool flag)
+ {
+-	uint32_t v, state = 0;
++	uint32_t state, last = 0x100;
+ 	int n;
+ 
+-	/* Take the WIFI domain out of low-power first (MIF:449-512). */
+-	a5scsc_pmu_set(A5SCSC_RESET_AHEAD_WIFI_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
+-	a5scsc_pmu_set(A5SCSC_CLEANY_BUS_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
+-	a5scsc_pmu_set(A5SCSC_LOGIC_RESET_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
+-	a5scsc_pmu_set(A5SCSC_TCXO_GATE_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
+-	a5scsc_pmu_set(A5SCSC_WIFI_DISABLE_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 1);
+-	a5scsc_pmu_set(A5SCSC_WIFI_RESET_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
+-	a5scsc_pmu_set(A5SCSC_CENTRAL_SEQ_WIFI_CONFIGURATION, A5SCSC_SYS_PWR_CFG_16, 0);
++	if (a5scsc_bootarg_on("a8wifilp", 0)) {
++		a5scsc_pmu_set(A5SCSC_RESET_AHEAD_WIFI_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
++		a5scsc_pmu_set(A5SCSC_CLEANY_BUS_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++		a5scsc_pmu_set(A5SCSC_LOGIC_RESET_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
++		a5scsc_pmu_set(A5SCSC_TCXO_GATE_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++		a5scsc_pmu_set(A5SCSC_WIFI_DISABLE_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 1);
++		a5scsc_pmu_set(A5SCSC_WIFI_RESET_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++		a5scsc_pmu_set(A5SCSC_CENTRAL_SEQ_WIFI_CONFIGURATION, A5SCSC_SYS_PWR_CFG_16, 0);
++	}
+ 
+ 	a5scsc_pmu_mem_windows();
+ 	/* Boot from external DRAM, not IRAM (MIF:684). */
+ 	a5scsc_wr(a5scsc.pmu, A5SCSC_WLBT_BOOT_TEST_RST_CFG, 0);
++	if (flag) {
++		a5scsc_acpm_flag();
++	}
++	a5scsc_pmu_snapshot("before release");
+ 
+ 	/* Power on -> release reset -> start (MIF:418-426). */
+ 	a5scsc_pmu_set(A5SCSC_WIFI_CTRL_NS, A5SCSC_WIFI_PWRON, A5SCSC_WIFI_PWRON);
+ 	a5scsc_pmu_set(A5SCSC_WIFI_CTRL_NS, A5SCSC_WIFI_RESET_SET, 0);
+ 	a5scsc_pmu_set(A5SCSC_WIFI_CTRL_S, A5SCSC_WIFI_START, A5SCSC_WIFI_START);
++	a5scsc_pmu_snapshot("start written");
++
++	/* Watch the sequencer for 50 ms (the vendor does not wait here). */
++	for (n = 0; n < 50; n++) {
++		state = (a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_STATUS) &
++		    A5SCSC_CENTRAL_SEQ_STATES) >> 16;
++		if (state != last) {
++			printf("A5XELTE SCSC: sequencer state 0x%02x at %d ms\n", state, n);
++			last = state;
++		}
++		delay(1000);
++	}
++	a5scsc_pmu_snapshot("50 ms after start");
++	printf("A5XELTE SCSC: stage 4/6 reset: released, PMU seq state 0x%x\n", last);
++	return 0;
++}
++
++static int
++a5scsc_pmu_reset_release(void)
++{
++	return a5scsc_pmu_release(a5scsc_bootarg_on("a8wififlag", 1));
++}
++
++/* 0208: the vendor's hold (platform_mif_pmu_reset(rst_case 2), MIF:426-527):
++ * low-power settings, WIFI_RESET_SET = 1, then sequencer state 0x80. */
++static int
++a5scsc_pmu_hold(void)
++{
++	uint32_t state = 0;
++	int n;
+ 
+-	/* Wait for the WLBT power state machine to reach UP (MIF:522-528). */
++	a5scsc_pmu_set(A5SCSC_RESET_AHEAD_WIFI_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
++	a5scsc_pmu_set(A5SCSC_CLEANY_BUS_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++	a5scsc_pmu_set(A5SCSC_LOGIC_RESET_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
++	a5scsc_pmu_set(A5SCSC_TCXO_GATE_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++	a5scsc_pmu_set(A5SCSC_WIFI_DISABLE_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 1);
++	a5scsc_pmu_set(A5SCSC_WIFI_RESET_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++	a5scsc_pmu_set(A5SCSC_CENTRAL_SEQ_WIFI_CONFIGURATION, A5SCSC_SYS_PWR_CFG_16, 0);
++	a5scsc_pmu_set(A5SCSC_WIFI_CTRL_NS, A5SCSC_WIFI_RESET_SET, A5SCSC_WIFI_RESET_SET);
+ 	for (n = 0; n < 500; n++) {
+-		v = a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_STATUS);
+-		state = (v & A5SCSC_CENTRAL_SEQ_STATES) >> 16;
+-		if (state == A5SCSC_CENTRAL_SEQ_UP) {
+-			printf("A5XELTE SCSC: stage 4/6 reset: released, PMU seq state 0x%x\n",
+-			    state);
+-			return 0;
++		state = (a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_STATUS) &
++		    A5SCSC_CENTRAL_SEQ_STATES) >> 16;
++		if (state == 0x80) {
++			break;
+ 		}
+-		delay(1000);    /* 1 ms between polls; 500 ms budget (MIF:438) */
++		delay(1000);
+ 	}
+-	printf("A5XELTE SCSC: reset release timed out, PMU seq state 0x%x\n", state);
+-	return ETIMEDOUT;
++	a5scsc_pmu_snapshot(state == 0x80 ? "held" : "hold: no state 0x80 in 500 ms");
++	return state == 0x80 ? 0 : ETIMEDOUT;
+ }
+ 
+ /* ---- poll thread ----------------------------------------------------------
+@@ -1170,6 +1298,7 @@ a5scsc_transport_up(void)
+ 		 * transport marked up so nothing retries the reset sequence. */
+ 		printf("A5XELTE SCSC: stage 5/6 handshake: no MM_START_IND in %u ms (pmu up, mxmgmt pending 0x%04x)\n",
+ 		    (unsigned)A5SCSC_MXMAN_START_TIMEOUT_MS, a5scsc_irq_get());
++		a5scsc_fail_dump("no start");
+ 		a5scsc_transport_state = 2;
+ 		printf("A5XELTE SCSC: stage 6/6 up: WLBT cannot be confirmed\n");
+ 		return 1;
+@@ -1299,6 +1428,79 @@ a5xelte_scsc_probe(void)
+ 	}
+ }
+ 
++/*
++ * 0208: console "scsc" (bsd/dev/a5xelte_usb.c), once the boot's own bring-up
++ * (a8wifi=1) has finished:
++ *   scsc               PMU, mailboxes, panic records, driver state
++ *   scsc hold          the vendor's hold (WIFI_RESET_SET = 1, state 0x80)
++ *   scsc start [f] [r] hold, then release again and wait 2 s for
++ *                      MM_START_IND; f = send the ACPM flag first, r = load
++ *                      the firmware image into the MIF again first
++ */
++void a5xelte_scsc_command(const char *args);
++
++void
++a5xelte_scsc_command(const char *args)
++{
++	bool start = false, hold = false, flag = false, reload = false;
++	uint32_t waited;
++
++	while (args != NULL && *args == ' ') {
++		args++;
++	}
++	if (args != NULL && strncmp(args, "start", 5) == 0) {
++		start = true;
++		flag = strchr(args + 5, 'f') != NULL;
++		reload = strchr(args + 5, 'r') != NULL;
++	} else if (args != NULL && strncmp(args, "hold", 4) == 0) {
++		hold = true;
++	}
++	if (!a5scsc.pmu_mapped) {
++		printf("A5XELTE SCSC: not mapped\n");
++		return;
++	}
++	if (!start && !hold) {
++		a5scsc_fail_dump("now");
++		printf("A5XELTE SCSC: transport %d, firmware %s, MM_START_IND %s, poll %s, irq 0x%04x\n",
++		    a5scsc_transport_state, a5scsc.fw_loaded ? "loaded" : "not loaded",
++		    a5scsc.mm_start_seen ? "seen" : "not seen", a5scsc.poll_running ? "running" : "stopped",
++		    a5scsc.mbox_mapped ? a5scsc_irq_get() : 0);
++		return;
++	}
++	if (a5scsc_transport_state != 2 || !a5scsc.fw_loaded || !a5scsc.mbox_mapped) {
++		printf("A5XELTE SCSC: only after the a8wifi=1 bring-up finished (transport %d)\n",
++		    a5scsc_transport_state);
++		return;
++	}
++	(void)a5scsc_pmu_hold();
++	if (hold) {
++		return;
++	}
++	if (reload) {
++		size_t size = 0;
++		int err = a5scsc_read_file(A5SCSC_FW_PATH, (void *)a5scsc.mif,
++		    a5scsc.fw_runtime_len, &size);
++
++		printf("A5XELTE SCSC: firmware image loaded again: error %d, %u bytes\n", err, (unsigned)size);
++		if (err != 0) {
++			return;
++		}
++	}
++	a5scsc_mbox_init(a5scsc.fw_entry, a5scsc.mxconf_ref);
++	a5scsc.mm_start_seen = false;
++	a5scsc_mb();
++	(void)a5scsc_pmu_release(flag);
++	for (waited = 0; waited < A5SCSC_MXMAN_START_TIMEOUT_MS && !a5scsc.mm_start_seen; waited += 10) {
++		a5scsc_sleep_ms(10);
++	}
++	if (a5scsc.mm_start_seen) {
++		printf("A5XELTE SCSC: restart: MM_START_IND after %u ms, RF 0x%04x\n", waited, a5scsc.rf_hw_ver);
++	} else {
++		printf("A5XELTE SCSC: restart: no MM_START_IND in %u ms\n", waited);
++		a5scsc_fail_dump("restart");
++	}
++}
++
+ #else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+ 
+ void
+@@ -1306,4 +1508,10 @@ a5xelte_scsc_probe(void)
+ {
+ }
+ 
++void a5xelte_scsc_command(const char *args);
++void
++a5xelte_scsc_command(const char *args __unused)
++{
++}
++
+ #endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+\ No newline at end of file
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 2b38486..c6fab7a 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1625,6 +1625,7 @@ extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
+ extern int sweet_fb_vsync_lock_set(int on);     /* SweetFramebuffer.cpp, 0204 */
+ /* 0192 */
+ extern void a8_acpm_command(const char *args);  /* a8_acpm.c */
++extern void a5xelte_scsc_command(const char *args); /* a5xelte_scsc.c, 0208 */
+ extern void a8_dvfs_command(const char *args);
+ extern void a8_tmu_command(const char *args);
+ extern void a8_tee_set(const char *names);      /* mem.c */
+@@ -1914,6 +1915,8 @@ a8s_command(const char *line)
+ 		a8f_date(rest);
+ 	} else if (a8s_word(line, "acpm", &rest)) {
+ 		a8_acpm_command(rest);
++	} else if (a8s_word(line, "scsc", &rest)) {
++		a5xelte_scsc_command(rest);     /* 0208 */
+ 	} else if (a8s_word(line, "dvfs", &rest)) {
+ 		a8_dvfs_command(rest);
+ 	} else if (a8s_word(line, "tmu", &rest)) {
+diff --git a/bsd/dev/a8_acpm.c b/bsd/dev/a8_acpm.c
+index 70a1da1..2a39414 100644
+--- a/bsd/dev/a8_acpm.c
++++ b/bsd/dev/a8_acpm.c
+@@ -1443,6 +1443,30 @@ a8_acpm_command(const char *args)
+ 	lck_mtx_unlock(&a8a_lock);
+ }
+ 
++/*
++ * 0208: one raw command for another driver (a5xelte_scsc.c sends the vendor's
++ * acpm_dvfs SET_FLAG before the WLBT reset release).  cmd comes back as the
++ * answer.  Needs a8dvfs=1 like the console's "acpm send".
++ */
++int a8_acpm_send(uint32_t channel, uint32_t cmd[4]);
++
++int
++a8_acpm_send(uint32_t channel, uint32_t cmd[4])
++{
++	int error;
++
++	lck_mtx_lock(&a8a_lock);
++	if (!a8a_init()) {
++		error = ENXIO;
++	} else if (a8a.allow == 0) {
++		error = ENOTSUP;
++	} else {
++		error = a8a_ipc(channel, cmd);
++	}
++	lck_mtx_unlock(&a8a_lock);
++	return error;
++}
++
+ /*
+  * dvfs                     the rate of every domain, the G3D PLL, the temperatures
+  * dvfs table [DOMAIN]      the firmware's frequency/voltage table
