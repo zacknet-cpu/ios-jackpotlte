@@ -466,6 +466,40 @@ flip_async_on(void)
    return flip_async;
 }
 
+/*
+ * glca14: CoreAnimation's render thread on a Cortex-A73 (kernel 0204,
+ * kern.a8_bind_big).  The single processor set put it on whichever core was
+ * free, mostly an A53, and its frame building (CPU) was ~7 ms of a 16.7 ms
+ * frame.  The first thread that ends a frame binds itself to cpu 7, once.
+ * Switch: a8gl-big "0" leaves threads where the scheduler puts them.
+ */
+static void
+bind_big_once(void)
+{
+   static __thread int tried;
+   static int off = -1;
+   int cpu = 7;
+
+   if (tried)
+      return;
+   tried = 1;
+   if (off < 0) {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-big", "r");
+
+      off = f != NULL && fgetc(f) == '0';
+      if (f != NULL)
+         fclose(f);
+   }
+   if (off) {
+      say("glca14: render thread left to the scheduler (a8gl-big \"0\")");
+      return;
+   }
+   if (sysctlbyname("kern.a8_bind_big", NULL, NULL, &cpu, sizeof(cpu)) == 0)
+      say("glca14: this render thread is bound to cpu 7 (Cortex-A73)");
+   else
+      say("glca14: no kern.a8_bind_big (kernel before 0204): render thread not bound");
+}
+
 /* glca13: before a frame goes to the GPU, the panel's last update taken */
 static void
 flip_settle(void)
@@ -698,6 +732,7 @@ frame_end(const char *why, int finished)
    if (sync_mode() == 0 || !frame_drawn)
       return;
    frame_drawn = 0;
+   bind_big_once();                /* glca14 */
    if (perf.frame_start != 0)
       perf.build += mach_absolute_time() - perf.frame_start;
    if (flush_mode() == 0)
