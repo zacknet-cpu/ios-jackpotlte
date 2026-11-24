@@ -63,8 +63,9 @@
  * layout of _UIStatusBarForegroundView the items left of its middle move so
  * the leftmost starts a margin from the left edge, and the ones right of it
  * so the rightmost ends the same margin from the right edge.  The margin is
- * 16 pt, or the number in /private/var/mobile/Library/a8fix-sbmargin (points,
- * 2 to 60, read once when the process starts).
+ * 5 pt (picked on the phone 11-24: 4 sat too close to the rounded corners, 6
+ * too far in), or the number in /private/var/mobile/Library/a8fix-sbmargin
+ * (points, 2 to 60, read once when the process starts).
  *
  * View dump (v6): SIGUSR1 (console "kill NAME 30") makes the process write
  * every visible window's views to stderr, one line each: depth, class, frame
@@ -661,7 +662,7 @@ sb_margin_now(void)
 			if (text != 0)
 				v = dbl(text, sel_registerName("doubleValue"));
 		}
-		sb_margin = (v >= 2 && v <= 60) ? v : 16;
+		sb_margin = (v >= 2 && v <= 60) ? v : 5;
 	}
 	return sb_margin;
 }
