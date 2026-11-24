@@ -299,7 +299,6 @@ static struct {
    unsigned long internal, format, type;
    BOOL invert;
    int target;                         /* made by -attachImage: (drawn into) */
-   int told;                           /* glca9c: its first draw was said */
    int empty;                          /* glca9d: the copy had alpha 0 everywhere */
    unsigned tries;                     /* copies made again while it stayed empty */
    uint64_t next_try;
@@ -671,54 +670,9 @@ frame_end(const char *why, int finished)
 unsigned ca_fixes_function(void);      /* ca_fixes.c */
 static int resolve_helpers(void);
 
-/*
- * glca9c: a surface CoreAnimation attaches to draw into, but that is not BGRA,
- * is a copy here, and apps' SF Symbols came out of such copies with nothing in
- * them (33x57, alpha 0 everywhere).  Say, once for each, what draws into one.
- */
-static void
-copy_target_draw(void)
-{
-   static void (*attachment)(unsigned, unsigned, unsigned, int *);
-   static unsigned said;
-   int framebuffer = 0, kind = 0, name = 0, program = 0;
-   unsigned i, function;
-
-   if (copied_used == 0 || said >= 60 || !resolve_helpers())
-      return;
-   if (attachment == NULL) {
-      attachment = (void (*)(unsigned, unsigned, unsigned, int *))
-         jackpotlte_gl_proc("glGetFramebufferAttachmentParameteriv");
-      if (attachment == NULL)
-         return;
-   }
-   helpers.get_integerv(0x8ca6 /* GL_FRAMEBUFFER_BINDING */, &framebuffer);
-   if (framebuffer == 0)
-      return;
-   attachment(0x8d40 /* GL_FRAMEBUFFER */, 0x8ce0 /* COLOR_ATTACHMENT0 */,
-              0x8cd0 /* ATTACHMENT_OBJECT_TYPE */, &kind);
-   if (kind != 0x1702 /* GL_TEXTURE */)
-      return;
-   attachment(0x8d40, 0x8ce0, 0x8cd1 /* ATTACHMENT_OBJECT_NAME */, &name);
-   for (i = 0; i < COPIED_MAX; i++) {
-      if (copied[i].surface == NULL || copied[i].texture != name || copied[i].told)
-         continue;
-      copied[i].told = 1;
-      said++;
-      helpers.get_integerv(0x8b8d /* GL_CURRENT_PROGRAM */, &program);
-      function = ca_fixes_function();
-      say("copy: a draw into texture %d (copy of surface %u, %zux%zu, %s): CA function %u, "
-          "program %d", name, (unsigned)IOSurfaceGetID(copied[i].surface),
-          IOSurfaceGetWidth(copied[i].surface), IOSurfaceGetHeight(copied[i].surface),
-          copied[i].target ? "attached" : "sampled", function, program);
-      break;
-   }
-}
-
 void
 jackpotlte_gl_after_draw(void)
 {
-   copy_target_draw();
 
    void (*flush)(void) = (void (*)(void))jackpotlte_gl_proc("glFlush");
    int mode = sync_mode();
@@ -906,18 +860,11 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 void ca_fixes_install(void *table[JACKPOTLTE_GL_SLOTS]);   /* ca_fixes.c */
 
 static void my_glBindTexture(void *context, GLenum target, GLuint texture);
-static void my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsizei w,
-                            GLsizei h, GLint border, GLenum format, GLenum type, const void *pixels);
-static void my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y,
-                               GLsizei w, GLsizei h, GLenum format, GLenum type,
-                               const void *pixels);
 
 static void
 install_fixes(void *table[JACKPOTLTE_GL_SLOTS])
 {
    table[0x006] = (void *)my_glBindTexture;          /* 0x0030 */
-   table[0x12e] = (void *)my_glTexImage2D;           /* 0x0970 */
-   table[0x134] = (void *)my_glTexSubImage2D;        /* 0x09a0 */
    table[0x03c] = (void *)my_glDeleteTextures;       /* 0x01e0 */
    table[0x05a] = (void *)my_glFinish;               /* 0x02d0 */
    table[0x05b] = (void *)my_glFlush;                /* 0x02d8 */
@@ -1250,7 +1197,6 @@ copied_note(void *owner, int texture, IOSurfaceRef surface, uint32_t seed,
    copied[slot].type = type;
    copied[slot].invert = invert;
    copied[slot].target = target;
-   copied[slot].told = 0;
    copied[slot].empty = last_copy_alpha == 0;
    copied[slot].tries = 0;
    copied[slot].next_try = 0;
@@ -1583,66 +1529,6 @@ alpha_max(const unsigned char *p, int w, int h, unsigned long format, unsigned l
          best = p[i * step + at];
    }
    return best;
-}
-
-static unsigned long uploads, empty_uploads;
-
-/* CoreAnimation's own uploads (the shim's copies call the library directly). */
-static void
-upload_note(const char *what, int w, int h, unsigned long internal, unsigned long format,
-            unsigned long type, const void *pixels)
-{
-   int alpha = -2;
-
-   uploads++;
-   if (w > 0 && h > 0 && (size_t)w * (size_t)h <= 512u * 512u && (uintptr_t)pixels >= 0x100000u) {
-      int unpack_buffer = 0;
-
-      /* with a pixel unpack buffer bound, `pixels` is an offset into it */
-      if (resolve_helpers())
-         helpers.get_integerv(0x88ef /* GL_PIXEL_UNPACK_BUFFER_BINDING */, &unpack_buffer);
-      alpha = unpack_buffer != 0 ? -3 : alpha_max(pixels, w, h, format, type);
-   }
-   if (alpha == 0)
-      empty_uploads++;
-   if (uploads <= 12 || (alpha == 0 && empty_uploads <= 40) || uploads % 1000 == 0)
-      say("upload %lu: %s %dx%d internal %#lx format %#lx type %#lx, %s, alpha max %d "
-          "(%lu with alpha 0 everywhere)", uploads, what, w, h, internal, format, type,
-          pixels != NULL ? "pixels" : "no pixels", alpha, empty_uploads);
-}
-
-static void
-my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsizei w,
-                GLsizei h, GLint border, GLenum format, GLenum type, const void *pixels)
-{
-   static void (*real)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum,
-                       const void *);
-
-   jackpotlte_gl_use(context);
-   if (real == NULL)
-      real = (void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum,
-                       const void *))jackpotlte_gl_proc("glTexImage2D");
-   if (level == 0)
-      upload_note("glTexImage2D", w, h, (unsigned long)internal, format, type, pixels);
-   if (real != NULL)
-      real(target, level, internal, w, h, border, format, type, pixels);
-}
-
-static void
-my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, GLsizei w,
-                   GLsizei h, GLenum format, GLenum type, const void *pixels)
-{
-   static void (*real)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum,
-                       const void *);
-
-   jackpotlte_gl_use(context);
-   if (real == NULL)
-      real = (void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum,
-                       const void *))jackpotlte_gl_proc("glTexSubImage2D");
-   if (level == 0)
-      upload_note("glTexSubImage2D", w, h, 0, format, type, pixels);
-   if (real != NULL)
-      real(target, level, x, y, w, h, format, type, pixels);
 }
 
 /*
