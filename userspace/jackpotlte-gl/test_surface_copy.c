@@ -303,6 +303,36 @@ main(void)
       my_glDeleteTextures(&eagl, 1, &name);
    }
 
+   /* 10. glca9f: a pixel-format-0 surface holding A,B,G,R bytes (a black
+    *     premultiplied glyph: alpha in byte 0) is reordered to B,G,R,A; a real
+    *     B,G,R,A one is left alone. */
+   memset(&upload, 0, sizeof(upload));
+   memset(captured, 0, sizeof(captured));
+   {
+      struct __IOSurface *s = surface_new(13, 0, 2, 1, 8, 4, 8);
+      unsigned char abgr[8] = { 0xff, 0, 0, 0,  0x80, 0x10, 0x20, 0x30 };
+
+      memcpy(s->bytes, abgr, 8);
+      check("an A,B,G,R glyph is copied",
+            surface_copy_texture(&eagl, s, 0, 0, GL_RGBA8, GL_BGRA,
+                                 GL_UNSIGNED_BYTE, NO, "-t") == YES);
+      check("  with its alpha moved to the fourth byte",
+            captured[3] == 0xff && captured[0] == 0 && captured[7] == 0x80 &&
+            captured[4] == 0x10 && captured[5] == 0x20 && captured[6] == 0x30);
+   }
+   memset(&upload, 0, sizeof(upload));
+   memset(captured, 0, sizeof(captured));
+   {
+      struct __IOSurface *s = surface_new(14, 0, 2, 1, 8, 4, 8);
+      unsigned char bgra[8] = { 0x10, 0x20, 0x30, 0x80,  0, 0, 0, 0xff };
+
+      memcpy(s->bytes, bgra, 8);
+      check("a B,G,R,A picture is copied",
+            surface_copy_texture(&eagl, s, 0, 0, GL_RGBA8, GL_BGRA,
+                                 GL_UNSIGNED_BYTE, NO, "-t") == YES);
+      check("  as it is", memcmp(captured, bgra, 8) == 0);
+   }
+
    printf("\n%s\n", failures ? "FAILURES" : "all checks passed");
    return failures ? 1 : 0;
 }

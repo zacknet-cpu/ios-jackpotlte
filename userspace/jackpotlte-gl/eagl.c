@@ -306,7 +306,7 @@ static struct {
 } copied[COPIED_MAX];
 static int last_copy_alpha = -1;       /* alpha_max of the last surface copy */
 static unsigned copied_next, copied_used;
-static unsigned long recopies;
+static unsigned long recopies, reordered;
 static unsigned long draws, cleans, finishes, frames, forgotten;
 static int frame_drawn;                /* a draw since the last frame_end() */
 
@@ -1442,6 +1442,50 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
       memcpy(out, base + off, n);
    }
    source = packed;
+   /*
+    * glca9f: CoreAnimation's IOSurfaceWrapClientImage surfaces carry no pixel
+    * format here (the kernel says 0, so they come through this copy), and
+    * CoreAnimation asks for GL_BGRA whatever they hold.  The apps' SF Symbols
+    * are CGImages with kCGBitmapByteOrder32Little | AlphaPremultipliedLast,
+    * bytes A,B,G,R: read as B,G,R,A the alpha is the red byte, 0 for a black
+    * template glyph, and the glyph is drawn as nothing (Settings' back
+    * chevron: 670 bytes not 0 in its 33x57 surface, every one at an offset
+    * that is a multiple of 4).  Premultiplied pixels never have a colour byte
+    * above their alpha, so when the bytes break that rule as B,G,R,A and keep
+    * it as A,B,G,R, they are put in B,G,R,A order.
+    */
+   if (pixels == 0 && bpp == 4 && format == GL_BGRA && type == GL_UNSIGNED_BYTE) {
+      size_t n = (size_t)width * (size_t)height, as_bgra = 0, as_abgr = 0, lit = 0;
+      static unsigned said;
+
+      for (size_t i = 0; i < n; i++) {
+         const unsigned char *q = packed + 4 * i;
+         unsigned char m012 = q[0] > q[1] ? q[0] : q[1], m123 = q[1] > q[2] ? q[1] : q[2];
+
+         if (q[2] > m012)
+            m012 = q[2];
+         if (q[3] > m123)
+            m123 = q[3];
+         as_bgra += m012 > q[3];
+         as_abgr += m123 > q[0];
+         lit += (q[0] | q[1] | q[2] | q[3]) != 0;
+      }
+      if (lit != 0 && as_bgra != 0 && as_abgr == 0) {
+         for (size_t i = 0; i < n; i++) {
+            unsigned char *q = packed + 4 * i, a = q[0];
+
+            q[0] = q[1];
+            q[1] = q[2];
+            q[2] = q[3];
+            q[3] = a;
+         }
+         reordered++;
+         if (said++ < 12 || reordered % 500 == 0)
+            say("%s: surface %u (%dx%d) holds A,B,G,R bytes (%zu of %zu pixels break B,G,R,A): "
+                "put in B,G,R,A order, %lu so far", method, (unsigned)IOSurfaceGetID(surface),
+                width, height, as_bgra, n, reordered);
+      }
+   }
 
    while (get_error() != 0) {
    }
