@@ -76,7 +76,7 @@ echo "--- arm64 iOS libjackpotlte-gl.dylib: the EAGL shim ---"
 gl=$repo/userspace/jackpotlte-gl
 xcrun --sdk iphoneos clang "${common[@]}" "${lookup[@]}" -target arm64-apple-ios16.0 \
 	-isysroot "$sdk" -I "$gl" -dynamiclib -o "$out/libjackpotlte-gl.dylib" \
-	"$gl/gl_slots.c" "$gl/jackpotlte_gl_osmesa.c" "$gl/eagl.c" "$gl/ca_fixes.c" "$gl/trap.c"
+	"$gl/gl_slots.c" "$gl/jackpotlte_gl_osmesa.c" "$gl/eagl.c" "$gl/ca_fixes.c" "$gl/trace.c" "$gl/trap.c"
 
 # The point of the generated table: no gl* function is called by name.  iOS's own
 # OpenGLES.framework is in the dyld shared cache and defines every one of them,
@@ -106,7 +106,7 @@ echo "--- host copy of the surface-copy test ---"
 # host build.
 # -lobjc: eagl.c installs its methods with the ObjC runtime, and the host
 # link does not bring it in on its own.
-clang "${common[@]}" -o "$out/test_surface_copy" "$gl/test_surface_copy.c" "$gl/ca_fixes.c" -lobjc
+clang "${common[@]}" -o "$out/test_surface_copy" "$gl/test_surface_copy.c" "$gl/ca_fixes.c" "$gl/trace.c" -lobjc
 
 echo "--- arm64 iOS libjackpotlte.a ---"
 obj=$out/.obj

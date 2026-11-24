@@ -98,6 +98,7 @@ static void (*next_uniform_matrix4fv)(void *, GLint, GLsizei, GLboolean, const G
 
 static int glsl_on = 1;
 static int plain_on = 1;
+static int debug_shape;         /* a8gl-dbg-shape "1": shape shaders show (coverage, 20 w, d / 2) */
 
 static void
 say(const char *format, ...)
@@ -168,6 +169,115 @@ load(void)
 static const char all_highp[] =
    "#define lowp highp\n"
    "#define mediump highp\n";
+
+/*
+ * Rounded corners without derivatives.  On this GPU (Mesa 25.0.7 panfrost,
+ * Bifrost v6, Mali-G71) dFdx/dFdy/fwidth come out wrong: measured on the dock's
+ * corner, fwidth(d) was about 3.7 where 0.05 is right, and a sign-keeping
+ * dFdx of the texture coordinates was as wrong the other way.  CoreAnimation
+ * draws every rounded shape with coverage = (w/2 + 1 - d) / w, w = fwidth(d)
+ * (supercircleImage, circleImage, squareImage), so its rounded rectangles
+ * came out square with a soft smudge (Control Center, the dock, the island).
+ *
+ * Here the size of a pixel in the shape's coordinates is worked out without the
+ * GPU's derivatives: the vertex shader hands on the vertex's place (CA's
+ * vertex_position is in pixels of the target) both interpolated and flat (the
+ * provoking vertex's), with the flat texture coordinates; a fragment divides
+ * how far its texture coordinates are from the provoking vertex's by how far
+ * it is from it in pixels.  Each shape's fwidth() becomes the derivative of
+ * its own d by that size.  Switch: a8gl-shapes "0".
+ */
+static const char shape_head[] =
+   "in highp vec2 a8_px;\n"
+   "flat in highp vec2 a8_fpx;\n"
+   "flat in highp vec4 a8_fuv;\n"
+   "highp float a8_s0 = 0.0166667, a8_s1 = 0.0166667;\n"
+   "highp float a8_pick(highp vec2 uv);\n"
+   "highp vec4 a8dbg = vec4(0., 0., 1., 1.);\n";
+
+static const char shape_vertex_head[] =
+   "out highp vec2 a8_px;\n"
+   "flat out highp vec2 a8_fpx;\n"
+   "flat out highp vec4 a8_fuv;\n"
+   "#define main a8_vmain\n"
+   "#line 1\n";
+
+static const struct {
+   const char *header;           /* the function's first line, as CA writes it */
+   const char *line;             /* its fwidth() line */
+   const char *with;             /* that line without derivatives */
+} shapes[] = {
+   { "lowp vec4 supercircleImage(highp vec2 uv) {", "w = max(fwidth(d), 1e-4);",
+     "w = max(2.68 * 1.199 * a8_sc * (pow(uv.x, 1.68) + pow(uv.y, 1.68)), 1e-4);" },
+   { "lowp vec4 circleImage(mediump vec2 uv) {", "w = max(fwidth(d), 1e-4);",
+     "w = max(a8_sc * (abs(uv.x) + abs(uv.y)) / max(d, 1e-4), 1e-4);" },
+   { "lowp vec4 squareImage(mediump vec2 uv) {", "w = max(fwidth(uv), 1e-4);",
+     "w = max(vec2(a8_sc), 1e-4);" },
+};
+#define SHAPES (int)(sizeof(shapes) / sizeof(shapes[0]))
+#define PICK " highp float a8_sc = a8_pick(uv);"
+
+static int shapes_on = 1;
+
+/* the text with each shape's fwidth() replaced, or NULL when it has none */
+static char *
+rewrite_shapes(const char *text)
+{
+   size_t room = strlen(text) + 1;
+   char *out;
+   bool any = false;
+
+   for (int i = 0; i < SHAPES; i++)
+      room += strlen(PICK) + strlen(shapes[i].with);
+   out = malloc(room);
+   if (out == NULL)
+      return NULL;
+   strcpy(out, text);
+   for (int i = 0; i < SHAPES; i++) {
+      char *head = strstr(out, shapes[i].header), *line;
+      size_t tail;
+
+      if (head == NULL)
+         continue;
+      head += strlen(shapes[i].header);
+      line = strstr(head, shapes[i].line);
+      if (line == NULL)
+         continue;
+      /* the fwidth line first (it is after the head), then the pick */
+      tail = strlen(line + strlen(shapes[i].line));
+      memmove(line + strlen(shapes[i].with), line + strlen(shapes[i].line), tail + 1);
+      memcpy(line, shapes[i].with, strlen(shapes[i].with));
+      memmove(head + strlen(PICK), head, strlen(head) + 1);
+      memcpy(head, PICK, strlen(PICK));
+      any = true;
+   }
+   if (!any) {
+      free(out);
+      return NULL;
+   }
+   return out;
+}
+
+/* what follows a shape shader: the scales, then main() as usual */
+static void
+shape_end(char *end, size_t room, const char *text, bool fetch, bool debug)
+{
+   bool has0 = strstr(text, "texcoord0_0") != NULL, has1 = strstr(text, "texcoord1_0") != NULL;
+
+   snprintf(end, room,
+            "\n#undef main\n"
+            "highp float a8_pick(highp vec2 uv) { return %s; }\n"
+            "void a8_scales() {\n"
+            "  highp float far = length(a8_px - a8_fpx);\n"
+            "  if (far < 1.5) return;\n"
+            "%s%s"
+            "}\n"
+            "void main() { a8_scales(); %sa8_main(); a8_colour = %s; }\n",
+            has1 && has0 ? "uv == texcoord1_0 ? a8_s1 : a8_s0" : has1 ? "a8_s1" : "a8_s0",
+            has0 ? "  a8_s0 = length(texcoord0_0 - a8_fuv.xy) / far;\n" : "",
+            has1 ? "  a8_s1 = length(texcoord1_0 - a8_fuv.zw) / far;\n" : "",
+            fetch ? "a8_last[0] = a8_colour; " : "", debug ? "a8dbg" : "a8_data[0]");
+}
 
 static const char fragment_start[] =
    "#define varying in\n"
@@ -259,6 +369,8 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
    char *text, *head, *line;
    bool fragment, fetch;
    const GLchar *parts[6];
+   char *debug_text, *shape_text, *shape_start = NULL;
+   char shape_tail[768];
 
    jackpotlte_gl_use(context);
    load();
@@ -312,7 +424,52 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
    parts[3] = fragment ? (fetch ? fragment_fetch : fragment_plain) : "";
    parts[4] = text;
    parts[5] = fragment ? (fetch ? fragment_fetch_end : fragment_plain_end) : "";
+
+   /* shapes: their fwidth() without derivatives (see shape_head) */
+   shape_text = NULL;
+   debug_text = NULL;
+   if (shapes_on && fragment && (shape_text = rewrite_shapes(text)) != NULL) {
+      const char *body = shape_text;
+      size_t n = strlen(fetch ? fragment_fetch : fragment_plain) + sizeof(shape_head);
+
+      /* a8gl-dbg-shape "1": a shape shows (coverage, 20 w, d / 2) instead */
+      if (debug_shape == 1 && !fetch) {
+         static const char from[] = "mediump float l = clamp((w * .5 + (1. - d)) / w, 0., 1.);";
+         static const char to[] = "mediump float l = clamp((w * .5 + (1. - d)) / w, 0., 1.); a8dbg = vec4(l, w * 20., d * .5, 1.);";
+         char *at = strstr(shape_text, from);
+
+         if (at != NULL && (debug_text = malloc(strlen(shape_text) + sizeof(to))) != NULL) {
+            size_t before = (size_t)(at - shape_text);
+
+            memcpy(debug_text, shape_text, before);
+            memcpy(debug_text + before, to, sizeof(to) - 1);
+            strcpy(debug_text + before + sizeof(to) - 1, at + sizeof(from) - 1);
+            body = debug_text;
+         }
+      }
+      shape_start = malloc(n);
+      if (shape_start != NULL) {
+         strcpy(shape_start, shape_head);
+         strcat(shape_start, fetch ? fragment_fetch : fragment_plain);
+         shape_end(shape_tail, sizeof(shape_tail), text, fetch, debug_text != NULL);
+         parts[3] = shape_start;
+         parts[4] = body;
+         parts[5] = shape_tail;
+      }
+   } else if (shapes_on && !fragment && strstr(text, "texcoord0_0 =") != NULL &&
+              strstr(text, "vertex_position") != NULL) {
+      /* CoreAnimation's vertex shader: also the places a shape shader needs */
+      parts[3] = shape_vertex_head;
+      snprintf(shape_tail, sizeof(shape_tail),
+               "\n#undef main\nvoid main() { a8_vmain(); a8_px = vertex_position.xy / vertex_position.w; "
+               "a8_fpx = a8_px; a8_fuv = vec4(texcoord0_0, %s); }\n",
+               strstr(text, "texcoord1_0 =") != NULL ? "texcoord1_0" : "vec2(0.)");
+      parts[5] = shape_tail;
+   }
    gl.shader_source(shader, 6, parts, NULL);
+   free(debug_text);
+   free(shape_text);
+   free(shape_start);
    keep_text(shader, text);
 }
 
@@ -529,6 +686,16 @@ current_function(void)
    return *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10);
 }
 
+/* trace.c's view of them */
+unsigned ca_fixes_function(void);
+const float *ca_fixes_matrix(void);
+
+unsigned
+ca_fixes_function(void)
+{
+   return current_function();
+}
+
 /* ---- hooks into CoreAnimation's GLES context (QuartzCore 20H392) -------- */
 
 #define VT_GLES_CONTEXT         0x1d5b2f6e8UL   /* vtable for CA::OGL::GLESContext */
@@ -633,6 +800,12 @@ static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 
 /* the matrix CoreAnimation last gave a program of its own (always from the
  * same place of its, so the pointer stays good) */
 static const GLfloat *ca_matrix;
+
+const float *
+ca_fixes_matrix(void)
+{
+   return ca_matrix;
+}
 
 struct our_program {
    GLuint program;
@@ -889,8 +1062,22 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
       read_switches = 1;
       glsl_on = access("/private/var/mobile/Library/a8gl-noglsl", F_OK) != 0;
       plain_on = access("/private/var/mobile/Library/a8gl-noplain", F_OK) != 0;
-      say("ca fixes: glsl rewrite %s, no-program draws %s", glsl_on ? "on" : "off",
-          plain_on ? "on" : "off");
+      {
+         /* "1" in the file turns it on (the console can write a file, not delete one) */
+         FILE *f = fopen("/private/var/mobile/Library/a8gl-dbg-shape", "r");
+
+         debug_shape = f == NULL ? 0 : fgetc(f) - '0';
+         if (debug_shape < 0 || debug_shape > 1)
+            debug_shape = 0;
+         if (f != NULL)
+            fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-shapes", "r");
+         shapes_on = !(f != NULL && fgetc(f) == '0');
+         if (f != NULL)
+            fclose(f);
+      }
+      say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s%s", glsl_on ? "on" : "off",
+          plain_on ? "on" : "off", shapes_on ? "on" : "off", debug_shape ? ", SHAPE DEBUG (a8gl-dbg-shape)" : "");
       if (access("/private/var/mobile/Library/a8gl-nohooks", F_OK) != 0)
          hook_coreanimation();
    }

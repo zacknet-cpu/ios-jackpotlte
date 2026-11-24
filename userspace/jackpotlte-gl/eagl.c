@@ -76,6 +76,9 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 
+void trace_install(void *table[JACKPOTLTE_GL_SLOTS]);      /* trace.c */
+void trace_frame(void);                                     /* trace.c */
+
 /*
  * IOSurface's accessors, declared here: the iPhoneOS SDK ships no header for
  * them (the framework is there, the header is not), the same arrangement the
@@ -327,7 +330,13 @@ flush_mode(void)
    static int mode = -1;
 
    if (mode < 0) {
-      mode = boot_arg_int("jtglflush", 1);
+      /* glca3: one batch a frame unless asked otherwise.  The boot-args lost
+       * jtglflush=0 with kernel 0196 (room for a8fix=1), and the old default
+       * then flushed every draw as a full-screen GPU pass (23-46 ms a frame
+       * with Control Center up).  The file a8gl-flush1 brings that back. */
+      mode = boot_arg_int("jtglflush", -1);
+      if (mode < 0)
+         mode = access("/private/var/mobile/Library/a8gl-flush1", F_OK) == 0 ? 1 : 0;
       say("flush: jtglflush=%d (1 a flush after every draw, 0 one batch a "
           "frame)", mode);
    }
@@ -651,6 +660,7 @@ my_glFenceSync(void *context, GLenum condition, GLbitfield flags)
       real = (GLsync (*)(GLenum, GLbitfield))jackpotlte_gl_proc("glFenceSync");
    frame_end("glFenceSync", 0);
    perf_frame();
+   trace_frame();
    return real != NULL ? real(condition, flags) : NULL;
 }
 
@@ -764,6 +774,7 @@ install_fixes(void *table[JACKPOTLTE_GL_SLOTS])
    table[0x1d7] = (void *)my_glFinishObjectAPPLE;    /* 0x0eb8 */
    table[0x30c] = (void *)my_glFenceSync;            /* 0x1860 */
    ca_fixes_install(table);
+   trace_install(table);
 }
 
 static struct jackpotlte_eagl *
