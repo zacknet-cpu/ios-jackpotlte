@@ -441,6 +441,15 @@ clean_surface(unsigned i, const char *why)
       sys_dcache_flush(base, length);
    perf.clean += mach_absolute_time() - t0;
    (void)IOSurfaceUnlock(shared[i].surface, 0, &seed);
+   /*
+    * glca5: the writable unlock above moves the surface's seed itself.  Not
+    * noting that made shared_sync() (after every draw) see a "seed changed"
+    * on every surface it had just cleaned and clean it again: both render
+    * targets after every draw, about 145 lock/clean/unlock rounds a frame
+    * (~290 kernel calls, a quarter of each frame in IOSurfaceClientUnlock in
+    * a backboardd sample).  Only another writer's change counts now.
+    */
+   shared[i].seed = IOSurfaceGetSeed(shared[i].surface);
    cleans++;
    if (cleans <= 40 || cleans % 500 == 0)
       say("cache: cleaned surface %u, %zu bytes at %p (%s, %s), %lu cleans",
