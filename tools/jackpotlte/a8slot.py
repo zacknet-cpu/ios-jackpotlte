@@ -138,8 +138,12 @@ def score(text, want_slot=None):
     procs = [int(x) for x in re.findall(r'procs (\d+);', text)]
     s['procs'] = procs[-1] if procs else 0
     s['flips'] = len(re.findall(r'^A8 FLIP:', text, re.M))
-    s['panic'] = lines_with(text, 'A8 PANIC:', 'SWEET EARLY PANIC', 'A5 XNU PANIC', 'panic(cpu')[:3]
+    # A panic of this boot shows as panic(cpu ...) if the console got it out;
+    # "A8 PANIC:" lines are the previous boot's panic, reported by this one.
+    s['panic'] = lines_with(text, 'SWEET EARLY PANIC', 'A5 XNU PANIC', 'panic(cpu')[:3]
+    s['prev_panic'] = lines_with(text, 'A8 PANIC:')[:3]
     s['failed_try'] = lines_with(text, 'FAILED:')[:2]
+    s['reset'] = (re.findall(r'reset cause ([0-9a-f]{8})', text) or [None])[-1]
     s['wdt'] = lines_with(text, 'A8 WDT:')[:1]
     checks = {
         'booted the wanted slot': want_slot is None or s['slot'] == want_slot,
@@ -188,14 +192,31 @@ def try_slot(seconds):
     time.sleep(3)
     send(['date %d' % int(time.time())])
     end = time.time() + seconds
+    ended = False
     while time.time() < end:
         text = last_boot_text()
-        if 'A8 PANIC' in text or ('disconnected' in text.split(' connected on ', 1)[-1]):
+        if 'disconnected' in text.split(' connected on ', 1)[-1]:
+            ended = True
             break
         time.sleep(5)
-    s = score(last_boot_text(), target)
+    s = score(text if ended else last_boot_text(), target)
     s['target'] = target
+    if ended:
+        # The try boot went away: wait for the fallback boot and keep what
+        # it says about the try (FAILED line, the try's panic message).
+        print('the try boot ended after %.0f s; waiting for the fallback' % (time.time() - t0))
+        pos = log_size()
+        back = wait_for(pos, lambda t: ' connected on ' in t, 420, 1)
+        if ' connected on ' in back:
+            time.sleep(20)
+            send(['date %d' % int(time.time())])
+            fb = score(last_boot_text())
+            s['fallback'] = {k: fb[k] for k in ('slot', 'why', 'reset', 'failed_try', 'prev_panic')}
+        else:
+            s['fallback'] = 'did not come back within 420 s'
     record(s)
+    if 'fallback' in s:
+        print('fallback:', s['fallback'])
     return s['pass']
 
 
