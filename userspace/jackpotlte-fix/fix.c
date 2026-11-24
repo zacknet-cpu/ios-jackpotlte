@@ -49,6 +49,14 @@
  * 393 pt iPhone 14 Pro the Dynamic Island needs) Control Center's module grid
  * (320 wide) was placed at x 0 instead of centered: CCUIScrollView centers it.
  *
+ * Auto-Lock (v8): with no CommCenter (no cellular here) SpringBoard's
+ * -[SBTelephonyManager _handleTelephonyDaemonRestart] retries once a second,
+ * and each retry ends in -[SBIdleTimerGlobalCoordinator resetIdleTimer]
+ * ("updateIdleTimerForReason: IdleTimerReset" ~once a second), so the
+ * Auto-Lock timer never ran out. A reset made inside that retry is dropped;
+ * the retries go on as before. The approach is Scion's (inject_sb.c,
+ * step 105).
+ *
  * View dump (v6): SIGUSR1 (console "kill NAME 30") makes the process write
  * every visible window's views to stderr, one line each: depth, class, frame
  * in window points, and a label's text ("A8VIEW ..."), seen with tee. It is
@@ -636,6 +644,53 @@ layout_apply(void)
 	}
 }
 
+/* ---- Auto-Lock (v8) --------------------------------------------------- */
+
+static void (*tel_restart_orig)(id, SEL, id);
+static void (*idle_reset_orig)(id, SEL);
+static int in_tel_restart;
+static unsigned long tel_dropped;
+
+static void
+tel_restart(id self, SEL cmd, id arg)
+{
+	in_tel_restart++;
+	tel_restart_orig(self, cmd, arg);
+	in_tel_restart--;
+}
+
+static void
+idle_reset(id self, SEL cmd)
+{
+	if (in_tel_restart > 0) {
+		if (tel_dropped++ == 0)
+			fix_put("A8FIX auto-lock: an idle-timer reset from the telephony retry dropped (no CommCenter here)\n");
+		return;
+	}
+	idle_reset_orig(self, cmd);
+}
+
+static int idle_done;
+
+static void
+idle_apply(void)
+{
+	Method m, r;
+
+	if (idle_done || objc_getClass("SBTelephonyManager") == 0 || objc_getClass("SBIdleTimerGlobalCoordinator") == 0)
+		return;
+	idle_done = 1;
+	m = class_getInstanceMethod(objc_getClass("SBTelephonyManager"), sel_registerName("_handleTelephonyDaemonRestart"));
+	r = class_getInstanceMethod(objc_getClass("SBIdleTimerGlobalCoordinator"), sel_registerName("resetIdleTimer"));
+	if (m == 0 || r == 0) {
+		fix_put("A8FIX auto-lock: methods not found, not hooked\n");
+		return;
+	}
+	tel_restart_orig = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)tel_restart);
+	idle_reset_orig = (void (*)(id, SEL))method_setImplementation(r, (IMP)idle_reset);
+	fix_put("A8FIX auto-lock: telephony retry resets dropped\n");
+}
+
 static void
 fix_image_added(const void *mh, long slide)
 {
@@ -644,6 +699,7 @@ fix_image_added(const void *mh, long slide)
 	fix_apply();
 	bl_apply();
 	layout_apply();
+	idle_apply();
 }
 
 /* ---- what UIKit and MobileGestalt think the screen is (a8fix-screen log) ---- */
@@ -906,6 +962,7 @@ fix_init(void)
 	fix_apply();
 	bl_apply();
 	layout_apply();
+	idle_apply();
 	/* (Control Center's module is a bundle loaded later: keep looking) */
 	_dyld_register_func_for_add_image(fix_image_added);
 	/* what the screen is, once UIKit is up (seen with the console's tee) */
