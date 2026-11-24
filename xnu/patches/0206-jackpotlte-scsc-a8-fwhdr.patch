@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index d5afdae..c703ffa 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -425,11 +425,16 @@ a5scsc_parse_fwhdr(const uint8_t *fw, uint32_t size,
+ 	}
+ 	/* fwhdr_is_valid() rejects a header whose advertised version is not the
+ 	 * one this driver was built for (fwhdr.c:44-45). */
+-	if (a5scsc_le16(fw + A5SCSC_FWHDR_VERSION_MAJOR_OFF) !=
+-	    A5SCSC_FWHDR_VERSION_MAJOR_EXPECT ||
+-	    a5scsc_le16(fw + A5SCSC_FWHDR_VERSION_MINOR_OFF) !=
+-	    A5SCSC_FWHDR_VERSION_MINOR_EXPECT) {
+-		return false;
++	{
++		uint16_t major = a5scsc_le16(fw + A5SCSC_FWHDR_VERSION_MAJOR_OFF);
++		uint16_t minor = a5scsc_le16(fw + A5SCSC_FWHDR_VERSION_MINOR_OFF);
++
++		if (!(major == A5SCSC_FWHDR_VERSION_MAJOR_EXPECT &&
++		    minor == A5SCSC_FWHDR_VERSION_MINOR_EXPECT) &&
++		    !(major == A5SCSC_FWHDR_VERSION_MAJOR_A8 &&
++		    minor == A5SCSC_FWHDR_VERSION_MINOR_A8)) {
++			return false;
++		}
+ 	}
+ 	if (a5scsc_le16(fw + A5SCSC_FWHDR_FWAPI_MAJOR_OFF) !=
+ 	    A5SCSC_FWHDR_FWAPI_MAJOR_EXPECT ||
+@@ -1210,19 +1215,32 @@ static void
+ a5scsc_bringup_thread(void *param __unused, wait_result_t wr __unused)
+ {
+ 	int attempt;
++	int err = ENOENT;
+ 
+ 	/* The staged iOS root may not be mounted yet; retry for a while.  A
+ 	 * missing image is not an error worth more than one line: the port stays
+ 	 * disabled and nothing else was touched. */
+ 	for (attempt = 0; attempt < 60 && !a5scsc.fw_loaded; attempt++) {
+-		if (a5scsc_load_firmware() == 0) {
++		err = a5scsc_load_firmware();
++		if (err == 0) {
+ 			break;
+ 		}
+ 		a5scsc_sleep_ms(500);
+ 	}
+ 	if (!a5scsc.fw_loaded) {
+-		printf("A5XELTE SCSC: firmware absent or invalid at %s; SCSC port disabled\n",
+-		    A5SCSC_FW_PATH);
++		/* 0206: say which check refused it (2 ENOENT = not there yet,
++		 * 27 EFBIG = over the MIF window, 22 EINVAL = header), with the
++		 * header fields the parser compares. */
++		const uint8_t *h = (const uint8_t *)a5scsc.mif;
++
++		printf("A5XELTE SCSC: firmware absent or invalid at %s (error %d"
++		    ", magic %c%c%c%c hdr %u.%u fwapi %u.%u); SCSC port disabled\n",
++		    A5SCSC_FW_PATH, err,
++		    h ? h[8] : '?', h ? h[9] : '?', h ? h[10] : '?', h ? h[11] : '?',
++		    h ? a5scsc_le16(h + A5SCSC_FWHDR_VERSION_MAJOR_OFF) : 0,
++		    h ? a5scsc_le16(h + A5SCSC_FWHDR_VERSION_MINOR_OFF) : 0,
++		    h ? a5scsc_le16(h + A5SCSC_FWHDR_FWAPI_MAJOR_OFF) : 0,
++		    h ? a5scsc_le16(h + A5SCSC_FWHDR_FWAPI_MINOR_OFF) : 0);
+ 		return;
+ 	}
+ 
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index 24e6da2..31c1696 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -169,6 +169,13 @@
+  * are the ones in the shipped mx140.bin (0.2 header, 0.2 firmware API). */
+ #define A5SCSC_FWHDR_VERSION_MAJOR_EXPECT 0     /* FWHDR:44 */
+ #define A5SCSC_FWHDR_VERSION_MINOR_EXPECT 2     /* FWHDR:45 */
++/* 0206: the A8's own mx140.bin (the phone's backup, build "6101|2020-11-1x",
++ * sha256 4f3ef775...) carries header version 1.0 at these offsets (bytes
++ * 12-15 = 00 00 01 00) with firmware API 0.2.  Android's driver ran it, so
++ * the header version it was built for is this one, not the 0.2 above (which
++ * came from another tree).  Both are accepted; the fwapi check is unchanged. */
++#define A5SCSC_FWHDR_VERSION_MAJOR_A8     1
++#define A5SCSC_FWHDR_VERSION_MINOR_A8     0
+ #define A5SCSC_FWHDR_FWAPI_MAJOR_EXPECT   0     /* MXMAN:61 */
+ #define A5SCSC_FWHDR_FWAPI_MINOR_EXPECT   2     /* MXMAN:62 */
+ 
