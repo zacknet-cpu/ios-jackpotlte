@@ -248,20 +248,20 @@ main(void)
       check("  and nothing was uploaded", !upload.called);
    }
 
-   /* 8. glca9: a copied surface its writer fills in after the first copy (an
-    *    app's SF Symbol, a 33x57 mask that came out empty) is copied again at
-    *    the next bind of its texture, and only when its seed has moved. */
+   /* 8. glca9: a copied surface its writer changes afterwards is copied again
+    *    at the next bind of its texture, and only when its seed has moved. */
    memset(&upload, 0, sizeof(upload));
    memset(captured, 0, sizeof(captured));
    {
       struct __IOSurface *s = surface_new(11, 0, 33, 57, 132, 4, 132 * 57);
       GLuint name = (GLuint)fake_texture;
 
-      memset(s->bytes, 0, s->alloc);              /* empty when first bound */
-      check("an empty 33x57 mask is copied",
+      memset(s->bytes, 0, s->alloc);
+      s->bytes[3] = 0x40;                          /* something in it */
+      check("a 33x57 mask is copied",
             surface_copy_texture(&eagl, s, 0, 0, GL_RGBA8, GL_BGRA,
                                  GL_UNSIGNED_BYTE, NO, "-t") == YES);
-      check("  and is empty", upload.called && captured[3] == 0);
+      check("  with its pixels", upload.called && captured[3] == 0x40);
       memset(&upload, 0, sizeof(upload));
       my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
       check("  a bind with the seed unmoved copies nothing",
@@ -279,6 +279,28 @@ main(void)
       s->seed++;
       my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
       check("  a deleted texture is forgotten", !upload.called);
+   }
+
+   /* 9. glca9d: a copy that came out empty is tried again at a bind even with
+    *    the seed unmoved, and stops being tried once it has pixels. */
+   memset(&upload, 0, sizeof(upload));
+   memset(captured, 0, sizeof(captured));
+   {
+      struct __IOSurface *s = surface_new(12, 0, 33, 57, 132, 4, 132 * 57);
+      GLuint name = (GLuint)fake_texture;
+
+      memset(s->bytes, 0, s->alloc);              /* empty when first bound */
+      check("an empty mask is copied",
+            surface_copy_texture(&eagl, s, 0, 0, GL_RGBA8, GL_BGRA,
+                                 GL_UNSIGNED_BYTE, NO, "-t") == YES);
+      s->bytes[3] = 0xff;                          /* filled, seed unmoved */
+      memset(&upload, 0, sizeof(upload));
+      my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
+      check("  a bind tries it again", upload.called && captured[3] == 0xff);
+      memset(&upload, 0, sizeof(upload));
+      my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
+      check("  and not once it has pixels", !upload.called);
+      my_glDeleteTextures(&eagl, 1, &name);
    }
 
    printf("\n%s\n", failures ? "FAILURES" : "all checks passed");

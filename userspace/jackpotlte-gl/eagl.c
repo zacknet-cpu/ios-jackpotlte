@@ -300,7 +300,11 @@ static struct {
    BOOL invert;
    int target;                         /* made by -attachImage: (drawn into) */
    int told;                           /* glca9c: its first draw was said */
+   int empty;                          /* glca9d: the copy had alpha 0 everywhere */
+   unsigned tries;                     /* copies made again while it stayed empty */
+   uint64_t next_try;
 } copied[COPIED_MAX];
+static int last_copy_alpha = -1;       /* alpha_max of the last surface copy */
 static unsigned copied_next, copied_used;
 static unsigned long recopies;
 static unsigned long draws, cleans, finishes, frames, forgotten;
@@ -1247,6 +1251,9 @@ copied_note(void *owner, int texture, IOSurfaceRef surface, uint32_t seed,
    copied[slot].invert = invert;
    copied[slot].target = target;
    copied[slot].told = 0;
+   copied[slot].empty = last_copy_alpha == 0;
+   copied[slot].tries = 0;
+   copied[slot].next_try = 0;
 }
 
 static int copy_again;                 /* surface_copy_texture from a bind: keep CA's filters */
@@ -1458,6 +1465,8 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
       tex_parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       tex_parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
    }
+   last_copy_alpha = (size_t)width * (size_t)height <= 512u * 512u ?
+      alpha_max(source, width, height, format, type) : -1;
    if (!copy_again)
       copied_note(e, bound_texture(e), surface, copy_seed, asked_width, asked_height,
                   asked_internal, asked_format, asked_type, invert,
@@ -1465,7 +1474,7 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
    if (copy_again)
       return YES;
    {
-      int alpha = alpha_max(source, width, height, format, type);
+      int alpha = last_copy_alpha;
       static unsigned empty_said;
 
       if (alpha == 0 && empty_said++ < 40)
@@ -1602,8 +1611,41 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
           copied[i].texture != (int)texture)
          continue;
       seed = IOSurfaceGetSeed(copied[i].surface);
-      if (seed == copied[i].seed)
+      if (seed == copied[i].seed) {
+         /*
+          * glca9d: a copy that came out empty (an app's SF Symbol: seed 1, no
+          * draw into it) is made again twice a second for 20 s, in case its
+          * writer fills it without moving the seed.
+          */
+         uint64_t now = mach_absolute_time();
+
+         if (!copied[i].empty || copied[i].tries >= 40 || now < copied[i].next_try)
+            break;
+         copied[i].tries++;
+         copied[i].next_try = now + 12000000ull;   /* 0.5 s of 24 MHz ticks */
+         copy_again = 1;
+         if (surface_copy_texture((struct jackpotlte_eagl *)context, copied[i].surface,
+                                  copied[i].width, copied[i].height, copied[i].internal,
+                                  copied[i].format, copied[i].type, copied[i].invert,
+                                  "retry") && last_copy_alpha > 0) {
+            copied[i].empty = 0;
+            recopies++;
+            say("copy: surface %u (%zux%zu) had pixels at try %u, seed still %u (alpha max %d)",
+                (unsigned)IOSurfaceGetID(copied[i].surface),
+                IOSurfaceGetWidth(copied[i].surface), IOSurfaceGetHeight(copied[i].surface),
+                copied[i].tries, seed, last_copy_alpha);
+         } else if (copied[i].tries == 40) {
+            static unsigned gave_up;
+
+            if (gave_up++ < 20)
+               say("copy: surface %u (%zux%zu) still empty after 40 tries (seed %u)",
+                   (unsigned)IOSurfaceGetID(copied[i].surface),
+                   IOSurfaceGetWidth(copied[i].surface), IOSurfaceGetHeight(copied[i].surface),
+                   seed);
+         }
+         copy_again = 0;
          break;
+      }
       was = copied[i].seed;
       copied[i].seed = seed;           /* a failed copy is not tried again until it moves again */
       copy_again = 1;
