@@ -1,0 +1,157 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 4fd8729..87e41d4 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -41,6 +41,9 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <sys/param.h>
++#include <kern/kalloc.h>
++#include <libkern/OSAtomic.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -298,11 +301,122 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * data (container paths, extension tokens) fail with ENOENT, except that
++ * the A8 issues and consumes extension tokens (below). The first use of
++ * each operation number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * A8 (0200): extension tokens. tccd issues one (op 5) to every app it lets
++ * into a protected class, and the app consumes it (op 6). With ENOENT here
++ * tccd logged "Failed to issue Sandbox Extension for kTCCServicePhotos", the
++ * Photos app was "not allowed to access Photo data", and PHPhotoLibrary
++ * failed with com.apple.photos.error 45002 (no Photos.sqlite was ever made).
++ * Nothing is sandboxed on this phone, so a token only has to be a
++ * well-formed string naming what it is for, and consuming one returns a new
++ * handle.
++ *
++ * libsystem_sandbox 20H392 (sandbox_extension_issue_*): op 5's argument is
++ *   { char *class; u64 type; char *item; u64 flags; char *token (0x800 B); i64 pid; u64 more }
++ * sandbox_extension_consume: op 6's argument is { char *token; u64 length; i64 *handle }.
++ */
++struct a8_sandbox_issue_args {
++	user64_addr_t   class_name;
++	uint64_t        type;
++	user64_addr_t   item;
++	uint64_t        flags;
++	user64_addr_t   token;
++	int64_t         pid;
++	uint64_t        more;
++};
++
++struct a8_sandbox_consume_args {
++	user64_addr_t   token;
++	uint64_t        length;
++	user64_addr_t   handle;
++};
++
++#define A8_SANDBOX_TOKEN_SIZE   0x800
++
++static volatile SInt64 a8_sandbox_serial;
++static volatile SInt64 a8_sandbox_handles;
++static volatile SInt32 a8_sandbox_said;
++
++static int
++a8_sandbox_issue(struct proc *p, user_addr_t arg)
++{
++	struct a8_sandbox_issue_args a;
++	char class_name[128] = "";
++	char *item, *token;
++	size_t length = 0;
++	int error;
++
++	if (!proc_is64bit(p)) {
++		return ENOTSUP;
++	}
++	error = copyin(arg, &a, sizeof(a));
++	if (error) {
++		return error;
++	}
++	if (a.token == 0) {
++		return EINVAL;
++	}
++	if (a.class_name != 0 && copyinstr(a.class_name, class_name, sizeof(class_name), &length) != 0) {
++		class_name[0] = '\0';
++	}
++	item = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	token = kalloc_data(A8_SANDBOX_TOKEN_SIZE, Z_WAITOK | Z_ZERO);
++	if (item == NULL || token == NULL) {
++		if (item != NULL) {
++			kfree_data(item, MAXPATHLEN);
++		}
++		if (token != NULL) {
++			kfree_data(token, A8_SANDBOX_TOKEN_SIZE);
++		}
++		return ENOMEM;
++	}
++	if (a.item != 0 && copyinstr(a.item, item, MAXPATHLEN, &length) != 0) {
++		item[0] = '\0';
++	}
++	/* the layout of a real token: hmac;flags;...;type;class;01;device;serial;item */
++	snprintf(token, A8_SANDBOX_TOKEN_SIZE,
++	    "0000000000000000000000000000000000000000;00;00000000;00000000;00000000;%016llx;%s;01;00000000;%016llx;%s",
++	    (unsigned long long)a.type, class_name,
++	    (unsigned long long)OSIncrementAtomic64(&a8_sandbox_serial) + 1, item);
++	error = copyout(token, a.token, strlen(token) + 1);
++	if (OSIncrementAtomic(&a8_sandbox_said) < 16) {
++		char name[32];
++
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("A8 SANDBOX: %s issues %s for %s (type %llu, pid %lld)%s\n", name, class_name,
++		    item[0] ? item : "-", (unsigned long long)a.type, (long long)a.pid, error ? " NOT copied out" : "");
++	}
++	kfree_data(item, MAXPATHLEN);
++	kfree_data(token, A8_SANDBOX_TOKEN_SIZE);
++	return error;
++}
++
++static int
++a8_sandbox_consume(user_addr_t arg)
++{
++	struct a8_sandbox_consume_args a;
++	int64_t handle;
++	int error;
++
++	error = copyin(arg, &a, sizeof(a));
++	if (error) {
++		return error;
++	}
++	handle = OSIncrementAtomic64(&a8_sandbox_handles) + 1;
++	if (a.handle != 0) {
++		error = copyout(&handle, a.handle, sizeof(handle));
++	}
++	return error;
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ {
+@@ -313,9 +427,16 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf(PORT_NAME " Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	case 5:         /* extension issue */
++		return a8_sandbox_issue(p, arg);
+ 	case 6:         /* extension consume */
++		return a8_sandbox_consume(arg);
++#else
++	case 5:         /* extension issue */
++	case 6:         /* extension consume */
++#endif
++	case 4:         /* container path (audit token / pid) */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
