@@ -31,6 +31,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mach-o/dyld.h>
+#include <mach/mach.h>
 #include <unistd.h>
 
 #define GL_TEXTURE_2D                           0x0de1
@@ -51,6 +53,7 @@
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME   0x8cd1
 #define GL_TEXTURE                              0x1702
 #define GL_VERTEX_ATTRIB_ARRAY_ENABLED          0x8622
+#define GL_BLEND                                0x0be2
 
 /* the library's own functions (not the table's: those are CoreAnimation's) */
 static struct {
@@ -80,6 +83,11 @@ static struct {
    void (*get_vertex_attribiv)(GLuint, GLenum, GLint *);
    void (*enable_vertex_attrib_array)(GLuint);
    void (*disable_vertex_attrib_array)(GLuint);
+   void (*uniform4fv)(GLint, GLsizei, const GLfloat *);
+   void (*uniform2fv)(GLint, GLsizei, const GLfloat *);
+   GLboolean (*is_enabled)(GLenum);
+   void (*enable)(GLenum);
+   void (*disable)(GLenum);
    int loaded;
 } gl;
 
@@ -148,6 +156,11 @@ load(void)
    PROC(get_vertex_attribiv, "glGetVertexAttribiv");
    PROC(enable_vertex_attrib_array, "glEnableVertexAttribArray");
    PROC(disable_vertex_attrib_array, "glDisableVertexAttribArray");
+   PROC(uniform4fv, "glUniform4fv");
+   PROC(uniform2fv, "glUniform2fv");
+   PROC(is_enabled, "glIsEnabled");
+   PROC(enable, "glEnable");
+   PROC(disable, "glDisable");
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -417,26 +430,226 @@ static const char table_fragment[] =
    "  result = vec4(clamp(both + over.rgb * (1. - under.a) + under.rgb * (1. - over.a), 0., opacity), opacity);\n"
    "}\n";
 
+
+/*
+ * Programs for CoreAnimation "functions" its OpenGL ES renderer has no shader
+ * for (Scion's eagl.c, MIT). Which function a draw is comes from CA's
+ * GLContext (hooks below): the byte at *(*(context + 0x10) + 0x10).
+ *
+ *   vcm (45)  vibrantColorMatrix: a colour matrix over what is behind, by the
+ *             layer's alpha (the lock screen's clock and its dimming
+ *             gradient). Reads the framebuffer (EXT_shader_framebuffer_fetch).
+ *   c4p (20)  colorMatrix over premultiplied pixels (masks of the clock digits).
+ *   sb3 (40)  four samples around a point (shadow blur).
+ *   ds8 (28)  eight times smaller in one go (first step of backdrop blur).
+ */
+static const char vibrant_fragment[] =
+   "#version 300 es\n"
+   "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+   "uniform lowp sampler2D texture0;\n"
+   "uniform mediump vec4 colours[5];\n"
+   "in lowp vec4 color;\n"
+   "in highp vec2 texcoord;\n"
+   "layout(location = 0) inout highp vec4 result;\n"
+   "void main() {\n"
+   "  mediump vec4 layer = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+   "  mediump vec4 behind = result, s = behind;\n"
+   "  s.rgb = s.rgb / max(s.a, .005);\n"
+   "  s = s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4];\n"
+   "  s.a = clamp(s.a, 0., 1.);\n"
+   "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
+   "  result = mix(behind, s, layer.a);\n"
+   "}\n";
+
+static const char masking_fragment[] =
+   "#version 300 es\n"
+   "uniform lowp sampler2D texture0;\n"
+   "uniform mediump vec4 colours[5];\n"
+   "in lowp vec4 color;\n"
+   "in highp vec2 texcoord;\n"
+   "out lowp vec4 result;\n"
+   "void main() {\n"
+   "  mediump vec4 s = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+   "  result = clamp(s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4], 0., 1.);\n"
+   "}\n";
+
+static const char blur4_fragment[] =
+   "#version 300 es\n"
+   "uniform lowp sampler2D texture0;\n"
+   "uniform highp vec2 places[4];\n"
+   "in lowp vec4 color;\n"
+   "in highp vec2 texcoord;\n"
+   "out lowp vec4 result;\n"
+   "void main() {\n"
+   "  highp vec2 middle = texcoord / vec2(textureSize(texture0, 0));\n"
+   "  result = .25 * (texture(texture0, middle + places[0]) + texture(texture0, middle + places[1]) +\n"
+   "      texture(texture0, middle + places[2]) + texture(texture0, middle + places[3]));\n"
+   "}\n";
+
+static const char box_fragment[] =
+   "#version 300 es\n"
+   "uniform lowp sampler2D texture0;\n"
+   "uniform highp vec2 places[4];\n"
+   "in lowp vec4 color;\n"
+   "in highp vec2 texcoord;\n"
+   "out lowp vec4 result;\n"
+   "void main() {\n"
+   "  highp vec2 middle = texcoord / vec2(textureSize(texture0, 0));\n"
+   "  highp vec4 sum = vec4(0.);\n"
+   "  for (int i = 0; i < 4; i++) {\n"
+   "    sum += texture(texture0, middle + places[i]) + texture(texture0, middle - places[i]);\n"
+   "    sum += texture(texture0, middle + places[i] * vec2(1., -1.)) + texture(texture0, middle + places[i] * vec2(-1., 1.));\n"
+   "  }\n"
+   "  result = sum * .0625;\n"
+   "}\n";
+
+#define FUNCTION_MATRIX_PREMULTIPLIED   20
+#define FUNCTION_DOWNSAMPLE_8           28
+#define FUNCTION_SHADOW_BLUR            40
+#define FUNCTION_VIBRANT_MATRIX         45
+#define FUNCTION_HOME_AFFORDANCE        53
+#define FUNCTION_CUSTOM                 89
+#define FUNCTIONS                       90
+
+static const char function_names[] =
+   "clr img ida cim cid mua m1a lrp lrc lra add spl s1a cma bds bco bim c33 c3b c4b c4p c3a c3x c4x bia grl ds4 ds6 "
+   "ds8 ups db2 db4 nb7 n11 n15 n19 n23 n27 vrd vrb sb3 axl rad rac con vcm vdk vlt map mpc crv hue clm hom opa met "
+   "srl ega sdr alt p3c edr hrm lut ovr ovl lub aup alm stl pc0 pc1 prc psl ps0 ps1 psm psr pcr pbl peo bib asg a75 "
+   "a50 atc ipc apl 3dl cst ";
+
+static void *ca_context;                       /* CA's GLContext, from the hooks */
+static GLfloat function_values[FUNCTIONS][20];
+static uint8_t function_given[FUNCTIONS];
+
+static unsigned
+current_function(void)
+{
+   if (ca_context == NULL)
+      return FUNCTIONS;                         /* not known */
+   return *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10);
+}
+
+/* ---- hooks into CoreAnimation's GLES context (QuartzCore 20H392) -------- */
+
+#define VT_GLES_CONTEXT         0x1d5b2f6e8UL   /* vtable for CA::OGL::GLESContext */
+#define VSLOT(offset)           (VT_GLES_CONTEXT + 0x10 + (offset))
+#define FUNCTION_SUPPORTED      0x1884b2164UL   /* its entry at 0x378 */
+#define FUNCTION_UNIFORM        0x1884b21acUL   /* its entry at 0x388 */
+
+static int (*orig_function_supported)(void *context);
+static void (*orig_function_uniform)(void *context, unsigned index, size_t components, size_t count,
+                                     const float *values);
+
+static int
+my_function_supported(void *context)
+{
+   static uint8_t said[256];
+   int supported = orig_function_supported(context);
+   unsigned function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
+
+   ca_context = context;
+   if (!supported && !said[function & 0xff]) {
+      said[function & 0xff] = 1;
+      say("CA has no shader for function %u (\"%.3s\"): what needs it is not drawn", function,
+          function < FUNCTIONS ? function_names + 4 * function : "?");
+   }
+   return supported;
+}
+
+static void
+my_function_uniform(void *context, unsigned index, size_t components, size_t count, const float *values)
+{
+   static uint8_t said[FUNCTIONS];
+   unsigned function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
+
+   ca_context = context;
+   if (function < FUNCTIONS && index == 0 && components * count <= 20) {
+      memcpy(function_values[function], values, components * count * sizeof(values[0]));
+      function_given[function] = (uint8_t)(components * count);
+      if (!said[function]) {
+         said[function] = 1;
+         say("CA gives function %u (\"%.3s\") %zu numbers", function, function_names + 4 * function,
+             components * count);
+      }
+   }
+   orig_function_uniform(context, index, components, count, values);
+}
+
+static intptr_t
+quartzcore_slide(void)
+{
+   for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+      const char *name = _dyld_get_image_name(i);
+
+      if (name != NULL && strstr(name, "/QuartzCore.framework/QuartzCore") != NULL)
+         return _dyld_get_image_vmaddr_slide(i);
+   }
+   return -1;
+}
+
+/* one vtable entry (unslid `slot`) that must hold `expected`: replaced */
+static uintptr_t
+replace_virtual(const char *what, intptr_t slide, uintptr_t slot, uintptr_t expected, uintptr_t replacement)
+{
+   uintptr_t *entry = (uintptr_t *)(slot + slide);
+   vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+   uintptr_t original;
+
+   if (*entry != expected + slide) {
+      say("hook %s: found %#lx, expected %#lx; left alone", what, (unsigned long)(*entry - slide),
+          (unsigned long)expected);
+      return 0;
+   }
+   if (vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+      say("hook %s: the table cannot be made writable", what);
+      return 0;
+   }
+   original = *entry;
+   *entry = replacement;
+   vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+   return original;
+}
+
+static void
+hook_coreanimation(void)
+{
+   intptr_t slide = quartzcore_slide();
+
+   if (slide == -1) {
+      say("hooks: QuartzCore not found");
+      return;
+   }
+   orig_function_supported = (int (*)(void *))replace_virtual("function_supported", slide,
+         VSLOT(0x378), FUNCTION_SUPPORTED, (uintptr_t)my_function_supported);
+   orig_function_uniform = (void (*)(void *, unsigned, size_t, size_t, const float *))replace_virtual(
+         "function_uniform", slide, VSLOT(0x388), FUNCTION_UNIFORM, (uintptr_t)my_function_uniform);
+   say("hooks: function_supported %s, function_uniform %s", orig_function_supported ? "on" : "OFF",
+       orig_function_uniform ? "on" : "OFF");
+}
+
 static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 
 /* the matrix CoreAnimation last gave a program of its own (always from the
  * same place of its, so the pointer stays good) */
 static const GLfloat *ca_matrix;
 
-static struct {
+struct our_program {
    GLuint program;
    GLint matrix;
+   GLint numbers;      /* "colours" or "places", -1 if none */
    int tried;
-} plain, table;
+};
+static struct our_program plain, table, vibrant, masking, blur4, box;
 
 static void
-make_program(const char *fragment, const char *what, GLuint *program, GLint *matrix, int *tried)
+make_program(struct our_program *our, const char *fragment, const char *numbers, const char *what)
 {
    GLuint p, shader;
    const GLchar *text;
    GLint good = 0;
 
-   *tried = 1;
+   our->tried = 1;
    p = gl.create_program();
    shader = gl.create_shader(GL_VERTEX_SHADER);
    text = plain_vertex;
@@ -454,10 +667,18 @@ make_program(const char *fragment, const char *what, GLuint *program, GLint *mat
    gl.link_program(p);
    gl.get_programiv(p, GL_LINK_STATUS, &good);
    say("a program of ours for draws with no program (%s): %s", what, good ? "made" : "NOT MADE");
-   if (!good)
+   if (!good) {
+      char words[512] = "";
+
+      if (gl.get_shader_info_log != NULL)
+         gl.get_shader_info_log(shader, sizeof(words), NULL, words);
+      if (words[0] != '\0')
+         say("  its fragment shader: %s", words);
       return;
-   *program = p;
-   *matrix = gl.get_uniform_location(p, "vertex_matrix");
+   }
+   our->program = p;
+   our->matrix = gl.get_uniform_location(p, "vertex_matrix");
+   our->numbers = numbers != NULL ? gl.get_uniform_location(p, numbers) : -1;
    gl.use_program(p);
    gl.uniform1i(gl.get_uniform_location(p, "texture0"), 0);
    if (fragment == table_fragment)
@@ -471,7 +692,8 @@ procs_for_plain(void)
           gl.attach_shader && gl.bind_attrib_location && gl.link_program && gl.get_programiv &&
           gl.get_uniform_location && gl.use_program && gl.uniform_matrix4fv && gl.uniform1i &&
           gl.get_integerv && gl.active_texture && gl.get_vertex_attribiv &&
-          gl.enable_vertex_attrib_array && gl.disable_vertex_attrib_array;
+          gl.enable_vertex_attrib_array && gl.disable_vertex_attrib_array &&
+          gl.uniform4fv && gl.uniform2fv && gl.is_enabled && gl.enable && gl.disable;
 }
 
 /* the texture the bound framebuffer draws into, or 0 */
@@ -495,15 +717,30 @@ colour_texture(void)
 struct plain_state {
    GLint active;
    GLint enabled[3];
+   GLboolean blended;   /* blending was on and our program blends itself */
 };
+
+/* a census: each function the first time it is met with no program */
+static void
+census(unsigned function, const char *how)
+{
+   static uint8_t said[FUNCTIONS + 1];
+   unsigned at = function < FUNCTIONS ? function : FUNCTIONS;
+
+   if (said[at])
+      return;
+   said[at] = 1;
+   say("no-program draw of function %u (\"%.3s\"): %s", function,
+       function < FUNCTIONS ? function_names + 4 * function : "?", how);
+}
 
 /* true: our program is in use for this draw (plain_end puts things back) */
 static bool
 plain_begin(void *context, struct plain_state *state)
 {
-   static unsigned said_plain, said_skip;
    GLint program = 0, texture0 = 0, texture1 = 0, rows = 0;
-   bool use_table;
+   struct our_program *our = NULL;
+   unsigned function;
 
    if (!plain_on)
       return false;
@@ -514,6 +751,7 @@ plain_begin(void *context, struct plain_state *state)
    gl.get_integerv(GL_CURRENT_PROGRAM, &program);
    if (program != 0)
       return false;
+   function = current_function();
 
    gl.get_integerv(GL_ACTIVE_TEXTURE, &state->active);
    gl.active_texture(GL_TEXTURE0 + 1);
@@ -523,43 +761,84 @@ plain_begin(void *context, struct plain_state *state)
    gl.active_texture(GL_TEXTURE0);
    gl.get_integerv(GL_TEXTURE_BINDING_2D, &texture0);
 
-   /* no texture, or one that is also what is drawn into: left alone, as
-    * before (Scion: such draws painted white or read unwritten memory) */
+   /* no texture, or one that is also what is drawn into: left alone (Scion:
+    * such draws painted white or read unwritten memory) */
    if (texture0 == 0 || texture0 == colour_texture()) {
       gl.active_texture((GLenum)state->active);
-      if (said_skip++ < 4)
-         say("a draw with no program left alone (texture %d)", texture0);
+      census(function, texture0 == 0 ? "no texture, not drawn" : "reads what it writes, not drawn");
       return false;
    }
 
-   use_table = texture1 != 0 && rows == 1;
-   if (use_table && !table.tried)
-      make_program(table_fragment, "through a table", &table.program, &table.matrix, &table.tried);
-   if (!use_table && !plain.tried)
-      make_program(plain_fragment, "as they are", &plain.program, &plain.matrix, &plain.tried);
-   if ((use_table ? table.program : plain.program) == 0) {
+   if (function == FUNCTION_VIBRANT_MATRIX && function_given[function] == 20) {
+      if (!vibrant.tried)
+         make_program(&vibrant, vibrant_fragment, "colours", "colour matrix over what is behind");
+      our = &vibrant;
+   } else if (function == FUNCTION_MATRIX_PREMULTIPLIED && function_given[function] == 20) {
+      if (!masking.tried)
+         make_program(&masking, masking_fragment, "colours", "colour matrix, premultiplied");
+      our = &masking;
+   } else if (function == FUNCTION_SHADOW_BLUR && function_given[function] == 8) {
+      if (!blur4.tried)
+         make_program(&blur4, blur4_fragment, "places", "four samples around a point");
+      our = &blur4;
+   } else if (function == FUNCTION_DOWNSAMPLE_8 && function_given[function] == 8) {
+      if (!box.tried)
+         make_program(&box, box_fragment, "places", "eight times smaller");
+      our = &box;
+   } else if (function == FUNCTION_VIBRANT_MATRIX || function == FUNCTION_MATRIX_PREMULTIPLIED ||
+              function == FUNCTION_SHADOW_BLUR || function == FUNCTION_DOWNSAMPLE_8 ||
+              (function < FUNCTIONS && function != FUNCTION_CUSTOM &&
+               function != FUNCTION_HOME_AFFORDANCE && !(texture1 != 0 && rows == 1))) {
+      /* a function we have no stand-in for: drawn as a picture it made a
+       * red veil (vcm) or blocks (the blur chain), so it is left out */
+      gl.active_texture((GLenum)state->active);
+      census(function, "no stand-in, not drawn");
+      return false;
+   } else if (texture1 != 0 && rows == 1) {
+      if (!table.tried)
+         make_program(&table, table_fragment, NULL, "through a table");
+      our = &table;
+   } else {
+      if (!plain.tried)
+         make_program(&plain, plain_fragment, NULL, "as they are");
+      our = &plain;
+   }
+   if (our->program == 0) {
       gl.use_program(0);
       gl.active_texture((GLenum)state->active);
+      census(function, "our program did not build, not drawn");
       return false;
    }
 
-   gl.use_program(use_table ? table.program : plain.program);
-   gl.uniform_matrix4fv(use_table ? table.matrix : plain.matrix, 1, 0,
-                        ca_matrix != NULL ? ca_matrix : identity);
+   gl.use_program(our->program);
+   gl.uniform_matrix4fv(our->matrix, 1, 0, ca_matrix != NULL ? ca_matrix : identity);
+   if (our == &vibrant || our == &masking)
+      gl.uniform4fv(our->numbers, 5, function_values[function]);
+   else if (our == &blur4 || our == &box)
+      gl.uniform2fv(our->numbers, 4, function_values[function]);
+   state->blended = 0;
+   if (our == &vibrant && gl.is_enabled(GL_BLEND)) {
+      state->blended = 1;      /* the program mixes by itself */
+      gl.disable(GL_BLEND);
+   }
    for (GLuint i = 0; i < 3; i++) {
       gl.get_vertex_attribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &state->enabled[i]);
       if (!state->enabled[i])
          gl.enable_vertex_attrib_array(i);
    }
-   if (said_plain++ < 6)
-      say("a draw with no program drawn with ours (%s): texture %d, unit-1 texture %d",
-          use_table ? "table" : "plain", texture0, texture1);
+   census(function, our == &plain ? "drawn as the picture (colour times texture)" :
+                    our == &table ? "drawn through the table (home indicator)" :
+                    our == &vibrant ? "drawn with our vibrant colour matrix" :
+                    our == &masking ? "drawn with our premultiplied colour matrix" :
+                    our == &blur4 ? "drawn with our four-sample blur" : "drawn with our 8x downsample");
    return true;
 }
 
 static void
 plain_end(struct plain_state *state)
 {
+   if (state->blended)
+      gl.enable(GL_BLEND);
    for (GLuint i = 0; i < 3; i++) {
       if (!state->enabled[i])
          gl.disable_vertex_attrib_array(i);
@@ -612,6 +891,8 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
       plain_on = access("/private/var/mobile/Library/a8gl-noplain", F_OK) != 0;
       say("ca fixes: glsl rewrite %s, no-program draws %s", glsl_on ? "on" : "off",
           plain_on ? "on" : "off");
+      if (access("/private/var/mobile/Library/a8gl-nohooks", F_OK) != 0)
+         hook_coreanimation();
    }
    /* (memcpy: a void * is not a function pointer to ISO C) */
    memcpy(&next_draw_arrays, &table_entries[0x042], sizeof(next_draw_arrays));
