@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
+index 4dbdbbd..24fb13b 100644
+--- a/bsd/dev/jackpotlte_pmic.c
++++ b/bsd/dev/jackpotlte_pmic.c
+@@ -6,8 +6,9 @@
+  * fallback.
+  *
+  * The fuel gauge and the sub-PMIC/MUIC (s2mu004) sit on ordinary S3C2440 I2C
+- * buses that S-Boot leaves muxed; they are read with the same polled transfer
+- * the A5 touch driver uses (bsd/dev/a5xelte_touch.c:224-318).
++ * buses whose pads S-Boot leaves as GPIOs (jp_mux_pads, 0205, puts them back
++ * to I2C); they are read with the same polled transfer the A5 touch driver
++ * uses (bsd/dev/a5xelte_touch.c:224-318).
+  *
+  * The main PMIC (s2mpu08) is reached through the ACPM mailbox, not I2C
+  * (exynos7885-jackpotlte_common.dtsi:196-198, acpm_mfd.c:20,
+@@ -168,6 +169,71 @@ static vm_offset_t jp_chg;
+ static LCK_GRP_DECLARE(jp_grp, "jackpotlte_pmic");
+ static LCK_MTX_DECLARE(jp_lock, &jp_grp);
+ 
++/*
++ * 0205: the pads.  S-Boot reads the gauge by bit-banging gpp1 and leaves all
++ * four pads as GPIO outputs driven high (GPP1CON 0x1111, PUD 0x3300, read on
++ * the phone with the console's peek).  The S3C controllers then never see
++ * their own SCL come back and stall after START: every boot logged "address
++ * timeout addr=0x76 stat=0xf0" and the same for 0x7a.  The vendor kernel's
++ * pinctrl default state is what Android runs with: i2c0-bus = gpp1-0/1 and
++ * i2c1-bus = gpp1-2/3, function 2, pull-up (pud 3), from the phone's own FDT
++ * (pinctrl@139B0000/i2c0-bus, i2c1-bus).  gpp1 is the third bank of
++ * pinctrl@139B0000 (gpp0 0x000, gpg0 0x020, gpp1 0x040; gpp4 at 0x0a0 is the
++ * touch bus, a5xelte_touch.c).  The same pokes on the running phone made
++ * both chips ACK their addresses.  Pull-ups go on before the function switch
++ * so the lines stay high across it; drive strength stays as S-Boot set it
++ * (that is the state that was tested).  A bus left with START latched is
++ * reset afterwards.  a8pmicmux=0 leaves the pads alone.
++ */
++#define JT_PINCTRL3_PA		0x139b0000u
++#define JT_GPP1_OFF		0x040u
++#define JT_PIN_CON		0x00u
++#define JT_PIN_PUD		0x08u
++#define JT_GPP1_I2C_CON		0x2222u		/* gpp1-0..3: function 2 */
++#define JT_GPP1_I2C_PUD		0x3333u		/* gpp1-0..3: pull-up     */
++
++static void jp_reset_bus(vm_offset_t i2c);
++
++static void
++jp_mux_pads(void)
++{
++	static bool done;
++	int on = 1;
++	vm_offset_t pc;
++	uint32_t con, pud;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	(void)PE_parse_boot_argn("a8pmicmux", &on, sizeof(on));
++	pc = ml_io_map(JT_PINCTRL3_PA, 0x1000u);
++	if (!pc) {
++		printf("JACKPOTLTE PMIC: pinctrl map failed, pads not set\n");
++		return;
++	}
++	con = jp_read(pc, JT_GPP1_OFF + JT_PIN_CON);
++	pud = jp_read(pc, JT_GPP1_OFF + JT_PIN_PUD);
++	if (!on) {
++		printf("JACKPOTLTE PMIC: pads left as S-Boot set them "
++		    "(a8pmicmux=0): gpp1 con %#x pud %#x\n", con, pud);
++		return;
++	}
++	jp_write(pc, JT_GPP1_OFF + JT_PIN_PUD,
++	    (pud & ~0xffffu) | JT_GPP1_I2C_PUD);
++	jp_write(pc, JT_GPP1_OFF + JT_PIN_CON,
++	    (con & ~0xffffu) | JT_GPP1_I2C_CON);
++	printf("JACKPOTLTE PMIC: gpp1 pads to I2C: con %#x -> %#x, "
++	    "pud %#x -> %#x\n", con, jp_read(pc, JT_GPP1_OFF + JT_PIN_CON),
++	    pud, jp_read(pc, JT_GPP1_OFF + JT_PIN_PUD));
++	if (jp_fg) {
++		jp_reset_bus(jp_fg);
++	}
++	if (jp_chg) {
++		jp_reset_bus(jp_chg);
++	}
++}
++
+ static bool
+ jp_map(void)
+ {
+@@ -177,6 +243,9 @@ jp_map(void)
+ 	if (!jp_chg) {
+ 		jp_chg = ml_io_map(JT_I2C_CHARGER_PA, JT_I2C_WINDOW);
+ 	}
++	if (jp_fg && jp_chg) {
++		jp_mux_pads();
++	}
+ 	return jp_fg && jp_chg;
+ }
+ 
