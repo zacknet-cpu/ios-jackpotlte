@@ -418,6 +418,7 @@ static struct {
    uint64_t frame_start, frame_done;   /* mach time of this frame's first draw, of the last frame's end */
    unsigned long on_big, on_cpu;       /* glca8: draws made on the big cores (cpu 6, 7), of all sampled */
    unsigned long on[8];                /* draws made on each cpu */
+   uint64_t latch, latch_max;          /* glca13: us waited for the panel to take the last frame */
 } perf;
 
 /* the CPU this thread runs on (XNU keeps it in TPIDRRO_EL0's low bits) */
@@ -434,6 +435,52 @@ cpu_now(void)
 #endif
 }
 static unsigned long perf_lines;
+
+/*
+ * glca13: kernel 0203's async SwapEnd.  SwapEnd used to wait for the panel to
+ * take each frame (up to a refresh), so CoreAnimation, whose frames start on
+ * the display's ticks, missed the next tick and most frames were two refreshes
+ * apart.  With kern.a8_flip_async = 1 SwapEnd returns at once, and a frame
+ * waits for the panel (kern.a8_flip_wait) only right before it goes to the
+ * GPU, so its CPU work overlaps the refresh and the GPU never draws into the
+ * buffer the panel still shows.  Switch: a8gl-async "0" keeps the old way.
+ */
+static int flip_async = -1;
+
+static int
+flip_async_on(void)
+{
+   if (flip_async < 0) {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-async", "r");
+      int c = f != NULL ? fgetc(f) : EOF, one = 1;
+
+      if (f != NULL)
+         fclose(f);
+      flip_async = 0;
+      if (c != '0' && sysctlbyname("kern.a8_flip_async", NULL, NULL, &one, sizeof(one)) == 0)
+         flip_async = 1;
+      say("glca13: SwapEnd %s", flip_async ? "async: a frame waits for the panel only before its GPU work"
+          : c == '0' ? "waits for the panel (a8gl-async \"0\")"
+          : "waits for the panel (no kern.a8_flip_async: kernel before 0203)");
+   }
+   return flip_async;
+}
+
+/* glca13: before a frame goes to the GPU, the panel's last update taken */
+static void
+flip_settle(void)
+{
+   uint32_t us = 0;
+   size_t size = sizeof(us);
+
+   if (flip_async_on() <= 0)
+      return;
+   if (sysctlbyname("kern.a8_flip_wait", &us, &size, NULL, 0) == 0) {
+      perf.latch += us;
+      if (us > perf.latch_max)
+         perf.latch_max = us;
+   }
+}
 
 static uint64_t
 ticks_us(uint64_t ticks)
@@ -476,8 +523,9 @@ perf_frame(void)
       return;
    n = perf.frames;
    if (perf_lines++ < 3000)
+      /* glca13: the cpu counts (always cpu 0 here) gave way to the panel wait */
       say("perf: %llu ms %lu fr %lu dr/fr; gaps 17/34/50/100+ %lu/%lu/%lu/%lu/%lu; "
-          "gpu %llu us (max %llu) build %llu btw %llu flush %llu cache %llu; big %lu%% cpus %lu %lu %lu %lu %lu %lu %lu %lu; f%d s%d",
+          "gpu %llu us (max %llu) build %llu btw %llu flush %llu cache %llu; panel %llu (max %llu) a%d; f%d s%d",
           (unsigned long long)(us / 1000), n, perf.draws / n,
           perf.gaps[0], perf.gaps[1], perf.gaps[2], perf.gaps[3], perf.gaps[4],
           (unsigned long long)(ticks_us(perf.wait) / n),
@@ -486,9 +534,8 @@ perf_frame(void)
           (unsigned long long)(ticks_us(perf.between) / n),
           (unsigned long long)(ticks_us(perf.flush) / n),
           (unsigned long long)(ticks_us(perf.clean) / n),
-          perf.on_cpu ? perf.on_big * 100 / perf.on_cpu : 0,
-          perf.on[0], perf.on[1], perf.on[2], perf.on[3], perf.on[4], perf.on[5], perf.on[6], perf.on[7],
-          flush_mode(), sync_mode());
+          (unsigned long long)(perf.latch / n), (unsigned long long)perf.latch_max,
+          flip_async, flush_mode(), sync_mode());
    {
       uint64_t done = perf.frame_done;
 
@@ -659,7 +706,10 @@ frame_end(const char *why, int finished)
       void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
 
       if (finish != NULL) {
-         uint64_t t0 = mach_absolute_time(), t;
+         uint64_t t0, t;
+
+         flip_settle();            /* glca13: before the batch goes to the GPU */
+         t0 = mach_absolute_time();
 
          finish();
          finishes++;
@@ -759,6 +809,8 @@ my_glFlush(void *context)
       real = (void (*)(void))jackpotlte_gl_proc("glFlush");
    if (sync_mode() != 0)
       shared_sync();
+   if (frame_drawn)
+      flip_settle();               /* glca13: the flush sends the batch to the GPU */
    if (real != NULL)
       real();
    frame_end("glFlush", 0);
@@ -774,6 +826,8 @@ my_glFinish(void *context)
       real = (void (*)(void))jackpotlte_gl_proc("glFinish");
    if (sync_mode() != 0)
       shared_sync();
+   if (frame_drawn)
+      flip_settle();               /* glca13 */
    if (real != NULL) {
       real();
       finishes++;
