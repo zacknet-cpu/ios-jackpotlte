@@ -307,6 +307,35 @@ static struct {
 static int last_copy_alpha = -1;       /* alpha_max of the last surface copy */
 static unsigned copied_next, copied_used;
 static unsigned long recopies, reordered;
+
+/*
+ * glca12: the pixel format a wrapped surface was made with (kernel 0202,
+ * sysctl kern.a8_wrap_format: write the surface id, read the format).  A
+ * wrapped surface says pixel format 0 so that it comes through the copy
+ * below; this is what its bytes really are.  0 when the kernel has no such
+ * sysctl (before 0202) or the surface is not a wrap.
+ */
+static uint32_t
+wrap_format(uint32_t id)
+{
+   static int absent = -1;
+   uint32_t format = 0;
+   size_t size = sizeof(format);
+
+   if (absent < 0) {
+      int mib[CTL_MAXNAME];
+      size_t count = CTL_MAXNAME;
+
+      absent = sysctlnametomib("kern.a8_wrap_format", mib, &count) != 0;
+      say("glca12: kern.a8_wrap_format %s", absent ? "absent (kernel before 0202): "
+          "A,B,G,R found by the premultiplied rule" : "present: wrapped surfaces say their format");
+   }
+   if (absent || id == 0)
+      return 0;
+   if (sysctlbyname("kern.a8_wrap_format", &format, &size, &id, sizeof(id)) != 0)
+      return 0;
+   return format;
+}
 static unsigned long draws, cleans, finishes, frames, forgotten;
 static int frame_drawn;                /* a draw since the last frame_end() */
 
@@ -1441,8 +1470,50 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
     */
    if (pixels == 0 && bpp == 4 && format == GL_BGRA && type == GL_UNSIGNED_BYTE) {
       size_t n = (size_t)width * (size_t)height, as_bgra = 0, as_abgr = 0, lit = 0;
-      static unsigned said;
+      static unsigned said, said_declared;
+      static uint32_t seen[16];
+      static unsigned nseen;
+      const uint32_t declared = wrap_format((uint32_t)IOSurfaceGetID(surface));
+      const char fourcc[5] = { (char)(declared >> 24), (char)(declared >> 16),
+                               (char)(declared >> 8), (char)declared, 0 };
+      int known = 0;
 
+      /* glca12: the first surface of each wrap format, once */
+      for (unsigned i = 0; i < nseen; i++)
+         known |= seen[i] == declared;
+      if (!known && nseen < 16) {
+         seen[nseen++] = declared;
+         say("%s: surface %u (%dx%d) is a wrap of '%s' (0x%x)", method,
+             (unsigned)IOSurfaceGetID(surface), width, height, declared ? fourcc : "----", declared);
+      }
+      if (declared == 0x41424752u || declared == 0x41524742u || declared == 0x52474241u) {
+         /* glca12: 'ABGR', 'ARGB' or 'RGBA' bytes, said by the kernel: put in
+          * B,G,R,A order without guessing */
+         for (size_t i = 0; i < n; i++) {
+            unsigned char *q = packed + 4 * i, t;
+
+            if (declared == 0x41424752u) {          /* A,B,G,R */
+               t = q[0];
+               q[0] = q[1];
+               q[1] = q[2];
+               q[2] = q[3];
+               q[3] = t;
+            } else if (declared == 0x41524742u) {   /* A,R,G,B */
+               t = q[0];
+               q[0] = q[3];
+               q[3] = t;
+               t = q[1];
+               q[1] = q[2];
+               q[2] = t;
+            } else {                                /* R,G,B,A */
+               t = q[0];
+               q[0] = q[2];
+               q[2] = t;
+            }
+         }
+         reordered++;
+         n = 0;      /* no premultiplied check below */
+      }
       for (size_t i = 0; i < n; i++) {
          const unsigned char *q = packed + 4 * i;
          unsigned char m012 = q[0] > q[1] ? q[0] : q[1], m123 = q[1] > q[2] ? q[1] : q[2];
@@ -1469,6 +1540,9 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
             say("%s: surface %u (%dx%d) holds A,B,G,R bytes (%zu of %zu pixels break B,G,R,A): "
                 "put in B,G,R,A order, %lu so far", method, (unsigned)IOSurfaceGetID(surface),
                 width, height, as_bgra, n, reordered);
+         if (declared != 0 && said_declared++ < 12)
+            say("%s: glca12: surface %u says '%s' (0x%x) but its bytes are A,B,G,R by the "
+                "premultiplied rule", method, (unsigned)IOSurfaceGetID(surface), fourcc, declared);
       }
    }
 
