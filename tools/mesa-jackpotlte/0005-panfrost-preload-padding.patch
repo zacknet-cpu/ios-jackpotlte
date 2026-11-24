@@ -1,0 +1,15 @@
+--- a/src/gallium/drivers/panfrost/pan_fb_preload.c
++++ b/src/gallium/drivers/panfrost/pan_fb_preload.c
+@@ -873,7 +873,11 @@
+    }
+ 
+    if (padding_buffer) {
+-      pan_cast_and_pack(varying_buffer.cpu + pan_size(ATTRIBUTE_BUFFER),
++      /* jackpotlte: the macro casts its first argument without parentheses,
++       * so "cpu + pan_size()" was scaled by the descriptor size: the padding
++       * descriptor went 256 bytes past a 32-byte allocation (backboardd
++       * SIGBUS at a pool buffer's end, 11-22..24).  Byte offset 16 is meant. */
++      pan_cast_and_pack(((uint8_t *)varying_buffer.cpu + pan_size(ATTRIBUTE_BUFFER)),
+                         ATTRIBUTE_BUFFER, cfg)
+          ;
+    }

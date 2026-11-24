@@ -337,19 +337,16 @@ static int
 bo_madvise(struct jt_gpu *g, void *arg, size_t size)
 {
 	struct jt_madvise_req *request = arg;
-	uint32_t retained = 0;
-	int ret;
 
 	if (arg == NULL || size < sizeof(*request)) {
 		return -EINVAL;
 	}
-	/* The kernel keeps every buffer and says so (0154:551); panfrost reads
-	 * that answer to decide whether the buffer still has its memory. */
-	ret = jt_bo_madvise(g, request->handle, request->madv, &retained);
-	if (ret != 0) {
-		return ret;
-	}
-	request->retained = retained;
+	/* The kernel keeps every buffer and answers retained = 1 to every call
+	 * (0154:551), so the answer is given here without the round trip: it was
+	 * 5% of backboardd's render thread while scrolling (11-24 profile; the
+	 * shim's glca17b patched the same thing into the binary). */
+	(void)g;
+	request->retained = 1;
 	return 0;
 }
 
