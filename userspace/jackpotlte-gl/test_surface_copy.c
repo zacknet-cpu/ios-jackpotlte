@@ -100,6 +100,7 @@ jackpotlte_gl_proc(const char *name)
 
 static int stub_context;
 
+unsigned long jackpotlte_gl_switches;   /* jackpotlte_gl_osmesa.c, glca15 */
 void jackpotlte_gl_fill_table(void *table[JACKPOTLTE_GL_SLOTS]) { (void)table; }
 struct jackpotlte_gl *jackpotlte_gl_create(int v) { (void)v; return (void *)&stub_context; }
 int jackpotlte_gl_make_current(struct jackpotlte_gl *g) { return g == (void *)&stub_context; }
