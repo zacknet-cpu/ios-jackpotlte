@@ -428,6 +428,76 @@ static uint32_t slot_gen(uintptr_t rd, int i)
 	return rd32(rd + SLOT_REC_OFF(i) + 44);
 }
 
+/* The heavy part of a slot decode (CRC, inflate, CRC) runs with an identity
+ * MMU and the D-cache on (start.S jt_cached): 1 GiB blocks, the low bank
+ * write-back cacheable, 0xc0000000-0xffffffff (framebuffer, slot RAM page)
+ * normal non-cacheable, the first GiB Device, nothing else mapped. */
+extern uint64_t jt_cached(uint64_t (*fn)(void *), void *ctx, uint64_t ttbr,
+    uint64_t inval_start, uint64_t inval_end);
+static uint64_t jt_mmu_table[512] __attribute__((aligned(4096)));
+
+#define TT_BLOCK	1UL
+#define TT_AF		(1UL << 10)
+#define TT_DEVICE	(TT_BLOCK | TT_AF | (0UL << 2) | (1UL << 53) | (1UL << 54))
+#define TT_NORMAL	(TT_BLOCK | TT_AF | (1UL << 2) | (3UL << 8))
+#define TT_NC		(TT_BLOCK | TT_AF | (2UL << 2) | (2UL << 8) | (1UL << 53) | (1UL << 54))
+
+static uint64_t mmu_table(void)
+{
+	for (int i = 0; i < 512; i++)
+		jt_mmu_table[i] = 0;
+	jt_mmu_table[0] = 0x00000000UL | TT_DEVICE;
+	jt_mmu_table[2] = 0x80000000UL | TT_NORMAL;
+	jt_mmu_table[3] = 0xc0000000UL | TT_NC;
+	__asm__ volatile("dsb sy" ::: "memory");
+	return (uint64_t)(uintptr_t)jt_mmu_table;
+}
+
+#define SLOT_SAMPLES	16
+#define SLOT_SAMPLE_LEN	4096U
+
+struct slot_job {
+	uintptr_t src;
+	uint64_t csize, usize;
+	uint32_t crc_c, crc_u;
+	const char *why;
+	uint32_t sample[SLOT_SAMPLES];	/* CRCs of spread 4 KiB pieces */
+};
+
+static uintptr_t sample_at(uint64_t usize, int k)
+{
+	uint64_t span = usize > SLOT_SAMPLE_LEN ? usize - SLOT_SAMPLE_LEN : 0;
+	return SLOT_SCRATCH + ((span * (uint64_t)k / (SLOT_SAMPLES - 1)) & ~3UL);
+}
+
+static uint64_t slot_job_run(void *p)
+{
+	struct slot_job *j = p;
+	uint64_t got = 0;
+
+	j->why = 0;
+	out("crc...");
+	if (crc32_dev(j->src, j->csize) != j->crc_c) {
+		j->why = "compressed CRC differs";
+		return 1;
+	}
+	out(" inflate...");
+	if (jt_inflate((uint8_t *)SLOT_SCRATCH, j->usize, &got,
+	    (const uint8_t *)j->src, j->csize) || got != j->usize) {
+		j->why = "inflate failed";
+		return 1;
+	}
+	out(" crc...");
+	if (crc32_dev(SLOT_SCRATCH, j->usize) != j->crc_u) {
+		j->why = "payload CRC differs";
+		return 1;
+	}
+	for (int k = 0; k < SLOT_SAMPLES; k++)
+		j->sample[k] = crc32_dev(sample_at(j->usize, k),
+		    j->usize < SLOT_SAMPLE_LEN ? j->usize : SLOT_SAMPLE_LEN);
+	return 0;
+}
+
 /* One slot: check it, decode it into SLOT_SCRATCH. 0 = ok. */
 static const char *slot_decode(uintptr_t rd, uint64_t len, int i,
     uintptr_t dtb, uint64_t *plen)
@@ -454,18 +524,20 @@ static const char *slot_decode(uintptr_t rd, uint64_t len, int i,
 	    (SLOT_SCRATCH < dtb_end && dtb < SLOT_SCRATCH + usize) ||
 	    (SLOT_SCRATCH < (uintptr_t)_end && (uintptr_t)_head < SLOT_SCRATCH + usize))
 		return "scratch RAM overlaps";
-	out("crc...");
-	if (crc32_dev(rd + off, csize) != crc_c)
-		return "compressed CRC differs";
-	out(" inflate...");
-	uint64_t got = 0;
-	int err = jt_inflate((uint8_t *)SLOT_SCRATCH, usize, &got,
-	    (const uint8_t *)(rd + off), csize);
-	if (err || got != usize)
-		return "inflate failed";
-	out(" crc...");
-	if (crc32_dev(SLOT_SCRATCH, usize) != crc_u)
-		return "payload CRC differs";
+	/* Everything the cached run touches must be in the cached low bank. */
+	if (rd < LOW_RAM_BASE || rd + len > LOW_RAM_END)
+		return "container outside low RAM";
+	struct slot_job job = { .src = rd + off, .csize = csize, .usize = usize,
+	    .crc_c = crc_c, .crc_u = crc_u };
+	if (jt_cached(slot_job_run, &job, mmu_table(), JT_RAMOOPS_CONSOLE,
+	    JT_RAMOOPS_CONSOLE + 2 * JT_RAMOOPS_SIZE))
+		return job.why ? job.why : "decode failed";
+	/* The caches are off again: spot-check that the payload reached RAM
+	 * (a flush that missed a cache level would show here, not in XNU). */
+	for (int k = 0; k < SLOT_SAMPLES; k++)
+		if (crc32_dev(sample_at(usize, k), usize < SLOT_SAMPLE_LEN ?
+		    usize : SLOT_SAMPLE_LEN) != job.sample[k])
+			return "payload not in RAM after the cache flush";
 	out(" ok\n");
 	*plen = usize;
 	return 0;

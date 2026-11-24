@@ -109,6 +109,131 @@ el1_entry:
 4:	wfe
 	b	4b
 
+/*
+ * uint64_t jt_cached(uint64_t (*fn)(void *), void *ctx, uint64_t ttbr)
+ *
+ * Runs fn(ctx) with an identity MMU and the D-cache on (0194 spent 86 s
+ * decoding a kernel slot with every load and store uncached). ttbr is a
+ * level-1 table built by loader.c (jt_mmu_table). Before: the loader image
+ * (code, data, bss, stack, table) and [x3, x4) are invalidated by VA, since
+ * they were written with the cache off and a stale line from S-Boot would
+ * shadow them. After: the whole D-cache is cleaned and invalidated by
+ * set/way, the MMU and D-cache are turned off, and it is done once more for
+ * lines allocated in between. Nothing between the first flush and the
+ * restore of this frame writes memory.
+ * x3/x4: one more range to invalidate first (ramoops), may be equal.
+ */
+	.globl	jt_cached
+jt_cached:
+	stp	x29, x30, [sp, #-32]!
+	stp	x19, x20, [sp, #16]
+	mov	x29, sp
+	mov	x19, x0
+	mov	x20, x1
+	mov	x9, x2
+	dsb	sy
+	adr	x0, _head
+	adr	x1, _end
+	bl	dcache_inval_range
+	mov	x0, x3
+	mov	x1, x4
+	bl	dcache_inval_range
+	ldr	x2, =0x44ff00		/* attr0 Device-nGnRnE, 1 WB, 2 NC */
+	msr	mair_el1, x2
+	ldr	x2, =0x200803519	/* T0SZ 25, WB walks, inner shareable,
+					   4 KB granule, EPD1, 40-bit PA */
+	msr	tcr_el1, x2
+	msr	ttbr0_el1, x9
+	isb
+	tlbi	vmalle1
+	dsb	sy
+	isb
+	mrs	x2, sctlr_el1
+	orr	x2, x2, #1		/* M */
+	orr	x2, x2, #4		/* C */
+	orr	x2, x2, #0x1000		/* I */
+	msr	sctlr_el1, x2
+	isb
+	mov	x0, x20
+	blr	x19
+	mov	x19, x0			/* result stays in a register */
+	bl	dcache_cisw_all
+	mrs	x2, sctlr_el1
+	bic	x2, x2, #1		/* M */
+	bic	x2, x2, #4		/* C */
+	msr	sctlr_el1, x2
+	isb
+	bl	dcache_cisw_all
+	tlbi	vmalle1
+	dsb	sy
+	ic	iallu
+	dsb	sy
+	isb
+	mov	x0, x19
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+
+/* Invalidate [x0, x1) by VA (MMU off: VA = PA). Uses x0-x2, x5-x6. */
+dcache_inval_range:
+	cmp	x0, x1
+	b.hs	2f
+	mrs	x5, ctr_el0
+	ubfx	x5, x5, #16, #4		/* DminLine, log2 words */
+	mov	x6, #4
+	lsl	x6, x6, x5		/* line size in bytes */
+	sub	x2, x6, #1
+	bic	x0, x0, x2
+1:	dc	ivac, x0
+	add	x0, x0, x6
+	cmp	x0, x1
+	b.lo	1b
+	dsb	sy
+2:	ret
+
+/* Clean and invalidate every data/unified cache level up to LoC by set/way
+ * (ARMv8 ARM, "Example code for cache maintenance"). Registers only:
+ * x0-x11. */
+dcache_cisw_all:
+	dsb	sy
+	mrs	x0, clidr_el1
+	and	w3, w0, #0x07000000
+	lsr	w3, w3, #23		/* LoC * 2 */
+	cbz	w3, 5f
+	mov	w10, #0			/* level * 2 */
+1:	add	w2, w10, w10, lsr #1	/* level * 3 */
+	lsr	w1, w0, w2
+	and	w1, w1, #7		/* cache type at this level */
+	cmp	w1, #2
+	b.lt	4f			/* no data cache here */
+	msr	csselr_el1, x10
+	isb
+	mrs	x1, ccsidr_el1
+	and	w2, w1, #7
+	add	w2, w2, #4		/* log2(line bytes) */
+	ubfx	w4, w1, #3, #10		/* ways - 1 */
+	clz	w5, w4			/* way field shift */
+	ubfx	w7, w1, #13, #15	/* sets - 1 */
+2:	mov	w9, w4
+3:	lsl	w6, w9, w5
+	orr	w11, w10, w6
+	lsl	w6, w7, w2
+	orr	w11, w11, w6
+	dc	cisw, x11
+	subs	w9, w9, #1
+	b.ge	3b
+	subs	w7, w7, #1
+	b.ge	2b
+4:	add	w10, w10, #2
+	cmp	w3, w10
+	b.gt	1b
+5:	mov	x10, #0
+	msr	csselr_el1, x10
+	dsb	sy
+	isb
+	ret
+	.ltorg
+
 /* EL1 exception vectors (installed above). */
 .macro vent slot
 	.balign	0x80
