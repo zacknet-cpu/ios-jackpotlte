@@ -359,6 +359,7 @@ static struct {
    uint64_t build, between;            /* glca6: first draw -> frame end, frame end -> next first draw */
    uint64_t frame_start, frame_done;   /* mach time of this frame's first draw, of the last frame's end */
    unsigned long on_big, on_cpu;       /* glca8: draws made on the big cores (cpu 6, 7), of all sampled */
+   unsigned long on[8];                /* draws made on each cpu */
 } perf;
 
 /* the CPU this thread runs on (XNU keeps it in TPIDRRO_EL0's low bits) */
@@ -418,7 +419,7 @@ perf_frame(void)
    n = perf.frames;
    if (perf_lines++ < 3000)
       say("perf: %llu ms %lu fr %lu dr/fr; gaps 17/34/50/100+ %lu/%lu/%lu/%lu/%lu; "
-          "gpu %llu us (max %llu) build %llu btw %llu flush %llu cache %llu; big %lu%%; f%d s%d",
+          "gpu %llu us (max %llu) build %llu btw %llu flush %llu cache %llu; big %lu%% cpus %lu %lu %lu %lu %lu %lu %lu %lu; f%d s%d",
           (unsigned long long)(us / 1000), n, perf.draws / n,
           perf.gaps[0], perf.gaps[1], perf.gaps[2], perf.gaps[3], perf.gaps[4],
           (unsigned long long)(ticks_us(perf.wait) / n),
@@ -428,6 +429,7 @@ perf_frame(void)
           (unsigned long long)(ticks_us(perf.flush) / n),
           (unsigned long long)(ticks_us(perf.clean) / n),
           perf.on_cpu ? perf.on_big * 100 / perf.on_cpu : 0,
+          perf.on[0], perf.on[1], perf.on[2], perf.on[3], perf.on[4], perf.on[5], perf.on[6], perf.on[7],
           flush_mode(), sync_mode());
    {
       uint64_t done = perf.frame_done;
@@ -637,7 +639,12 @@ jackpotlte_gl_after_draw(void)
    draws++;
    perf.draws++;
    perf.on_cpu++;
-   perf.on_big += cpu_now() >= 6;
+   {
+      unsigned c = cpu_now();
+
+      perf.on_big += c >= 6;
+      perf.on[c & 7]++;
+   }
    if (!frame_drawn) {
       perf.frame_start = mach_absolute_time();
       if (perf.frame_done != 0)
