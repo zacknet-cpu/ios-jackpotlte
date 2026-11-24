@@ -640,6 +640,36 @@ flip_async_on(void)
 }
 
 /*
+ * glca19: kernel 0209 (kern.a8_flip_defer = 1) with async SwapEnd leaves the
+ * flip of a frame the GPU is still drawing to the kernel's GPU worker, and
+ * the next frame's first GPU job waits there until the panel took it.  A
+ * frame then ends with glFlush (the batch goes to the GPU) instead of
+ * glFinish, so CoreAnimation builds the next frame while the GPU draws this
+ * one.  Switch a8gl-pipe "1"; anything else, or an older kernel, keeps
+ * glFinish.
+ */
+static int
+pipe_on(void)
+{
+   static int pipe = -1;
+
+   if (pipe < 0) {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-pipe", "r");
+      int c = f != NULL ? fgetc(f) : EOF, defer = 0;
+      size_t len = sizeof(defer);
+
+      if (f != NULL)
+         fclose(f);
+      pipe = c == '1' && flip_async_on() &&
+             sysctlbyname("kern.a8_flip_defer", &defer, &len, NULL, 0) == 0 && defer == 1;
+      say("glca19: a frame ends with %s", pipe ? "glFlush (the kernel flips when the GPU is done)"
+          : c == '1' ? "glFinish (a8gl-pipe \"1\" but no async SwapEnd or no kern.a8_flip_defer)"
+          : "glFinish");
+   }
+   return pipe;
+}
+
+/*
  * glca14: CoreAnimation's render thread on a Cortex-A73 (kernel 0204,
  * kern.a8_bind_big).  The single processor set put it on whichever core was
  * free, mostly an A53, and its frame building (CPU) was ~7 ms of a 16.7 ms
@@ -920,7 +950,7 @@ frame_end(const char *why, int finished)
    if (flush_mode() == 0)
       shared_sync();               /* before the batch goes to the GPU (glFinish below) */
    if (!finished) {
-      void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
+      void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc(pipe_on() ? "glFlush" : "glFinish");
 
       if (finish != NULL) {
          uint64_t t0, t;
