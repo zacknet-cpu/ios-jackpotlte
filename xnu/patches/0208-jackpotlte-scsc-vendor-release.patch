@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
-index c703ffa..cf7f4de 100644
+index c703ffa..6e0bca9 100644
 --- a/bsd/dev/a5xelte_scsc.c
 +++ b/bsd/dev/a5xelte_scsc.c
 @@ -58,6 +58,7 @@
@@ -10,7 +10,7 @@ index c703ffa..cf7f4de 100644
  #include <sys/vnode.h>
  #include <sys/attr.h>
  #include <kern/clock.h>
-@@ -970,43 +971,170 @@ a5scsc_pmu_mem_windows(void)
+@@ -970,43 +971,168 @@ a5scsc_pmu_mem_windows(void)
  	    A5SCSC_BTABOX_SIZE >> 12);
  }
  
@@ -48,15 +48,13 @@ index c703ffa..cf7f4de 100644
 +	}
 +	if (a5scsc.mif_mapped && a5scsc.fw_loaded) {
 +		uint32_t r4p = a5scsc_mif_rd32(176), m4p = a5scsc_mif_rd32(180);
++		bool r4ok = r4p <= A5SCSC_MIF_DRAM_SIZE - 16, m4ok = m4p <= A5SCSC_MIF_DRAM_SIZE - 8;
 +
 +		printf("A5XELTE SCSC: %s: panic records R4 at 0x%x: 0x%08x 0x%08x 0x%08x 0x%08x, "
 +		    "M4 at 0x%x: 0x%08x 0x%08x\n", when, r4p,
-+		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p) : 0,
-+		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p + 4) : 0,
-+		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p + 8) : 0,
-+		    r4p + 16 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(r4p + 12) : 0, m4p,
-+		    m4p + 8 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(m4p) : 0,
-+		    m4p + 8 <= A5SCSC_MIF_DRAM_SIZE ? a5scsc_mif_rd32(m4p + 4) : 0);
++		    r4ok ? a5scsc_mif_rd32(r4p) : 0, r4ok ? a5scsc_mif_rd32(r4p + 4) : 0,
++		    r4ok ? a5scsc_mif_rd32(r4p + 8) : 0, r4ok ? a5scsc_mif_rd32(r4p + 12) : 0, m4p,
++		    m4ok ? a5scsc_mif_rd32(m4p) : 0, m4ok ? a5scsc_mif_rd32(m4p + 4) : 0);
 +	}
 +}
 +
@@ -201,7 +199,7 @@ index c703ffa..cf7f4de 100644
  }
  
  /* ---- poll thread ----------------------------------------------------------
-@@ -1170,6 +1298,7 @@ a5scsc_transport_up(void)
+@@ -1170,6 +1296,7 @@ a5scsc_transport_up(void)
  		 * transport marked up so nothing retries the reset sequence. */
  		printf("A5XELTE SCSC: stage 5/6 handshake: no MM_START_IND in %u ms (pmu up, mxmgmt pending 0x%04x)\n",
  		    (unsigned)A5SCSC_MXMAN_START_TIMEOUT_MS, a5scsc_irq_get());
@@ -209,7 +207,7 @@ index c703ffa..cf7f4de 100644
  		a5scsc_transport_state = 2;
  		printf("A5XELTE SCSC: stage 6/6 up: WLBT cannot be confirmed\n");
  		return 1;
-@@ -1299,6 +1428,79 @@ a5xelte_scsc_probe(void)
+@@ -1299,6 +1426,79 @@ a5xelte_scsc_probe(void)
  	}
  }
  
@@ -289,7 +287,7 @@ index c703ffa..cf7f4de 100644
  #else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
  
  void
-@@ -1306,4 +1508,10 @@ a5xelte_scsc_probe(void)
+@@ -1306,4 +1506,10 @@ a5xelte_scsc_probe(void)
  {
  }
  
