@@ -307,6 +307,9 @@ sampler_main(void *arg)
          continue;
       last = now;
       t0 = mach_absolute_time();
+#if defined(__arm64__) || defined(__aarch64__)
+      /* arm64 only: CI also compiles this file for the x86_64 host, which
+       * has no arm_thread_state64_t; there the sampler writes 0 samples. */
       while (n < PS_MAX && ticks_us(mach_absolute_time() - t0) < 6000000ull) {
          arm_thread_state64_t st;
          mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
@@ -333,6 +336,10 @@ sampler_main(void *arg)
          }
          thread_resume(rt);
       }
+#else
+      (void)t0;
+      (void)lo;
+#endif
       f = fopen("/private/var/mobile/Library/a8gl-samples.txt", "w");
       if (f != NULL) {
          for (unsigned i = 0; i < n; i++) {
