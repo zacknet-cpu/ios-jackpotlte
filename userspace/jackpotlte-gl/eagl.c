@@ -1477,10 +1477,27 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
       int alpha = last_copy_alpha;
       static unsigned empty_said;
 
-      if (alpha == 0 && empty_said++ < 40)
-         say("%s: surface %u (%dx%d, '%.4s', %zu B a pixel, seed %u) copied with alpha 0 "
-             "everywhere", method, (unsigned)IOSurfaceGetID(surface), width, height,
-             (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, bpp, copy_seed);
+      if (alpha == 0 && empty_said++ < 40) {
+         /* glca9e: is anything at all in the surface's memory, and where */
+         const unsigned char *all = (const unsigned char *)IOSurfaceGetBaseAddress(surface);
+         size_t whole = IOSurfaceGetAllocSize(surface), nonzero = 0, first = 0, last = 0;
+
+         if (whole > (1u << 20))
+            whole = 1u << 20;
+         for (size_t i = 0; all != NULL && i < whole; i++) {
+            if (all[i] != 0) {
+               if (nonzero++ == 0)
+                  first = i;
+               last = i;
+            }
+         }
+         say("%s: surface %u (%dx%d, '%.4s', %zu B a pixel, row %zu, %zu allocated at %p, "
+             "seed %u; asked %#lx/%#lx/%#lx) copied with alpha 0 everywhere; its memory has "
+             "%zu bytes not 0 (from %zu to %zu)", method, (unsigned)IOSurfaceGetID(surface),
+             width, height, (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, bpp,
+             IOSurfaceGetBytesPerRow(surface), IOSurfaceGetAllocSize(surface), (const void *)all,
+             copy_seed, asked_internal, asked_format, asked_type, nonzero, first, last);
+      }
    }
    if (logged++ < 16) {
       say("%s: surface %u is '%.4s' %dx%d, row %zu of %zu bytes, %zu B a pixel, "
