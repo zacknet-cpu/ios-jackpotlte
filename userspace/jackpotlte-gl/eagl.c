@@ -64,6 +64,7 @@
 
 #include <fcntl.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
@@ -1075,12 +1076,50 @@ bound_texture(struct jackpotlte_eagl *e)
  * map (0154's 0x7e) and the one CoreAnimation composites its own draws into, so
  * both -attachImage: and -texImageIOSurface: take the zero-copy path for it.
  */
+/*
+ * glca11: whether this process may write the surface's pixels.  A surface
+ * made over a client's own pages that the kernel could only hold for reading
+ * (0190: IOSurfaceAddress, mapReadOnly) is mapped read-only here, and the
+ * GPU buffer the driver makes of it is too: Mesa writing into one under
+ * glDrawElements was a SIGBUS in backboardd (sig 10, far in a prot 1/1
+ * tag 51 mapping, while typing in Settings).  Unknown counts as writable.
+ */
+static int
+surface_writable(IOSurfaceRef surface)
+{
+   vm_address_t want = (vm_address_t)IOSurfaceGetBaseAddress(surface);
+   vm_address_t address = want;
+   vm_size_t size = 0;
+   vm_region_basic_info_data_64_t info;
+   mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+   mach_port_t object = MACH_PORT_NULL;
+
+   if (want == 0)
+      return 1;
+   if (vm_region_64(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+                    (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+      return 1;
+   if (address > want || want - address >= size)
+      return 1;                         /* not the region the pixels are in */
+   return (info.protection & VM_PROT_WRITE) != 0;
+}
+
 static int
 surface_shareable(IOSurfaceRef surface)
 {
-   return IOSurfaceGetPixelFormat(surface) == 'BGRA' &&
-          IOSurfaceGetPlaneCount(surface) == 0 &&
-          IOSurfaceGetBytesPerElement(surface) == 4;
+   static unsigned said;
+
+   if (IOSurfaceGetPixelFormat(surface) != 'BGRA' ||
+       IOSurfaceGetPlaneCount(surface) != 0 ||
+       IOSurfaceGetBytesPerElement(surface) != 4)
+      return 0;
+   if (!surface_writable(surface)) {
+      if (said++ < 8)
+         say("surface %u is BGRA but read-only in this process: copied, not shared",
+             (unsigned)IOSurfaceGetID(surface));
+      return 0;
+   }
+   return 1;
 }
 
 /*
