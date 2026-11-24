@@ -22,7 +22,7 @@ index b5b3ba9..53c2120 100644
   * dcache_incoherent_io_flush64() dcache_incoherent_io_store64() result info
   */
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 64bacc1..9e3a574 100644
+index 64bacc1..67a401d 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -1467,7 +1467,7 @@ pmap_set_xprr_perm(
@@ -34,7 +34,7 @@ index 64bacc1..9e3a574 100644
  	pt_entry_t * const ptep = pmap_pte(kernel_pmap, kva);
  
  	pmap_set_pte_xprr_perm(ptep, expected_perm, new_perm);
-@@ -2654,6 +2654,36 @@ pmap_next_page(
+@@ -2654,6 +2654,86 @@ pmap_next_page(
  }
  
  
@@ -44,34 +44,84 @@ index 64bacc1..9e3a574 100644
 + * by the pmap (pa_valid, pa_index) and mapped in the physical aperture
 + * (arm_vm_init.c); here the VM gets their pages, the way ml_static_mfree()
 + * hands boot memory back, one vm_page per page from the "vm pages" zone.
++ * That zone is made by vm_page_module_init() at STARTUP(ZALLOC, SECOND),
++ * after pmap_init() (KMEM), so this runs at the end of ZALLOC.
++ *
++ * First a quick probe through the aperture: a word written at the start and
++ * the end of every 2 MiB block, all read back after all were written.  A
++ * range with any wrong word stays out of the VM (it is still managed, which
++ * is harmless with no vm_page).  a8lowram=2 stops after the probe.
 + */
++static bool
++a8lo_probe_range(unsigned int i)
++{
++	const uint64_t pa0 = a8lo_ranges[i].pa, len = a8lo_ranges[i].len;
++	unsigned int bad = 0;
++
++	for (uint64_t off = 0; off < len; off += ARM_TT_L2_SIZE) {
++		volatile uint64_t *w0 = (volatile uint64_t *)phystokv(pa0 + off);
++		volatile uint64_t *w1 = (volatile uint64_t *)phystokv(pa0 + off + ARM_TT_L2_SIZE - sizeof(uint64_t));
++
++		*w0 = (pa0 + off) ^ 0xa8a8a8a855aa55aaULL;
++		*w1 = ~((pa0 + off) ^ 0xa8a8a8a855aa55aaULL);
++	}
++	__builtin_arm_dsb(DSB_SY);
++	for (uint64_t off = 0; off < len; off += ARM_TT_L2_SIZE) {
++		volatile uint64_t *w0 = (volatile uint64_t *)phystokv(pa0 + off);
++		volatile uint64_t *w1 = (volatile uint64_t *)phystokv(pa0 + off + ARM_TT_L2_SIZE - sizeof(uint64_t));
++
++		if ((*w0 != ((pa0 + off) ^ 0xa8a8a8a855aa55aaULL)) ||
++		    (*w1 != ~((pa0 + off) ^ 0xa8a8a8a855aa55aaULL))) {
++			if (bad++ < 4) {
++				printf("A8 RAM: probe mismatch at 0x%llx: 0x%llx 0x%llx\n",
++				    (unsigned long long)(pa0 + off), (unsigned long long)*w0,
++				    (unsigned long long)*w1);
++			}
++		}
++	}
++	return bad == 0;
++}
++
++__startup_func
 +static void
 +a8lo_give_to_vm(void)
 +{
 +	uint64_t pages = 0;
++	unsigned int before = vm_page_free_count;
 +
 +	if (!a8lo_on) {
 +		printf("A8 RAM: lower bank not used (boot-arg a8lowram=1 adds it)\n");
 +		return;
 +	}
 +	for (unsigned int i = 0; i < A8LO_RANGES; i++) {
-+		vm_page_create((ppnum_t)atop(a8lo_ranges[i].pa),
-+		    (ppnum_t)atop(a8lo_ranges[i].pa + a8lo_ranges[i].len));
-+		pages += atop(a8lo_ranges[i].len);
++		const uint64_t pa = a8lo_ranges[i].pa, len = a8lo_ranges[i].len;
++
++		if (!a8lo_probe_range(i)) {
++			printf("A8 RAM: lower bank 0x%llx-0x%llx failed the probe, not used\n",
++			    (unsigned long long)pa, (unsigned long long)(pa + len - 1));
++			continue;
++		}
++		if (a8lo_on == 2) {
++			printf("A8 RAM: lower bank 0x%llx-0x%llx mapped and probed (a8lowram=2: not given)\n",
++			    (unsigned long long)pa, (unsigned long long)(pa + len - 1));
++			continue;
++		}
++		vm_page_create((ppnum_t)atop(pa), (ppnum_t)atop(pa + len));
++		pages += atop(len);
 +		printf("A8 RAM: lower bank 0x%llx-0x%llx added (%llu MiB)\n",
-+		    (unsigned long long)a8lo_ranges[i].pa,
-+		    (unsigned long long)(a8lo_ranges[i].pa + a8lo_ranges[i].len - 1),
-+		    (unsigned long long)(a8lo_ranges[i].len >> 20));
++		    (unsigned long long)pa, (unsigned long long)(pa + len - 1),
++		    (unsigned long long)(len >> 20));
 +	}
-+	printf("A8 RAM: %llu MiB of the lower bank given to the VM, %u pages free now\n",
-+	    (unsigned long long)(ptoa_64(pages) >> 20), vm_page_free_count);
++	printf("A8 RAM: %llu MiB of the lower bank given to the VM, free pages %u -> %u\n",
++	    (unsigned long long)(ptoa_64(pages) >> 20), before, vm_page_free_count);
 +}
++STARTUP(ZALLOC, STARTUP_RANK_LAST, a8lo_give_to_vm);
 +#endif /* JACKPOTLTE */
 +
  /*
   *	Initialize the pmap module.
   *	Called by vm_init, to initialize any structures that the pmap
-@@ -2685,7 +2715,12 @@ pmap_init(
+@@ -2685,7 +2765,12 @@ pmap_init(
  	 *	structures for pages we allocate to be page tables in
  	 *	pmap_expand().
  	 */
@@ -84,17 +134,7 @@ index 64bacc1..9e3a574 100644
  	pmap_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
  
  	/*
-@@ -2698,6 +2733,9 @@ pmap_init(
- 	if ((uint32_t)hard_maxproc > pmap_max_asids) {
- 		hard_maxproc = pmap_max_asids;
- 	}
-+#if defined(JACKPOTLTE)
-+	a8lo_give_to_vm();
-+#endif
- }
- 
- /**
-@@ -3927,7 +3965,7 @@ pmap_set_ptov_ap(unsigned int pai __unused, unsigned int ap __unused, boolean_t
+@@ -3927,7 +4012,7 @@ pmap_set_ptov_ap(unsigned int pai __unused, unsigned int ap __unused, boolean_t
  {
  #if __ARM_PTE_PHYSMAP__
  	pvh_assert_locked(pai);
@@ -103,7 +143,7 @@ index 64bacc1..9e3a574 100644
  	pt_entry_t *pte_p = pmap_pte(kernel_pmap, kva);
  
  	pt_entry_t tmplate = *pte_p;
-@@ -7440,6 +7478,17 @@ pmap_disconnect(
+@@ -7440,6 +7525,17 @@ pmap_disconnect(
  boolean_t
  pmap_has_managed_page(ppnum_t first, ppnum_t last)
  {
@@ -157,10 +197,10 @@ index d8592c4..c9f8161 100644
  		assert(VM_PAGE_WIRED(mem));
  		vm_page_lock_queues();
 diff --git a/osfmk/arm/pmap/pmap_data.h b/osfmk/arm/pmap/pmap_data.h
-index 2883f63..c6df08f 100644
+index 2883f63..c812d86 100644
 --- a/osfmk/arm/pmap/pmap_data.h
 +++ b/osfmk/arm/pmap/pmap_data.h
-@@ -62,6 +62,44 @@
+@@ -62,6 +62,45 @@
   */
  extern pmap_paddr_t vm_first_phys, vm_last_phys;
  
@@ -175,12 +215,13 @@ index 2883f63..c6df08f 100644
 + * vm_page_create() (pmap.c, a8lo_give_to_vm).  What stays out: the Samsung
 + * reserved-memory carve-outs (sec_debug_magic, dram_test, tima, seclog,
 + * wifibt_if, abox, the framebuffer and boot-slot page, modem_if,
-+ * cp_ram_logging, gnss_if), the TEE hole 0xbda00000-0xbfffffff and the
-+ * secondary-core trampoline page 0x8f000000.
++ * cp_ram_logging, gnss_if), the FDT /memreserve/ at 0xe0000000, the TEE hole
++ * 0xbda00000-0xbfffffff and the secondary-core trampoline page 0x8f000000.
++ * a8lo_on is 1, or 2 for "map and manage, but no pages to the VM".
 + */
 +#define A8LO_BASE       0x80000000ULL
 +#define A8LO_SPAN       0x80000000ULL
-+#define A8LO_RANGES     6
++#define A8LO_RANGES     7
 +struct a8lo_range {
 +	uint64_t pa, len;
 +};
@@ -205,7 +246,7 @@ index 2883f63..c6df08f 100644
  /**
   * Return whether the given address represents a kernel-managed physical page.
   *
-@@ -74,6 +112,11 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
+@@ -74,6 +113,11 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
  static inline bool
  pa_valid(pmap_paddr_t pa)
  {
@@ -217,7 +258,7 @@ index 2883f63..c6df08f 100644
  	return (pa >= vm_first_phys) && (pa < vm_last_phys);
  }
  
-@@ -97,9 +140,42 @@ pa_valid(pmap_paddr_t pa)
+@@ -97,9 +141,42 @@ pa_valid(pmap_paddr_t pa)
  static inline unsigned int
  pa_index(pmap_paddr_t pa)
  {
@@ -261,10 +302,10 @@ index 2883f63..c6df08f 100644
  extern pv_entry_t **pv_head_table;
  
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 671c55a..a1ad465 100644
+index 671c55a..acc623a 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -366,6 +366,56 @@ typedef struct {
+@@ -366,6 +366,60 @@ typedef struct {
  SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
  SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
  
@@ -278,14 +319,17 @@ index 671c55a..a1ad465 100644
 + * edge on a 2 MiB block so the aperture can use L2 blocks:
 + *   0x80000000 sec_debug_magic, 0x80002000 dram_test, 0x8f000000 trampoline,
 + *   0xb8000000 tima_region (2 MiB), 0xbda00000-0xbfffffff not RAM,
-+ *   0xc0000000 seclog_mem, 0xe9000000 wifibt_if (4 MiB) and abox_rmem
-+ *   (4 MiB), 0xec000000 framebuffer and the boot-slot page (20 MiB),
-+ *   0xf5400000-0xffffffff modem_if, cp_ram_logging, gnss_if.
-+ * 1802 MiB in all.
++ *   0xc0000000 seclog_mem, 0xe0000000 the FDT header's /memreserve/
++ *   (13 MiB; not a reserved-memory node, so check the header too),
++ *   0xe9000000 wifibt_if (4 MiB) and abox_rmem (4 MiB), 0xec000000
++ *   framebuffer and the boot-slot page (20 MiB), 0xf5400000-0xffffffff
++ *   modem_if, cp_ram_logging, gnss_if.
++ * 1788 MiB in all.  a8lowram=2 maps and manages the ranges but keeps their
++ * pages from the VM (pmap.c), to tell a mapping fault from a page fault.
 + */
 +#define A8LO_BASE       0x80000000ULL
 +#define A8LO_SPAN       0x80000000ULL
-+#define A8LO_RANGES     6
++#define A8LO_RANGES     7
 +struct a8lo_range {
 +	uint64_t pa, len;
 +};
@@ -293,7 +337,8 @@ index 671c55a..a1ad465 100644
 +	{ 0x80200000ULL, 0x0ee00000ULL },       /* 238 MiB, to 0x8effffff */
 +	{ 0x8f200000ULL, 0x28e00000ULL },       /* 654 MiB, to 0xb7ffffff */
 +	{ 0xb8200000ULL, 0x05800000ULL },       /*  88 MiB, to 0xbd9fffff */
-+	{ 0xc0200000ULL, 0x28e00000ULL },       /* 654 MiB, to 0xe8ffffff */
++	{ 0xc0200000ULL, 0x1fe00000ULL },       /* 510 MiB, to 0xdfffffff */
++	{ 0xe0e00000ULL, 0x08200000ULL },       /* 130 MiB, to 0xe8ffffff */
 +	{ 0xe9800000ULL, 0x02800000ULL },       /*  40 MiB, to 0xebffffff */
 +	{ 0xed400000ULL, 0x08000000ULL },       /* 128 MiB, to 0xf53fffff */
 +};
@@ -321,7 +366,7 @@ index 671c55a..a1ad465 100644
  #if defined(JACKPOTLTE)
  /*
   * Bring-up aid.  An illegal PA panics deep inside a cache maintenance
-@@ -1624,6 +1674,50 @@ arm_vm_physmap_init(boot_args *args)
+@@ -1624,6 +1678,50 @@ arm_vm_physmap_init(boot_args *args)
  
  #else
  
@@ -372,7 +417,7 @@ index 671c55a..a1ad465 100644
  static void
  arm_vm_physmap_init(boot_args *args)
  {
-@@ -1640,6 +1734,12 @@ arm_vm_physmap_init(boot_args *args)
+@@ -1640,6 +1738,12 @@ arm_vm_physmap_init(boot_args *args)
  	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
  	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
  
@@ -385,7 +430,7 @@ index 671c55a..a1ad465 100644
  	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
  
  	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
-@@ -1906,6 +2006,18 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1906,6 +2010,18 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	 */
  	gVirtBase = args->virtBase;
  	gPhysBase = args->physBase;
@@ -395,16 +440,16 @@ index 671c55a..a1ad465 100644
 +		 * runs in the upper one, which the lower bank's indices follow */
 +		unsigned int on = 0;
 +
-+		if (PE_parse_boot_argn("a8lowram", &on, sizeof(on)) && (on == 1) &&
++		if (PE_parse_boot_argn("a8lowram", &on, sizeof(on)) && ((on == 1) || (on == 2)) &&
 +		    (gPhysBase >= A8LO_BASE + A8LO_SPAN)) {
-+			a8lo_on = 1;
++			a8lo_on = on;
 +		}
 +	}
 +#endif
  #if KASAN
  	real_phys_size = args->memSize + (shadow_ptop - shadow_pbase);
  #else
-@@ -1980,6 +2092,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1980,6 +2096,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
  #endif // ARM_LARGE_MEMORY
  #endif
