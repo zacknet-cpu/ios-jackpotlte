@@ -28,6 +28,15 @@
  * for where to draw the slider, and gets the level last set. The approach is
  * Scion's (cooblg/scion-kernel userland/src/inject_sb.c, brightness_bridge).
  *
+ * os_log to stderr (v5): a process named with the console's "tee" starts
+ * with OS_ACTIVITY_DT_MODE in its environment (kernel 0192), which iOS's
+ * libtrace does not honor on this build. Such a process gets an os_log hook
+ * (libsystem_trace's os_log_set_hook, the one Xcode's console uses) that
+ * writes each of its log messages to stderr as one line, "A8LOG <type>
+ * <message>", which the tee shows. This phone has no "log stream" and
+ * ReportCrash is off, so this is how a daemon that fails quietly (assetsd not
+ * making the Photos library) says why.
+ *
  * Plain C on the Objective-C runtime; no SDK headers.
  */
 typedef struct objc_class *Class;
@@ -53,6 +62,12 @@ typedef unsigned long long dispatch_time_t;
 extern dispatch_time_t dispatch_time(dispatch_time_t when, long long delta);
 extern void dispatch_after_f(dispatch_time_t when, void *queue, void *context, void (*work)(void *));
 extern char _dispatch_main_q;
+extern char *getenv(const char *name);
+extern void free(void *p);
+typedef struct os_log_message_s *os_log_message_t;
+typedef void (^os_log_hook_t)(unsigned char type, os_log_message_t message);
+extern os_log_hook_t os_log_set_hook(unsigned char level, os_log_hook_t hook);
+extern char *os_log_copy_message_string(os_log_message_t message);
 
 static void
 fix_put(const char *s)
@@ -428,9 +443,54 @@ fix_screen_report(void *context)
 	fix_put("\n");
 }
 
+/* ---- os_log to stderr ------------------------------------------------ */
+
+/* one line, written at once (pieces of a line written apart arrive on the
+ * console as separate lines) */
+static void
+log_line(unsigned char type, const char *text)
+{
+	char line[1024];
+	unsigned long n = 0;
+	const char *kind = type == 0x10 ? "error" : type == 0x11 ? "fault" :
+	    type == 0x01 ? "info" : type == 0x02 ? "debug" : "default";
+
+	for (const char *k = "A8LOG "; *k; k++)
+		line[n++] = *k;
+	for (const char *k = kind; *k; k++)
+		line[n++] = *k;
+	line[n++] = ' ';
+	for (const char *t = text ? text : "(null)"; *t && n < sizeof(line) - 2; t++)
+		line[n++] = (*t == '\n' || *t == '\r') ? ' ' : *t;
+	line[n++] = '\n';
+	write(2, line, n);
+}
+
+/* is this process tee'd (the kernel put OS_ACTIVITY_DT_MODE in its environment)? */
+static int
+log_wanted(void)
+{
+	return getenv("OS_ACTIVITY_DT_MODE") != 0;
+}
+
+static void
+log_apply(void)
+{
+	if (!log_wanted())
+		return;
+	os_log_set_hook(0x00, ^(unsigned char type, os_log_message_t message) {
+		char *text = os_log_copy_message_string(message);
+
+		log_line(type, text);
+		free(text);
+	});
+	log_line(0x00, "A8FIX: os_log goes to stderr in this process");
+}
+
 __attribute__((constructor)) static void
 fix_init(void)
 {
+	log_apply();
 	NSSetUncaughtExceptionHandler(fix_exception);
 	fix_apply();
 	bl_apply();
