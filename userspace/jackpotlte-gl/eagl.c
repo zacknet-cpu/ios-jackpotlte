@@ -417,17 +417,16 @@ perf_frame(void)
       return;
    n = perf.frames;
    if (perf_lines++ < 3000)
-      say("perf: %llu ms, %lu frames, %lu draws (%lu a frame); gaps <=17/34/50/100/more ms: "
-          "%lu/%lu/%lu/%lu/%lu; GPU wait %llu us a frame (max %llu), flush %llu us a "
-          "frame, cache %llu us a frame; build %llu us, between %llu us a frame; draws on big cores %lu%%; jtglflush=%d jtglsync=%d",
-          (unsigned long long)(us / 1000), n, perf.draws, perf.draws / n,
+      say("perf: %llu ms %lu fr %lu dr/fr; gaps 17/34/50/100+ %lu/%lu/%lu/%lu/%lu; "
+          "gpu %llu us (max %llu) build %llu btw %llu flush %llu cache %llu; big %lu%%; f%d s%d",
+          (unsigned long long)(us / 1000), n, perf.draws / n,
           perf.gaps[0], perf.gaps[1], perf.gaps[2], perf.gaps[3], perf.gaps[4],
           (unsigned long long)(ticks_us(perf.wait) / n),
           (unsigned long long)ticks_us(perf.wait_max),
-          (unsigned long long)(ticks_us(perf.flush) / n),
-          (unsigned long long)(ticks_us(perf.clean) / n),
           (unsigned long long)(ticks_us(perf.build) / n),
           (unsigned long long)(ticks_us(perf.between) / n),
+          (unsigned long long)(ticks_us(perf.flush) / n),
+          (unsigned long long)(ticks_us(perf.clean) / n),
           perf.on_cpu ? perf.on_big * 100 / perf.on_cpu : 0,
           flush_mode(), sync_mode());
    {
