@@ -1,0 +1,82 @@
+diff --git a/bsd/dev/a8_slots.c b/bsd/dev/a8_slots.c
+index caf6629..8a8ed5f 100644
+--- a/bsd/dev/a8_slots.c
++++ b/bsd/dev/a8_slots.c
+@@ -125,6 +125,7 @@ struct a8b_state {
+ 	uint32_t wdt_row;               /* watchdog resets in a row */
+ 	uint32_t ntimes;
+ 	uint32_t times[8];              /* calendar seconds of the last tries */
++	uint32_t clock;                 /* 0197: last calendar second seen */
+ 	uint32_t check;
+ };
+ 
+@@ -328,11 +329,11 @@ a8b_state_load(void)
+ 	for (int i = 0; i < n; i++) {
+ 		dst[i] = w[i];
+ 	}
+-	if (a8b_st.magic != STATE_MAGIC || a8b_st.version != 1 ||
++	if (a8b_st.magic != STATE_MAGIC || a8b_st.version != 2 ||
+ 	    a8b_st.check != a8b_xor(w, n - 1)) {
+ 		memset(&a8b_st, 0, sizeof(a8b_st));
+ 		a8b_st.magic = STATE_MAGIC;
+-		a8b_st.version = 1;
++		a8b_st.version = 2;
+ 		printf("A8 SLOTS: no saved state (cold start); starting fresh\n");
+ 	}
+ }
+@@ -880,6 +881,41 @@ a8b_promote(void)
+ 	a8b_state_save();
+ }
+ 
++/* ---- clock across warm restarts (0197) ----
++ * XNU has no RTC driver here (the PMIC RTC sits on the SPEEDY bus), so the
++ * calendar starts in 1970 on every boot until the PC sends "date". The state
++ * page keeps the last calendar second seen (every 30 s); a boot after a warm
++ * restart starts the calendar there plus a minute. A cold start still needs
++ * "date". */
++#define A8B_CLOCK_MIN   1767225600u     /* 2026-01-01 */
++
++static void
++a8b_clock_restore(void)
++{
++	uint32_t now = a8b_now();
++
++	if (now >= A8B_CLOCK_MIN || a8b_st.clock < A8B_CLOCK_MIN) {
++		return;
++	}
++	clock_set_calendar_microtime((clock_sec_t)(a8b_st.clock + 60u), 0);
++	printf("A8 CLOCK: calendar set to %u (last seen before the restart, plus 60 s)\n",
++	    a8b_st.clock + 60u);
++}
++
++static void
++a8b_clock_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		uint32_t now = a8b_now();
++
++		if (now >= A8B_CLOCK_MIN && now != a8b_st.clock) {
++			a8b_st.clock = now;
++			a8b_state_save();
++		}
++		a8b_sleep_ms(30000);
++	}
++}
++
+ /* ---- watchdog ---- */
+ 
+ static void
+@@ -1067,6 +1103,13 @@ a8b_init(void)
+ 	}
+ 	a8b_state_save();
+ 	a8b_report_panic();
++	a8b_clock_restore();
++	{
++		thread_t th;
++		if (kernel_thread_start(a8b_clock_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++		}
++	}
+ 
+ 	loader_armed = a8b_boot_valid && a8b_boot[3] == WHY_TRY;
+ 	secs = a8b_boot_valid ? 60u : 0u;
