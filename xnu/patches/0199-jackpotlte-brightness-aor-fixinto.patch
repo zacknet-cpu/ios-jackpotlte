@@ -1,0 +1,309 @@
+diff --git a/bsd/dev/a5xelte_panel.c b/bsd/dev/a5xelte_panel.c
+index 48ddd31..1cc4c2d 100644
+--- a/bsd/dev/a5xelte_panel.c
++++ b/bsd/dev/a5xelte_panel.c
+@@ -26,6 +26,9 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -563,4 +566,159 @@ a5xelte_panel_init(void)
+ 
+ 	printf("A5XELTE PANEL: DSIM/PHY/panel bring-up done\n");
+ }
++/* ------------------------------------------------------------------ */
++/* 0199: brightness, by the panel's AOR (AMOLED off ratio)             */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The s6e3fa7 sets its brightness with Samsung's dynamic AID: a gamma table
++ * (0xCA, worked out from the panel's MTP calibration), the AOR (0xB1, the
++ * share of each frame the pixels are dark), ELVSS and so on, latched by F7 03
++ * (s6e3fa7_jackpot_lcd_ctrl.c low_level_set_brightness()). Below about 100
++ * nits Samsung itself keeps the gamma and moves only the AOR; here the AOR
++ * alone is moved over the whole range, on top of whatever gamma S-Boot set:
++ * 0x0897 (its own 2-nit value, the darkest it uses) to 0x0010 (the least off
++ * time it uses), so every value sent is one Samsung's driver sends this panel.
++ * The share of time lit follows the level on a square curve, so the low end
++ * of the slider is fine-grained the way the eye wants it.
++ *
++ * Commands go the way dsim_write_data() sends them at run time (payload
++ * words, then the header, under one lock), not the bring-up path's packet-go
++ * dance: test key on (F0 5A 5A), B1 hi lo, F7 03, test key off (F0 A5 A5).
++ * sysctl kern.a8_brightness (0-255, anyone may set it: SpringBoard's hook in
++ * the fix library runs as mobile) and the console's "bl [N]". Nothing is sent
++ * until a level is asked for.
++ */
++#define A8_AOR_DARK	0x0897U
++#define A8_AOR_BRIGHT	0x0010U
++#define A8_AOR_TOTAL	2240U		/* lines: the 2-nit AOR is 98 % of it */
++
++static LCK_GRP_DECLARE(a8_bl_grp, "a8_brightness");
++static LCK_MTX_DECLARE(a8_bl_lock, &a8_bl_grp);
++static int a8_bl_level = -1;
++static uint32_t a8_bl_aor_sent;
++static uint32_t a8_bl_sends, a8_bl_timeouts;
++
++/* one command as dsim_write_data() sends it at run time; false: the FIFO
++ * did not drain in 20 ms */
++static bool
++a8_dsi_cmd(const unsigned char *cmd, unsigned int len)
++{
++	uint32_t id, d0, d1, cnt = 2000;
++
++	if (len == 1) {
++		id = DSI_DCS_SHORT_WRITE;
++		d0 = cmd[0];
++		d1 = 0;
++	} else if (len == 2) {
++		id = DSI_DCS_SHORT_WRITE_1;
++		d0 = cmd[0];
++		d1 = cmd[1];
++	} else {
++		id = DSI_DCS_LONG_WRITE;
++		d0 = len & 0xff;
++		d1 = (len >> 8) & 0xff;
++		for (unsigned int i = 0; i < len; i += 4) {
++			uint32_t payload = cmd[i];
++
++			if (i + 1 < len) {
++				payload |= (uint32_t)cmd[i + 1] << 8;
++			}
++			if (i + 2 < len) {
++				payload |= (uint32_t)cmd[i + 2] << 16;
++			}
++			if (i + 3 < len) {
++				payload |= (uint32_t)cmd[i + 3] << 24;
++			}
++			a5p_write(a5p_dsim, DSIM_PAYLOAD, payload);
++		}
++	}
++	a5p_mask(a5p_dsim, DSIM_PKTHDR, (d0 << 8) | (d1 << 16) | id, DSIM_PKTHDR_MASK);
++	while (!(a5p_read(a5p_dsim, DSIM_FIFOCTRL) & DSIM_FIFO_EMPTY_PH_SFR)) {
++		if (cnt-- == 0) {
++			return false;
++		}
++		delay(10);
++	}
++	return true;
++}
++
++static uint32_t
++a8_bl_aor(unsigned int level)
++{
++	uint64_t lit_min = A8_AOR_TOTAL - A8_AOR_DARK, lit_max = A8_AOR_TOTAL - A8_AOR_BRIGHT;
++	uint64_t lit = lit_min + (lit_max - lit_min) * level * level / (255 * 255);
++
++	return A8_AOR_TOTAL - (uint32_t)lit;
++}
++
++/* 0 (darkest) .. 255 (brightest); returns the AOR sent, or 0 if nothing was */
++uint32_t a8_panel_brightness(unsigned int level);
++
++uint32_t
++a8_panel_brightness(unsigned int level)
++{
++	static const unsigned char key_on[] = { 0xF0, 0x5A, 0x5A };
++	static const unsigned char key_off[] = { 0xF0, 0xA5, 0xA5 };
++	static const unsigned char update[] = { 0xF7, 0x03 };
++	unsigned char aor[3] = { 0xB1, 0, 0 };
++	uint32_t value;
++	bool ok;
++
++	if (level > 255) {
++		level = 255;
++	}
++	if (a5p_dsim == 0 || !(a5p_read(a5p_dsim, DSIM_LINK_STATUS3) & DSIM_PLL_STABLE)) {
++		printf("A8 BL: the DSI link is not up; nothing sent\n");
++		return 0;
++	}
++	value = a8_bl_aor(level);
++	aor[1] = (unsigned char)(value >> 8);
++	aor[2] = (unsigned char)value;
++	lck_mtx_lock(&a8_bl_lock);
++	ok = a8_dsi_cmd(key_on, sizeof(key_on)) && a8_dsi_cmd(aor, sizeof(aor)) &&
++	    a8_dsi_cmd(update, sizeof(update));
++	ok = a8_dsi_cmd(key_off, sizeof(key_off)) && ok;
++	a8_bl_level = (int)level;
++	a8_bl_aor_sent = value;
++	a8_bl_sends++;
++	if (!ok) {
++		a8_bl_timeouts++;
++	}
++	lck_mtx_unlock(&a8_bl_lock);
++	if (a8_bl_sends <= 8 || a8_bl_sends % 64 == 0 || !ok) {
++		printf("A8 BL: level %u -> AOR 0x%04x%s (%u sent, %u timeouts)\n", level, value,
++		    ok ? "" : ": the DSI FIFO did not drain", a8_bl_sends, a8_bl_timeouts);
++	}
++	return value;
++}
++
++int a8_panel_brightness_get(void);
++
++int
++a8_panel_brightness_get(void)
++{
++	return a8_bl_level;
++}
++
++static int
++a8_bl_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = a8_bl_level, error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (value < 0 || value > 255) {
++		return EINVAL;
++	}
++	if (value != a8_bl_level) {
++		(void)a8_panel_brightness((unsigned int)value);
++	}
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, a8_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, a8_bl_sysctl, "I", "A8 panel brightness 0-255 (AOR)");
+ #endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 5521cc0..451bdd1 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1628,6 +1628,10 @@ extern void a8_dvfs_command(const char *args);
+ extern void a8_tmu_command(const char *args);
+ extern void a8_tee_set(const char *names);      /* mem.c */
+ extern const char *a8_tee_get(void);
++extern void a8_fixinto_set(const char *names);  /* mem.c */
++extern const char *a8_fixinto_get(void);
++extern uint32_t a8_panel_brightness(unsigned int level);    /* a5xelte_panel.c */
++extern int a8_panel_brightness_get(void);
+ extern bool a8_probe_read32(vm_offset_t va, uint32_t *value, uint32_t *esr);    /* sleh.c */
+ extern void sweet_sample_task(const char *name, int pid, task_t task);         /* exception.c */
+ 
+@@ -1684,6 +1688,8 @@ a8s_command(const char *line)
+ 		    "dvfs big|little|g3d KHZ | dvfs boot | tmu [on]\n");
+ 		printf("A8SH: looking: tee NAME,NAME|- (stderr and log of those programs, "
+ 		    "from their next start) | sample NAME|PID [N]\n");
++		printf("A8SH: fixinto NAME,NAME|- (the fix library into those too) | "
++		    "bl [0-255] (panel brightness by AOR; sysctl kern.a8_brightness)\n");
+ 		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
+ 		    "(writes the slot that is not the default) | tryb (boot it once) | "
+ 		    "tryok | promote\n");
+@@ -1911,6 +1917,30 @@ a8s_command(const char *line)
+ 		printf("A8SH: tee: %s (on top of the boot list; a program named here logs to "
+ 		    "stderr from its next start: kill it)\n",
+ 		    a8_tee_get()[0] != 0 ? a8_tee_get() : "nothing");
++	} else if (a8s_word(line, "fixinto", &rest)) {
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest != 0) {
++			a8_fixinto_set(rest);
++		}
++		printf("A8SH: fixinto: %s (with a8fix=1 these also get the fix library from their next start)\n",
++		    a8_fixinto_get()[0] != 0 ? a8_fixinto_get() : "nothing");
++	} else if (a8s_word(line, "bl", &rest)) {
++		bool ok = false;
++		const char *q = rest;
++		long level;
++
++		while (*q == ' ') {
++			q++;
++		}
++		level = *q != 0 ? a8s_dec(&q, &ok) : -1;
++		if (ok && level >= 0 && level <= 255) {
++			printf("A8SH: bl %ld: AOR 0x%04x sent\n", level, a8_panel_brightness((unsigned int)level));
++		} else {
++			printf("A8SH: bl: level %d (0-255; -1 = never set: S-Boot's); bl N sets it\n",
++			    a8_panel_brightness_get());
++		}
+ 	} else if (a8s_word(line, "sample", &rest)) {
+ 		char name[20];
+ 		size_t n = 0;
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index cb04daf..b237f1e 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -246,6 +246,53 @@ a8_tee_wants(const char *name, size_t len)
+ 
+ 	return name != NULL && list[0] != 0 && a8_tee_listed(list, name, len);
+ }
++
++/*
++ * 0199: the console's "fixinto NAME,NAME|-": programs that get the fix
++ * library (a8fix=1) although their path has no ".app/" in it -- daemons, so
++ * that an uncaught exception that kills one is printed (the library's
++ * exception printer) and can be read with "tee".
++ */
++static char a8_fixinto_buf[2][128];
++static const char *volatile a8_fixinto_names = "";
++static uint32_t a8_fixinto_flip;
++
++void a8_fixinto_set(const char *names);
++const char *a8_fixinto_get(void);
++bool a8_fixinto_wants(const char *name, size_t len);
++
++void
++a8_fixinto_set(const char *names)
++{
++	char *buf = a8_fixinto_buf[++a8_fixinto_flip & 1u];
++	size_t n;
++
++	while (*names == ' ') {
++		names++;
++	}
++	if (names[0] == '-') {
++		names = "";
++	}
++	strlcpy(buf, names, sizeof(a8_fixinto_buf[0]));
++	for (n = strlen(buf); n > 0 && buf[n - 1] == ' '; n--) {
++		buf[n - 1] = 0;
++	}
++	a8_fixinto_names = buf;
++}
++
++const char *
++a8_fixinto_get(void)
++{
++	return a8_fixinto_names;
++}
++
++bool
++a8_fixinto_wants(const char *name, size_t len)
++{
++	const char *list = a8_fixinto_names;
++
++	return name != NULL && list[0] != 0 && a8_tee_listed(list, name, len);
++}
+ #endif /* JACKPOTLTE */
+ 
+ static bool
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index df37ffa..7226400 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5616,6 +5616,7 @@ static TUNABLE_STR(exec_inject_vars, 256, "jtexecenv", "");
+ #if defined(JACKPOTLTE)
+ extern bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size); /* a8_files.c */
+ extern bool a8_fix_library_ok(void); /* a8_files.c */
++extern bool a8_fixinto_wants(const char *name, size_t len); /* mem.c, console "fixinto" */
+ 
+ /*
+  * 0196: boot-arg a8fix=1 also inserts the userland fix library (typing lag:
+@@ -5731,7 +5732,8 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 		    name != NULL ? name : "(?)", any ? env : "(no match)");
+ 	}
+ #if defined(JACKPOTLTE)
+-	if (exec_inject_fix != 0 && exec_inject_is_app(imgp) && a8_fix_library_ok()) {
++	if (exec_inject_fix != 0 && (exec_inject_is_app(imgp) || a8_fixinto_wants(name, namelen)) &&
++	    a8_fix_library_ok()) {
+ 		size_t fixlen = strlen(A8_FIX_LIBRARY);
+ 
+ 		if (used + 1 + fixlen < size) {
