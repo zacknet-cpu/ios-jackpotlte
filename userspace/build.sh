@@ -76,7 +76,7 @@ echo "--- arm64 iOS libjackpotlte-gl.dylib: the EAGL shim ---"
 gl=$repo/userspace/jackpotlte-gl
 xcrun --sdk iphoneos clang "${common[@]}" "${lookup[@]}" -target arm64-apple-ios16.0 \
 	-isysroot "$sdk" -I "$gl" -dynamiclib -o "$out/libjackpotlte-gl.dylib" \
-	"$gl/gl_slots.c" "$gl/jackpotlte_gl_osmesa.c" "$gl/eagl.c" "$gl/trap.c"
+	"$gl/gl_slots.c" "$gl/jackpotlte_gl_osmesa.c" "$gl/eagl.c" "$gl/ca_fixes.c" "$gl/trap.c"
 
 # The point of the generated table: no gl* function is called by name.  iOS's own
 # OpenGLES.framework is in the dyld shared cache and defines every one of them,

@@ -94,6 +94,9 @@ open_library(void)
       "@loader_path/libOSMesa.8.dylib",
       "@loader_path/../lib/libOSMesa.8.dylib",
       "libOSMesa.8.dylib",
+      /* a shim updated over USB lives in /private/var/mobile/Library;
+       * Mesa stays where the image put it */
+      "/usr/local/lib/libOSMesa.8.dylib",
    };
    static int tried;
    const char *wanted;

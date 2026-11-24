@@ -746,6 +746,8 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 }
 
 /* Offsets from eagl_slots.txt (gl_slots.c): index = offset / 8. */
+void ca_fixes_install(void *table[JACKPOTLTE_GL_SLOTS]);   /* ca_fixes.c */
+
 static void
 install_fixes(void *table[JACKPOTLTE_GL_SLOTS])
 {
@@ -761,6 +763,7 @@ install_fixes(void *table[JACKPOTLTE_GL_SLOTS])
    table[0x1d6] = (void *)my_glTestObjectAPPLE;      /* 0x0eb0 */
    table[0x1d7] = (void *)my_glFinishObjectAPPLE;    /* 0x0eb8 */
    table[0x30c] = (void *)my_glFenceSync;            /* 0x1860 */
+   ca_fixes_install(table);
 }
 
 static struct jackpotlte_eagl *

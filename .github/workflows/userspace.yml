@@ -14,7 +14,7 @@ name: userspace
 
 on:
   push:
-    branches: [a8-gpu, a8-gpu-cache, a8-gpu2, a8-0193-gl]
+    branches: [a8-gpu, a8-gpu-cache, a8-gpu2, a8-0193-gl, a8-gl-ca]
   workflow_dispatch:
 
 concurrency:
@@ -115,6 +115,7 @@ jobs:
           outbranch=userspace-out
           if [ "${GITHUB_REF_NAME}" = a8-gpu2 ]; then outbranch=userspace-out-gpu2; fi
           if [ "${GITHUB_REF_NAME}" = a8-0193-gl ]; then outbranch=userspace-out-0193; fi
+          if [ "${GITHUB_REF_NAME}" = a8-gl-ca ]; then outbranch=userspace-out-glca; fi
           git init -q -b "$outbranch"
           git config user.name "a8-gpu"
           git config user.email "a8-gpu@users.noreply.github.com"
