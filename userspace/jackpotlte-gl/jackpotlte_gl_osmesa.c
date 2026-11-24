@@ -26,6 +26,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach-o/dyld.h>
+#include <zlib.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -224,6 +226,211 @@ mesa_fixed_copy(void)
 }
 
 /*
+ * glca18: a rebuilt Mesa (-O3, the two fixes above as source) is shipped
+ * compressed, because the console's file put takes at most 4 MiB a file and
+ * one put cannot outlast the bridge's 180 s: /private/var/mobile/Library/
+ * libOSMesa.8.next.z.0, .z.1, ... joined are "A8Z1", the library's size (8
+ * bytes, little-endian), its SHA-256 (32 bytes), then a zlib stream.  The
+ * shim inflates that once into libOSMesa.8.next.dylib (size and hash checked,
+ * the hash kept beside it) and loads it when a8gl-mesa says "1".  libz and
+ * CommonCrypto are reached with dlopen/dlsym, so the shim links nothing new.
+ * Anything wrong: the patched copy (glca16), then the original.
+ */
+#define MESA_NEXT     "/private/var/mobile/Library/libOSMesa.8.next.dylib"
+#define MESA_NEXT_PKG "/private/var/mobile/Library/libOSMesa.8.next.z"
+#define MESA_PKG_MAX  64
+
+static int
+mesa_next_wanted(void)
+{
+   FILE *f = fopen("/private/var/mobile/Library/a8gl-mesa", "r");
+   int c = f != NULL ? fgetc(f) : EOF;
+
+   if (f != NULL)
+      fclose(f);
+   return c == '1';
+}
+
+static void
+hex32(const unsigned char *h, char out[65])
+{
+   for (int i = 0; i < 32; i++)
+      snprintf(out + 2 * i, 3, "%02x", h[i]);
+}
+
+static unsigned char *
+read_whole(const char *path, size_t *size)
+{
+   struct stat st;
+   unsigned char *b;
+   int fd = open(path, O_RDONLY);
+
+   if (fd < 0)
+      return NULL;
+   if (fstat(fd, &st) != 0 || st.st_size <= 0 || (b = malloc((size_t)st.st_size)) == NULL) {
+      close(fd);
+      return NULL;
+   }
+   if (read(fd, b, (size_t)st.st_size) != st.st_size) {
+      free(b);
+      close(fd);
+      return NULL;
+   }
+   close(fd);
+   *size = (size_t)st.st_size;
+   return b;
+}
+
+static const char *
+mesa_next(void)
+{
+   typedef int (*inflate_init_fn)(z_streamp, int, const char *, int);
+   typedef int (*inflate_fn)(z_streamp, int);
+   typedef int (*inflate_end_fn)(z_streamp);
+   typedef int (*sha_init_fn)(CC_SHA256_CTX *);
+   typedef int (*sha_update_fn)(CC_SHA256_CTX *, const void *, CC_LONG);
+   typedef int (*sha_final_fn)(unsigned char *, CC_SHA256_CTX *);
+   void *libz;
+   inflate_init_fn zinit;
+   inflate_fn zinflate;
+   inflate_end_fn zend;
+   sha_init_fn hinit;
+   sha_update_fn hupdate;
+   sha_final_fn hfinal;
+   unsigned char hdr[44], got[32], *out = NULL;
+   char want_hex[65], have_hex[65] = "", part[256];
+   uint64_t raw_size = 0, written = 0;
+   size_t hdr_have = 0;
+   struct stat st;
+   z_stream z;
+   CC_SHA256_CTX ctx;
+   int fd = -1, zret = Z_OK, ok = 0, parts = 0, started = 0;
+   FILE *f;
+
+   if (!mesa_next_wanted())
+      return NULL;
+   hinit = (sha_init_fn)dlsym(RTLD_DEFAULT, "CC_SHA256_Init");
+   hupdate = (sha_update_fn)dlsym(RTLD_DEFAULT, "CC_SHA256_Update");
+   hfinal = (sha_final_fn)dlsym(RTLD_DEFAULT, "CC_SHA256_Final");
+   libz = dlopen("/usr/lib/libz.1.dylib", RTLD_NOW | RTLD_LOCAL);
+   zinit = libz != NULL ? (inflate_init_fn)dlsym(libz, "inflateInit2_") : NULL;
+   zinflate = libz != NULL ? (inflate_fn)dlsym(libz, "inflate") : NULL;
+   zend = libz != NULL ? (inflate_end_fn)dlsym(libz, "inflateEnd") : NULL;
+   if (hinit == NULL || hupdate == NULL || hfinal == NULL || zinit == NULL || zinflate == NULL || zend == NULL) {
+      say("glca18: libz or CommonCrypto not found: the old Mesa");
+      return NULL;
+   }
+
+   /* the package's header (in part 0) says which library it holds */
+   {
+      size_t n = 0;
+      unsigned char *p0 = read_whole(MESA_NEXT_PKG ".0", &n);
+
+      if (p0 == NULL || n < sizeof(hdr) || memcmp(p0, "A8Z1", 4) != 0) {
+         free(p0);
+         /* no package: an already unpacked library still counts */
+         f = fopen(MESA_NEXT ".sha256", "r");
+         if (f != NULL && fgets(have_hex, sizeof(have_hex), f) != NULL && stat(MESA_NEXT, &st) == 0) {
+            fclose(f);
+            say("glca18: %s (sha256 %.16s..., no package beside it)", MESA_NEXT, have_hex);
+            return MESA_NEXT;
+         }
+         if (f != NULL)
+            fclose(f);
+         say("glca18: a8gl-mesa says 1 but there is no %s.0: the old Mesa", MESA_NEXT_PKG);
+         return NULL;
+      }
+      memcpy(hdr, p0, sizeof(hdr));
+      free(p0);
+   }
+   for (int i = 0; i < 8; i++)
+      raw_size |= (uint64_t)hdr[4 + i] << (8 * i);
+   hex32(hdr + 12, want_hex);
+   f = fopen(MESA_NEXT ".sha256", "r");
+   if (f != NULL) {
+      if (fgets(have_hex, sizeof(have_hex), f) == NULL)
+         have_hex[0] = '\0';
+      fclose(f);
+   }
+   if (stat(MESA_NEXT, &st) == 0 && (uint64_t)st.st_size == raw_size && strcmp(have_hex, want_hex) == 0) {
+      say("glca18: %s is unpacked already (%llu bytes, sha256 %.16s...)", MESA_NEXT,
+          (unsigned long long)raw_size, want_hex);
+      return MESA_NEXT;
+   }
+
+   /* inflate every part in order into MESA_NEXT.new, hashing what comes out */
+   out = malloc(1u << 20);
+   memset(&z, 0, sizeof(z));
+   if (out == NULL || zinit(&z, 15, ZLIB_VERSION, (int)sizeof(z_stream)) != Z_OK) {
+      free(out);
+      say("glca18: inflate would not start: the old Mesa");
+      return NULL;
+   }
+   started = 1;
+   hinit(&ctx);
+   fd = open(MESA_NEXT ".new", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   for (parts = 0; fd >= 0 && parts < MESA_PKG_MAX && zret != Z_STREAM_END; parts++) {
+      size_t n = 0, skip;
+      unsigned char *b;
+
+      snprintf(part, sizeof(part), "%s.%d", MESA_NEXT_PKG, parts);
+      b = read_whole(part, &n);
+      if (b == NULL)
+         break;
+      skip = parts == 0 ? sizeof(hdr) : 0;
+      hdr_have += n;
+      z.next_in = b + skip;
+      z.avail_in = (uInt)(n - skip);
+      while (z.avail_in > 0 && zret == Z_OK) {
+         z.next_out = out;
+         z.avail_out = 1u << 20;
+         zret = zinflate(&z, Z_NO_FLUSH);
+         if (zret != Z_OK && zret != Z_STREAM_END)
+            break;
+         {
+            size_t have = (1u << 20) - z.avail_out;
+
+            if (have > 0) {
+               if (write(fd, out, have) != (ssize_t)have) {
+                  zret = Z_ERRNO;
+                  break;
+               }
+               hupdate(&ctx, out, (CC_LONG)have);
+               written += have;
+            }
+         }
+      }
+      free(b);
+   }
+   hfinal(got, &ctx);
+   hex32(got, have_hex);
+   if (started)
+      zend(&z);
+   free(out);
+   ok = fd >= 0 && zret == Z_STREAM_END && written == raw_size && strcmp(have_hex, want_hex) == 0;
+   if (fd >= 0) {
+      if (ok && fsync(fd) != 0)
+         ok = 0;
+      close(fd);
+   }
+   if (!ok || rename(MESA_NEXT ".new", MESA_NEXT) != 0) {
+      say("glca18: package not unpacked (%d parts, %llu bytes read, zlib %d, %llu of %llu bytes, "
+          "sha256 %.16s... wanted %.16s...): the old Mesa", parts, (unsigned long long)hdr_have, zret,
+          (unsigned long long)written, (unsigned long long)raw_size, have_hex, want_hex);
+      unlink(MESA_NEXT ".new");
+      return NULL;
+   }
+   f = fopen(MESA_NEXT ".sha256", "w");
+   if (f != NULL) {
+      fputs(want_hex, f);
+      fclose(f);
+   }
+   say("glca18: %s unpacked from %d parts (%llu bytes, sha256 %.16s...)", MESA_NEXT, parts,
+       (unsigned long long)written, want_hex);
+   return MESA_NEXT;
+}
+
+/*
  * Where the library may be: the one beside this one first (the phone's root has
  * both in the same directory), then the same library a directory up, then
  * whatever the loader's own search finds.  JACKPOTLTE_GL_LIBRARY answers for
@@ -252,6 +459,16 @@ open_library(void)
    if (wanted != NULL && wanted[0] != '\0') {
       lib.handle = dlopen(wanted, RTLD_NOW | RTLD_LOCAL);
       lib.where = wanted;
+   }
+   if (lib.handle == NULL) {
+      const char *next = mesa_next();             /* glca18 */
+
+      if (next != NULL) {
+         lib.handle = dlopen(next, RTLD_NOW | RTLD_LOCAL);
+         lib.where = next;
+         if (lib.handle == NULL)
+            say("glca18: %s did not load (%s): the old Mesa", next, dlerror());
+      }
    }
    if (lib.handle == NULL) {
       const char *fixed = mesa_fixed_copy();      /* glca16 */
