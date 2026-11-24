@@ -1,0 +1,420 @@
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index b5b3ba9..53c2120 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -47,6 +47,18 @@
+ 
+ #include <arm/misc_protos.h>
+ 
++#if defined(JACKPOTLTE)
++/*
++ * The A8's lower DRAM bank is in the physical aperture too when a8lowram=1
++ * (osfmk/arm64/arm_vm_init.c): maintain its cache lines through the aperture
++ * instead of a per-page copy window, and an executable page there without a
++ * whole-cache flush (cache_sync_page).
++ */
++extern bool a8lo_isphys(pmap_paddr_t pa);
++#undef isphysmem
++#define isphysmem(a)    ((((vm_address_t)(a) - gPhysBase) < gPhysSize) || a8lo_isphys((pmap_paddr_t)(a)))
++#endif /* JACKPOTLTE */
++
+ /*
+  * dcache_incoherent_io_flush64() dcache_incoherent_io_store64() result info
+  */
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 64bacc1..9e3a574 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -1467,7 +1467,7 @@ pmap_set_xprr_perm(
+ {
+ 	pvh_assert_locked(pai);
+ 
+-	const vm_offset_t kva = phystokv(vm_first_phys + (pmap_paddr_t)ptoa(pai));
++	const vm_offset_t kva = phystokv(pai_to_pa(pai));
+ 	pt_entry_t * const ptep = pmap_pte(kernel_pmap, kva);
+ 
+ 	pmap_set_pte_xprr_perm(ptep, expected_perm, new_perm);
+@@ -2654,6 +2654,36 @@ pmap_next_page(
+ }
+ 
+ 
++#if defined(JACKPOTLTE)
++/*
++ * The A8's lower DRAM bank (a8lowram=1): its safe ranges are already managed
++ * by the pmap (pa_valid, pa_index) and mapped in the physical aperture
++ * (arm_vm_init.c); here the VM gets their pages, the way ml_static_mfree()
++ * hands boot memory back, one vm_page per page from the "vm pages" zone.
++ */
++static void
++a8lo_give_to_vm(void)
++{
++	uint64_t pages = 0;
++
++	if (!a8lo_on) {
++		printf("A8 RAM: lower bank not used (boot-arg a8lowram=1 adds it)\n");
++		return;
++	}
++	for (unsigned int i = 0; i < A8LO_RANGES; i++) {
++		vm_page_create((ppnum_t)atop(a8lo_ranges[i].pa),
++		    (ppnum_t)atop(a8lo_ranges[i].pa + a8lo_ranges[i].len));
++		pages += atop(a8lo_ranges[i].len);
++		printf("A8 RAM: lower bank 0x%llx-0x%llx added (%llu MiB)\n",
++		    (unsigned long long)a8lo_ranges[i].pa,
++		    (unsigned long long)(a8lo_ranges[i].pa + a8lo_ranges[i].len - 1),
++		    (unsigned long long)(a8lo_ranges[i].len >> 20));
++	}
++	printf("A8 RAM: %llu MiB of the lower bank given to the VM, %u pages free now\n",
++	    (unsigned long long)(ptoa_64(pages) >> 20), vm_page_free_count);
++}
++#endif /* JACKPOTLTE */
++
+ /*
+  *	Initialize the pmap module.
+  *	Called by vm_init, to initialize any structures that the pmap
+@@ -2685,7 +2715,12 @@ pmap_init(
+ 	 *	structures for pages we allocate to be page tables in
+ 	 *	pmap_expand().
+ 	 */
++#if defined(JACKPOTLTE)
++	/* page table pages from the A8's lower bank sit after the upper bank's */
++	_vm_object_allocate(mem_size + (a8lo_on ? A8LO_SPAN : 0), pmap_object);
++#else
+ 	_vm_object_allocate(mem_size, pmap_object);
++#endif
+ 	pmap_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+ 
+ 	/*
+@@ -2698,6 +2733,9 @@ pmap_init(
+ 	if ((uint32_t)hard_maxproc > pmap_max_asids) {
+ 		hard_maxproc = pmap_max_asids;
+ 	}
++#if defined(JACKPOTLTE)
++	a8lo_give_to_vm();
++#endif
+ }
+ 
+ /**
+@@ -3927,7 +3965,7 @@ pmap_set_ptov_ap(unsigned int pai __unused, unsigned int ap __unused, boolean_t
+ {
+ #if __ARM_PTE_PHYSMAP__
+ 	pvh_assert_locked(pai);
+-	vm_offset_t kva = phystokv(vm_first_phys + (pmap_paddr_t)ptoa(pai));
++	vm_offset_t kva = phystokv(pai_to_pa(pai));
+ 	pt_entry_t *pte_p = pmap_pte(kernel_pmap, kva);
+ 
+ 	pt_entry_t tmplate = *pte_p;
+@@ -7440,6 +7478,17 @@ pmap_disconnect(
+ boolean_t
+ pmap_has_managed_page(ppnum_t first, ppnum_t last)
+ {
++#if defined(JACKPOTLTE)
++	/* the A8's lower bank ranges are managed too (a8lowram=1) */
++	if (a8lo_on) {
++		for (unsigned int i = 0; i < A8LO_RANGES; i++) {
++			if ((ptoa(first) < a8lo_ranges[i].pa + a8lo_ranges[i].len) &&
++			    (ptoa(last) >= a8lo_ranges[i].pa)) {
++				return TRUE;
++			}
++		}
++	}
++#endif
+ 	if (ptoa(first) >= vm_last_phys) {
+ 		return FALSE;
+ 	}
+diff --git a/osfmk/arm/pmap/pmap_data.c b/osfmk/arm/pmap/pmap_data.c
+index d8592c4..c9f8161 100644
+--- a/osfmk/arm/pmap/pmap_data.c
++++ b/osfmk/arm/pmap/pmap_data.c
+@@ -631,7 +631,12 @@ pmap_data_bootstrap(void)
+ 	vm_size_t ptd_root_table_size = num_ptd_pages * PAGE_SIZE;
+ 
+ 	/* Number of VM pages that span all of kernel-managed memory. */
++#if defined(JACKPOTLTE)
++	/* plus the index space of the A8's lower bank (pa_index), when in use */
++	const unsigned int npages = (unsigned int)(atop(mem_size) + (a8lo_on ? atop(A8LO_SPAN) : 0));
++#else
+ 	const unsigned int npages = (unsigned int)atop(mem_size);
++#endif
+ 
+ 	/* The pv_head_table and pp_attr_table both have one entry per VM page. */
+ 	const vm_size_t pp_attr_table_size = npages * sizeof(pp_attr_t);
+@@ -1222,7 +1227,7 @@ pmap_enqueue_pages(vm_page_t mem)
+ 	vm_object_lock(pmap_object);
+ 	while (mem != VM_PAGE_NULL) {
+ 		const vm_object_offset_t offset =
+-		    (vm_object_offset_t) ((ptoa(VM_PAGE_GET_PHYS_PAGE(mem))) - gPhysBase);
++		    pmap_object_offset(ptoa(VM_PAGE_GET_PHYS_PAGE(mem)));
+ 
+ 		vm_page_insert_wired(mem, pmap_object, offset, VM_KERN_MEMORY_PTE);
+ 		m_prev = mem;
+@@ -1545,7 +1550,7 @@ pmap_pages_free(pmap_paddr_t pa, __assert_only unsigned size)
+ 		 * Remove the page from the pmap's VM object and return it back to the
+ 		 * VM's global free list of pages.
+ 		 */
+-		mem = vm_page_lookup(pmap_object, (pa - gPhysBase));
++		mem = vm_page_lookup(pmap_object, pmap_object_offset(pa));
+ 		assert(mem != VM_PAGE_NULL);
+ 		assert(VM_PAGE_WIRED(mem));
+ 		vm_page_lock_queues();
+diff --git a/osfmk/arm/pmap/pmap_data.h b/osfmk/arm/pmap/pmap_data.h
+index 2883f63..c6df08f 100644
+--- a/osfmk/arm/pmap/pmap_data.h
++++ b/osfmk/arm/pmap/pmap_data.h
+@@ -62,6 +62,44 @@
+  */
+ extern pmap_paddr_t vm_first_phys, vm_last_phys;
+ 
++#if defined(JACKPOTLTE)
++/*
++ * Galaxy A8 2018 (4 GB): DRAM is two 2 GiB banks, 0x80000000-0xffffffff and
++ * 0x880000000-0x8ffffffff.  XNU's managed range [vm_first_phys, vm_last_phys)
++ * is the upper bank only.  With the boot-arg a8lowram=1 the safe parts of the
++ * lower bank are managed too (a8lo_ranges, osfmk/arm64/arm_vm_init.c): their
++ * pmap indices follow the upper bank's (pa_index), the physical aperture maps
++ * them at one more ptov_table entry, and the VM gets their pages through
++ * vm_page_create() (pmap.c, a8lo_give_to_vm).  What stays out: the Samsung
++ * reserved-memory carve-outs (sec_debug_magic, dram_test, tima, seclog,
++ * wifibt_if, abox, the framebuffer and boot-slot page, modem_if,
++ * cp_ram_logging, gnss_if), the TEE hole 0xbda00000-0xbfffffff and the
++ * secondary-core trampoline page 0x8f000000.
++ */
++#define A8LO_BASE       0x80000000ULL
++#define A8LO_SPAN       0x80000000ULL
++#define A8LO_RANGES     6
++struct a8lo_range {
++	uint64_t pa, len;
++};
++extern const struct a8lo_range a8lo_ranges[A8LO_RANGES];
++extern unsigned int a8lo_on;
++
++static inline bool
++a8lo_valid(pmap_paddr_t pa)
++{
++	if (!a8lo_on || (pa - A8LO_BASE) >= A8LO_SPAN) {
++		return false;
++	}
++	for (unsigned int i = 0; i < A8LO_RANGES; i++) {
++		if ((pa - a8lo_ranges[i].pa) < a8lo_ranges[i].len) {
++			return true;
++		}
++	}
++	return false;
++}
++#endif /* JACKPOTLTE */
++
+ /**
+  * Return whether the given address represents a kernel-managed physical page.
+  *
+@@ -74,6 +112,11 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
+ static inline bool
+ pa_valid(pmap_paddr_t pa)
+ {
++#if defined(JACKPOTLTE)
++	if (__improbable(pa < vm_first_phys)) {
++		return a8lo_valid(pa);
++	}
++#endif
+ 	return (pa >= vm_first_phys) && (pa < vm_last_phys);
+ }
+ 
+@@ -97,9 +140,42 @@ pa_valid(pmap_paddr_t pa)
+ static inline unsigned int
+ pa_index(pmap_paddr_t pa)
+ {
++#if defined(JACKPOTLTE)
++	if (__improbable(pa < vm_first_phys)) {
++		return (unsigned int)(atop(vm_last_phys - vm_first_phys) + atop(pa - A8LO_BASE));
++	}
++#endif
+ 	return (unsigned int)atop(pa - vm_first_phys);
+ }
+ 
++/* The physical address of a physical address index (the inverse of pa_index). */
++static inline pmap_paddr_t
++pai_to_pa(unsigned int pai)
++{
++#if defined(JACKPOTLTE)
++	if (__improbable(pai >= atop(vm_last_phys - vm_first_phys))) {
++		return A8LO_BASE + (pmap_paddr_t)ptoa(pai - atop(vm_last_phys - vm_first_phys));
++	}
++#endif
++	return vm_first_phys + (pmap_paddr_t)ptoa(pai);
++}
++
++/*
++ * The offset in pmap_object of a page table page at `pa` (pmap_data.c).  The
++ * upper bank keeps its offsets (pa - gPhysBase, and vm_first_phys is
++ * gPhysBase); the lower bank's follow them, like its pmap indices.
++ */
++static inline vm_object_offset_t
++pmap_object_offset(pmap_paddr_t pa)
++{
++#if defined(JACKPOTLTE)
++	if (__improbable(pa < vm_first_phys)) {
++		return (vm_object_offset_t)(vm_last_phys - vm_first_phys) + (pa - A8LO_BASE);
++	}
++#endif
++	return (vm_object_offset_t)(pa - vm_first_phys);
++}
++
+ /* See the definition of pv_head_table for more information. */
+ extern pv_entry_t **pv_head_table;
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 671c55a..a1ad465 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -366,6 +366,56 @@ typedef struct {
+ SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
+ SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+ 
++#if defined(JACKPOTLTE)
++/*
++ * The A8's lower DRAM bank, 0x80000000-0xffffffff (osfmk/arm/pmap/pmap_data.h
++ * has the same definitions and says how the pmap uses it).  Boot-arg
++ * a8lowram=1.  The ranges are the Linux "System RAM" of this phone (Samsung
++ * DT memory@80000000 is 0x3da00000 long; the TEE hole follows) minus every
++ * fixed reserved-memory node and the secondary-core trampoline page, each
++ * edge on a 2 MiB block so the aperture can use L2 blocks:
++ *   0x80000000 sec_debug_magic, 0x80002000 dram_test, 0x8f000000 trampoline,
++ *   0xb8000000 tima_region (2 MiB), 0xbda00000-0xbfffffff not RAM,
++ *   0xc0000000 seclog_mem, 0xe9000000 wifibt_if (4 MiB) and abox_rmem
++ *   (4 MiB), 0xec000000 framebuffer and the boot-slot page (20 MiB),
++ *   0xf5400000-0xffffffff modem_if, cp_ram_logging, gnss_if.
++ * 1802 MiB in all.
++ */
++#define A8LO_BASE       0x80000000ULL
++#define A8LO_SPAN       0x80000000ULL
++#define A8LO_RANGES     6
++struct a8lo_range {
++	uint64_t pa, len;
++};
++const struct a8lo_range a8lo_ranges[A8LO_RANGES] = {
++	{ 0x80200000ULL, 0x0ee00000ULL },       /* 238 MiB, to 0x8effffff */
++	{ 0x8f200000ULL, 0x28e00000ULL },       /* 654 MiB, to 0xb7ffffff */
++	{ 0xb8200000ULL, 0x05800000ULL },       /*  88 MiB, to 0xbd9fffff */
++	{ 0xc0200000ULL, 0x28e00000ULL },       /* 654 MiB, to 0xe8ffffff */
++	{ 0xe9800000ULL, 0x02800000ULL },       /*  40 MiB, to 0xebffffff */
++	{ 0xed400000ULL, 0x08000000ULL },       /* 128 MiB, to 0xf53fffff */
++};
++SECURITY_READ_ONLY_LATE(unsigned int) a8lo_on = 0;
++SECURITY_READ_ONLY_LATE(vm_map_address_t) a8lo_va = 0;
++
++/* osfmk/arm/caches.c: whether a lower-bank PA is in the physical aperture */
++bool a8lo_isphys(pmap_paddr_t pa);
++
++bool
++a8lo_isphys(pmap_paddr_t pa)
++{
++	if (!a8lo_on || (pa - A8LO_BASE) >= A8LO_SPAN) {
++		return false;
++	}
++	for (unsigned int i = 0; i < A8LO_RANGES; i++) {
++		if ((pa - a8lo_ranges[i].pa) < a8lo_ranges[i].len) {
++			return true;
++		}
++	}
++	return false;
++}
++#endif /* JACKPOTLTE */
++
+ #if defined(JACKPOTLTE)
+ /*
+  * Bring-up aid.  An illegal PA panics deep inside a cache maintenance
+@@ -1624,6 +1674,50 @@ arm_vm_physmap_init(boot_args *args)
+ 
+ #else
+ 
++#if defined(JACKPOTLTE)
++/*
++ * The lower bank's safe ranges in the physical aperture: one ptov_table entry
++ * for the whole 2 GiB bank (so phystokv/ml_static_vtop work for any of it),
++ * but L2 blocks only over a8lo_ranges.  Nothing at all is mapped over the
++ * carve-outs: no cacheable alias of the framebuffer, and no speculative
++ * fetch into memory the secure world protects.
++ */
++static void
++a8lo_map(ptov_table_entry *temp_ptov_table)
++{
++	vm_map_address_t va;
++
++	if (ptov_index == 0 || ptov_index >= PTOV_TABLE_SIZE) {
++		a8lo_on = 0;
++		return;
++	}
++	va = ROUND_TWIG(temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len);
++	if (va + A8LO_SPAN > physmap_end) {
++		a8lo_on = 0;
++		return;
++	}
++	for (unsigned int i = 0; i < A8LO_RANGES; i++) {
++		for (uint64_t off = 0; off < a8lo_ranges[i].len; off += ARM_TT_L2_SIZE) {
++			const pmap_paddr_t pa = a8lo_ranges[i].pa + off;
++			tt_entry_t *tte2 = arm_kva_to_tte(va + (pa - A8LO_BASE));
++			tt_entry_t tmplate = (pa & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
++			    | ARM_TTE_VALID | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_NX | ARM_TTE_BLOCK_PNX
++			    | ARM_TTE_BLOCK_AP(AP_RWNA) | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY)
++			    | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITEBACK);
++#if __ARM_KERNEL_PROTECT__
++			tmplate |= ARM_TTE_BLOCK_NG;
++#endif /* __ARM_KERNEL_PROTECT__ */
++			*tte2 = tmplate;
++		}
++	}
++	temp_ptov_table[ptov_index].pa = A8LO_BASE;
++	temp_ptov_table[ptov_index].va = va;
++	temp_ptov_table[ptov_index].len = A8LO_SPAN;
++	++ptov_index;
++	a8lo_va = va;
++}
++#endif /* JACKPOTLTE */
++
+ static void
+ arm_vm_physmap_init(boot_args *args)
+ {
+@@ -1640,6 +1734,12 @@ arm_vm_physmap_init(boot_args *args)
+ 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
+ 	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
+ 
++#if defined(JACKPOTLTE)
++	if (a8lo_on) {
++		a8lo_map(temp_ptov_table);      // the A8's lower DRAM bank, after the rest
++	}
++#endif
++
+ 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
+ 
+ 	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
+@@ -1906,6 +2006,18 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 */
+ 	gVirtBase = args->virtBase;
+ 	gPhysBase = args->physBase;
++#if defined(JACKPOTLTE)
++	{
++		/* a8lowram=1: the lower DRAM bank too (pmap_data.h), only when XNU
++		 * runs in the upper one, which the lower bank's indices follow */
++		unsigned int on = 0;
++
++		if (PE_parse_boot_argn("a8lowram", &on, sizeof(on)) && (on == 1) &&
++		    (gPhysBase >= A8LO_BASE + A8LO_SPAN)) {
++			a8lo_on = 1;
++		}
++	}
++#endif
+ #if KASAN
+ 	real_phys_size = args->memSize + (shadow_ptop - shadow_pbase);
+ #else
+@@ -1980,6 +2092,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+ #endif // ARM_LARGE_MEMORY
+ #endif
++#if defined(JACKPOTLTE)
++	if (a8lo_on) {
++		/* the lower bank's aperture comes after the upper bank's (a8lo_map) */
++		static_memory_end += A8LO_SPAN + ARM_TT_TWIG_SIZE;
++		physmap_end += A8LO_SPAN + ARM_TT_TWIG_SIZE;
++	}
++#endif
+ 
+ #if KASAN && !defined(ARM_LARGE_MEMORY)
+ 	/* add the KASAN stolen memory to the physmap */
