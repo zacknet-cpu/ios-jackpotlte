@@ -57,6 +57,15 @@
  * the retries go on as before. The approach is Scion's (inject_sb.c,
  * step 105).
  *
+ * Status bar (v10): DynamicSplit lays the bar out for the 393 pt iPhone 14
+ * Pro; on this 360 pt screen the clock sat 22 pt from the left edge and the
+ * battery 49 pt from the right one, too far toward the island.  After each
+ * layout of _UIStatusBarForegroundView the items left of its middle move so
+ * the leftmost starts a margin from the left edge, and the ones right of it
+ * so the rightmost ends the same margin from the right edge.  The margin is
+ * 16 pt, or the number in /private/var/mobile/Library/a8fix-sbmargin (points,
+ * 2 to 60, read once when the process starts).
+ *
  * View dump (v6): SIGUSR1 (console "kill NAME 30") makes the process write
  * every visible window's views to stderr, one line each: depth, class, frame
  * in window points, and a label's text ("A8VIEW ..."), seen with tee. It is
@@ -626,7 +635,112 @@ own_method(Class cls, const char *selector, IMP imp, const char *types)
 	return method_setImplementation(m, imp);
 }
 
-static int layout_kb_done, layout_cc_done;
+/* ---- status bar (v10) ----------------------------------------------- */
+
+static void (*sb_fg_layout_orig)(id, SEL);
+static double sb_margin = -1;
+static int sb_said;
+
+static double
+sb_margin_now(void)
+{
+	if (sb_margin < 0) {
+		Class string = objc_getClass("NSString");
+		id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+		id (*from_file)(Class, SEL, id, unsigned long, id *) =
+		    (id (*)(Class, SEL, id, unsigned long, id *))objc_msgSend;
+		double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+		double v = 0;
+
+		if (string != 0) {
+			id path = make(string, sel_registerName("stringWithUTF8String:"),
+			    "/private/var/mobile/Library/a8fix-sbmargin");
+			id text = from_file(string, sel_registerName("stringWithContentsOfFile:encoding:error:"),
+			    path, 4 /* NSUTF8StringEncoding */, 0);
+
+			if (text != 0)
+				v = dbl(text, sel_registerName("doubleValue"));
+		}
+		sb_margin = (v >= 2 && v <= 60) ? v : 16;
+	}
+	return sb_margin;
+}
+
+static void
+sb_fg_layout(id self, SEL cmd)
+{
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+	unsigned long (*count)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
+	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	void (*set_rect)(id, SEL, fix_rect) = (void (*)(id, SEL, fix_rect))objc_msgSend;
+	double lmin = 1e9, rmax = -1e9, dl = 0, dr = 0, m;
+	unsigned long n, nl = 0, nr = 0;
+	fix_rect b;
+	id views;
+
+	sb_fg_layout_orig(self, cmd);
+	b = rect(self, sel_registerName("bounds"));
+	if (b.w < 250 || b.w > 500 || b.h > 120)
+		return;                 /* a portrait phone's bar only */
+	m = sb_margin_now();
+	views = get(self, sel_registerName("subviews"));
+	n = views ? count(views, sel_registerName("count")) : 0;
+	for (unsigned long i = 0; i < n; i++) {
+		id v = at(views, sel_registerName("objectAtIndex:"), i);
+		fix_rect f;
+
+		if (flag(v, sel_registerName("isHidden")))
+			continue;
+		f = rect(v, sel_registerName("frame"));
+		if (f.w < 0.5 || f.w > b.w / 3)
+			continue;       /* nothing bar-wide */
+		if (f.x + f.w / 2 < b.w / 2) {
+			lmin = f.x < lmin ? f.x : lmin;
+			nl++;
+		} else {
+			rmax = f.x + f.w > rmax ? f.x + f.w : rmax;
+			nr++;
+		}
+	}
+	if (nl)
+		dl = m - lmin;
+	if (nr)
+		dr = (b.w - m) - rmax;
+	if (dl > -0.25 && dl < 0.25 && dr > -0.25 && dr < 0.25)
+		return;
+	for (unsigned long i = 0; i < n; i++) {
+		id v = at(views, sel_registerName("objectAtIndex:"), i);
+		fix_rect f;
+
+		if (flag(v, sel_registerName("isHidden")))
+			continue;
+		f = rect(v, sel_registerName("frame"));
+		if (f.w < 0.5 || f.w > b.w / 3)
+			continue;
+		f.x += (f.x + f.w / 2 < b.w / 2) ? dl : dr;
+		set_rect(v, sel_registerName("setFrame:"), f);
+	}
+	if (sb_said < 2) {
+		struct vline l;
+
+		l.n = 0;
+		vl_str(&l, "A8FIX status bar: left items moved ");
+		vl_num(&l, dl);
+		vl_str(&l, " pt, right items ");
+		vl_num(&l, dr);
+		vl_str(&l, " pt (margin ");
+		vl_num(&l, m);
+		vl_str(&l, ", bar ");
+		vl_num(&l, b.w);
+		vl_str(&l, " wide)\n");
+		write(2, l.b, l.n);
+		sb_said++;
+	}
+}
+
+static int layout_kb_done, layout_cc_done, layout_sb_done;
 
 static void
 layout_apply(void)
@@ -641,6 +755,12 @@ layout_apply(void)
 		m = bl_method("UIKeyboardImpl", "defaultSizeForInterfaceOrientation:", 1, "{");
 		if (m)
 			kbi_size_orig = (fix_size (*)(id, SEL, long))method_setImplementation(m, (IMP)kbi_size);
+	}
+	if (!layout_sb_done && objc_getClass("_UIStatusBarForegroundView") != 0) {
+		layout_sb_done = 1;
+		sb_fg_layout_orig = (void (*)(id, SEL))own_method(objc_getClass("_UIStatusBarForegroundView"),
+		    "layoutSubviews", (IMP)sb_fg_layout, "v16@0:8");
+		fix_put(sb_fg_layout_orig ? "A8FIX status bar: edge layout hooked\n" : "A8FIX status bar: not hooked\n");
 	}
 	if (!layout_cc_done && objc_getClass("CCUIOverlayStatusBarPresentationProvider") != 0) {
 		layout_cc_done = 1;
