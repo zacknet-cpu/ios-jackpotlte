@@ -1,0 +1,194 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index daf1dfe..2b38486 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1902,8 +1902,10 @@ a8s_command(const char *line)
+ 		while (*rest == ' ') {
+ 			rest++;
+ 		}
+-		/* 0203: "flip a" async SwapEnd, "flip s" synchronous again */
+-		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : *rest == 'a' ? 2 : *rest == 's' ? 3 : -1;
++		/* 0203: "flip a" async SwapEnd, "flip s" synchronous again;
++		 * 0207: "flip g" / "flip n" a swap waits for the GPU or not */
++		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : *rest == 'a' ? 2 : *rest == 's' ? 3 :
++		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : -1;
+ 		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
+ 	} else if (a8s_word(line, "date", &rest)) {
+ 		while (*rest == ' ') {
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index da55307..1633645 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -936,12 +936,28 @@ jt_mali_worker(void *parameter, wait_result_t result)
+ 	}
+ }
+ 
++/* 0207: the last job number handed out (0: none yet), for SwapEnd. */
++uint64_t
++jackpotlte_mali_queued_seq(void)
++{
++	uint64_t seq;
++
++	lck_mtx_lock(&jt_queue_lock);
++	seq = jt_queued_seq;
++	lck_mtx_unlock(&jt_queue_lock);
++	return seq;
++}
++
++extern void sweet_fb_gpu_gate(void);    /* SweetFramebuffer.cpp, 0207 */
++
+ uint64_t
+ jackpotlte_mali_enqueue(uint64_t chain, bool fragment)
+ {
+ 	uint64_t seq;
+ 	unsigned at;
+ 
++	/* 0207: with async SwapEnd, not into a buffer the panel still shows. */
++	sweet_fb_gpu_gate();
+ 	lck_mtx_lock(&jt_queue_lock);
+ 	if (!jt_worker_started) {
+ 		thread_t thread;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 63ada96..bac81c9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -245,6 +245,15 @@ static void a8_scan_to_panel(AppleCLCD *fb, bool copy);
+  * (kern.a8_flip_wait) only right before its next frame goes to the GPU. */
+ static volatile int  a8_flip_async;
+ static uint64_t      a8_flip_settles, a8_flip_settle_us;
++/* 0207: a swap waits for the GPU to finish what is queued (the frame it
++ * presents) before the panel is pointed at it, and with async SwapEnd a GPU
++ * job waits until the panel took a pending flip, so the GPU never draws into
++ * the buffer on the panel.  Boot-arg a8flipgpu (default 1), console "flip g"
++ * (on) and "flip n" (off).  A swap that came within fMinGap of the last
++ * present is shown at once instead of by the vsync timer (a8_swap_quick). */
++static int           a8_flip_gpu = -1;
++static uint64_t      a8_flip_gpu_busy, a8_flip_gpu_us, a8_flip_gpu_late;
++static uint64_t      a8_gpu_gates, a8_gpu_gate_us, a8_swap_quick;
+ /* 0204: the software vsync follows the panel's frame starts (seen when an
+  * update is taken), so CoreAnimation's frames start right after the panel
+  * took the last one instead of anywhere in its refresh. */
+@@ -542,6 +551,9 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" IOMemoryDescriptor *sweet_fb_scanout_claim(SweetSurface *s);
+ extern "C" void sweet_fb_scanout_release(SweetSurface *s);
+ extern "C" int sweet_fb_flip_set(int on);
++extern "C" uint64_t jackpotlte_mali_queued_seq(void);            /* jackpotlte_mali.c, 0207 */
++extern "C" bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
++extern "C" void sweet_fb_gpu_gate(void);
+ 
+ #define A8_FB_RESERVED          0x1400000ull    /* reserved-memory framebuffer@0xEC000000 */
+ #define A8_IDMA0                0x148b1000ul
+@@ -563,6 +575,17 @@ a8_flip_on(void)
+ 	return a8_flip > 0;
+ }
+ 
++static bool
++a8_flip_gpu_on(void)
++{
++	if (a8_flip_gpu < 0) {
++		int on = 1;
++		PE_parse_boot_argn("a8flipgpu", &on, sizeof(on));
++		a8_flip_gpu = on != 0;
++	}
++	return a8_flip_gpu > 0;
++}
++
+ /* Whether the panel has an update it has not taken yet (0203). */
+ static bool
+ a8_scan_pending(void)
+@@ -594,11 +617,56 @@ a8_scan_settle(void)
+ 	return us;
+ }
+ 
++/* 0207: called by jackpotlte_mali_enqueue() before a GPU job is queued.  With
++ * async SwapEnd the next frame may start drawing while the panel has not yet
++ * taken the flip to the last one, i.e. into the buffer it still shows (seen as
++ * heavy flicker on 11-24); the job waits for that, at most 20 ms. */
++extern "C" void
++sweet_fb_gpu_gate(void)
++{
++	uint32_t us;
++
++	if (!a8_flip_async || !a8_flip_gpu_on() || !a8_scan_pending()) {
++		return;
++	}
++	us = a8_scan_settle();
++	a8_gpu_gates++;
++	a8_gpu_gate_us += us;
++}
++
++/* 0207: before a swap points the panel at a buffer, the GPU finishes what is
++ * queued, which includes the frame being presented (at most 50 ms). */
++static void
++a8_flip_gpu_wait(void)
++{
++	uint64_t seq, t0, ns;
++	bool done;
++
++	if (!a8_flip_gpu_on()) {
++		return;
++	}
++	seq = jackpotlte_mali_queued_seq();
++	if (seq == 0 || jackpotlte_mali_wait(seq, 0)) {
++		return;
++	}
++	t0 = mach_absolute_time();
++	done = jackpotlte_mali_wait(seq, 50ull * NSEC_PER_MSEC);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	a8_flip_gpu_busy++;
++	a8_flip_gpu_us += ns / 1000;
++	if (!done && a8_flip_gpu_late++ < 8) {
++		IOLog("A8 FLIP: the GPU was still busy 50 ms into a swap (job %llu)\n", seq);
++	}
++}
++
+ /* Show a buffer: physical address and full width in pixels.  Waits for the
+  * frame that takes it when wait is true (and SwapEnd is not async, 0203). */
+ static void
+ a8_scan_show(AppleCLCD *fb, uint32_t addr, uint32_t width, bool wait)
+ {
++	if (wait) {
++		a8_flip_gpu_wait();     /* 0207: a swap; not the claim/release paths */
++	}
+ 	if (a8_idma == 0) {
+ 		a8_idma = ml_io_map(A8_IDMA0, 0x1000);
+ 		a8_decon = ml_io_map(A8_DECON, 0x1000);
+@@ -829,6 +897,11 @@ sweet_fb_flip_set(int on)
+ 		a8_flip_async = on == 2;
+ 		on = -1;
+ 	}
++	if (on == 4 || on == 5) {                       /* 0207: "flip g" / "flip n" */
++		(void)a8_flip_gpu_on();
++		a8_flip_gpu = on == 4;
++		on = -1;
++	}
+ 	if (on >= 0) {
+ 		(void)a8_flip_on();
+ 		if (fb != NULL) {
+@@ -844,6 +917,10 @@ sweet_fb_flip_set(int on)
+ 	    "for the update before (%llu us)\n", a8_flip_on() ? "on" : "off",
+ 	    a8_flips, a8_flip_late, a8_scan_owner != NULL ? "in use" : "free",
+ 	    a8_flip_async ? "async" : "waits for the panel", a8_flip_settles, a8_flip_settle_us);
++	IOLog("A8 FLIP: GPU wait %s: %llu swaps found it busy (%llu us, %llu over 50 ms); "
++	    "%llu jobs held for the panel (%llu us); %llu quick swaps shown at once\n",
++	    a8_flip_gpu_on() ? "on" : "off", a8_flip_gpu_busy, a8_flip_gpu_us, a8_flip_gpu_late,
++	    a8_gpu_gates, a8_gpu_gate_us, a8_swap_quick);
+ 	return a8_flip_on();
+ }
+ 
+@@ -918,6 +995,15 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fDirty = true;
+ 	uint64_t now = mach_absolute_time();
+ 	bool copyNow = !fPowerOff && now - fLastPresent >= fMinGap;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	/* 0207: with scan-out flips a present is cheap.  Leaving a swap that came
++	 * within fMinGap of the last present to the vsync timer let CoreAnimation
++	 * draw its next frame into the buffer still on the panel. */
++	if (!copyNow && !fPowerOff && a8_flip_on()) {
++		copyNow = true;
++		a8_swap_quick++;
++	}
++#endif
+ 	if (copyNow) {
+ 		fDirty = false;
+ 		fLastPresent = now;
