@@ -175,6 +175,21 @@ def build():
     root.children.append(mkadt.node('a5xelte-emmc', [
         ('reg', mkadt.u64(0x13500000, 0x2000)),
     ]))
+    # Dynamic Island (2026-11-24): libMobileGestalt reads ArtworkTraits from
+    # IODeviceTree:/product; with A8_ARTWORK_SUBTYPE=2556 (iPhone 14 Pro)
+    # SpringBoard shows the system aperture. The node is the one the 0198-island
+    # slot booted with (artwork-device-idiom iphone, subtype, scale 3, dynamic
+    # displaymode 0, phandle 999).
+    subtype = os.environ.get('A8_ARTWORK_SUBTYPE')
+    if subtype:
+        root.children = [n for n in root.children if n.prop('name') != mkadt.cstr('product')]
+        root.children.append(mkadt.node('product', [
+            ('AAPL,phandle', mkadt.u32(999)),
+            ('artwork-device-idiom', mkadt.cstr('iphone')),
+            ('artwork-device-subtype', mkadt.u32(int(subtype, 0))),
+            ('artwork-scale-factor', mkadt.u32(int(os.environ.get('A8_ARTWORK_SCALE', '3'), 0))),
+            ('artwork-dynamic-displaymode', mkadt.u32(0)),
+        ]))
     return root
 
 
