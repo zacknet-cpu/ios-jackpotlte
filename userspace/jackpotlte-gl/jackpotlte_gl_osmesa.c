@@ -22,6 +22,9 @@
 #include "jackpotlte_gl.h"
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <mach-o/dyld.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -82,6 +85,145 @@ say(const char *format, ...)
 }
 
 /*
+ * glca16: Mesa 25.0.7 as built for the phone (mesa-out b8da8f55, LC_UUID
+ * 938e27a4-44bb-3ae4-b065-c20ecaefb07b) writes the Bifrost framebuffer
+ * preload's padding attribute buffer 0x100 bytes into its 0x20-byte pool
+ * allocation (pan_preload_fb_part + 0x348: str q0, [x0, #0x100]; the
+ * allocation is 2 x 16-byte ATTRIBUTE_BUFFER, the second belongs at +0x10).
+ * Usually that only overwrites the next descriptor in the pool; at the end of
+ * a pool buffer it lands in the next mapping, and backboardd died with SIGBUS
+ * (12 of its 16 crashes, 11-22..24, all at Mesa + 0x41a308).  The fix is that
+ * one instruction (imm12 0x10 -> 0x1): the library is copied from
+ * /usr/local/lib to /private/var/mobile/Library under its own name, checked
+ * (size, UUID, the old bytes) and patched there once, and that copy is loaded.
+ * Switch: a8gl-mesafix "0" loads the original.
+ */
+#define MESA_SRC   "/usr/local/lib/libOSMesa.8.dylib"
+#define MESA_FIXED "/private/var/mobile/Library/libOSMesa.8.a8fix2.dylib"
+static const unsigned char mesa_uuid[16] = {
+   0x93, 0x8e, 0x27, 0xa4, 0x44, 0xbb, 0x3a, 0xe4, 0xb0, 0x65, 0xc2, 0x0e, 0xca, 0xef, 0xb0, 0x7b,
+};
+/*
+ * glca17b: one more, in this port's own DRM stand-in (userspace/libjackpotlte,
+ * built into Mesa): jt_bo_madvise asked the kernel, which answers it without
+ * doing anything (retained = 1, JackpotlteMali.cpp); ~5% of the render thread
+ * while scrolling.  It now stores retained = 1 and returns 0 in place.
+ * jt_wait_bo stays a kernel call: WAIT_BO really waits for the buffer's last
+ * job (the top of externalMethod; the switch's case is dead code), and glca17,
+ * which answered it in place too, let Mesa reuse buffers the GPU was still
+ * reading: job faults, 10 s waits (11-24 17:33 UTC).  Its copy
+ * (libOSMesa.8.a8fixed.dylib) is not used by anything.
+ */
+static const struct {
+   size_t offset, length;
+   unsigned char was[20], fixed[20];
+} mesa_fixes[] = {
+   /* pan_preload_fb_part + 0x348: str q0, [x0, #0x100] -> [x0, #0x10] */
+   { 0x41a308, 4, { 0x00, 0x40, 0x80, 0x3d }, { 0x00, 0x04, 0x80, 0x3d } },
+   /* jt_bo_madvise: cbz x3, 1f; mov w8, #1; str w8, [x3]; 1: mov w0, #0; ret */
+   { 0x49bea0, 20,
+     { 0xe8, 0x03, 0x00, 0xaa, 0xa0, 0x02, 0x80, 0x12, 0xa8, 0x02, 0x00, 0xb4,
+       0x81, 0x02, 0x00, 0x34, 0xff, 0xc3, 0x00, 0xd1 },
+     { 0x63, 0x00, 0x00, 0xb4, 0x28, 0x00, 0x80, 0x52, 0x68, 0x00, 0x00, 0xb9,
+       0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6 } },
+};
+
+static int
+mesa_uuid_matches(const unsigned char *b, size_t size)
+{
+   uint32_t ncmds, at = 32;
+
+   if (size < 32 || *(const uint32_t *)b != 0xfeedfacfu)
+      return 0;
+   ncmds = *(const uint32_t *)(b + 16);
+   for (uint32_t i = 0; i < ncmds && at + 8 <= size; i++) {
+      uint32_t cmd = *(const uint32_t *)(b + at), len = *(const uint32_t *)(b + at + 4);
+
+      if (cmd == 0x1b && at + 24 <= size)          /* LC_UUID */
+         return memcmp(b + at + 8, mesa_uuid, 16) == 0;
+      if (len < 8)
+         return 0;
+      at += len;
+   }
+   return 0;
+}
+
+static const char *
+mesa_fixed_copy(void)
+{
+   struct stat src, dst;
+   unsigned char *b = NULL;
+   size_t n = sizeof(mesa_fixes) / sizeof(mesa_fixes[0]);
+   int fd, ok = 1;
+   FILE *sw = fopen("/private/var/mobile/Library/a8gl-mesafix", "r");
+
+   if (sw != NULL) {
+      int c = fgetc(sw);
+
+      fclose(sw);
+      if (c == '0') {
+         say("glca16: Mesa fix off (a8gl-mesafix \"0\"): the original library");
+         return NULL;
+      }
+   }
+   if (stat(MESA_SRC, &src) != 0)
+      return NULL;
+   /* a copy made before: the right size and every fix in place */
+   if (stat(MESA_FIXED, &dst) == 0 && dst.st_size == src.st_size &&
+       (fd = open(MESA_FIXED, O_RDONLY)) >= 0) {
+      for (size_t i = 0; i < n && ok; i++) {
+         unsigned char now[20];
+         size_t len = mesa_fixes[i].length;
+
+         ok = pread(fd, now, len, (off_t)mesa_fixes[i].offset) == (ssize_t)len &&
+              memcmp(now, mesa_fixes[i].fixed, len) == 0;
+      }
+      close(fd);
+      if (ok)
+         return MESA_FIXED;
+   }
+   /* make it: read, check, patch, write beside, rename */
+   b = malloc((size_t)src.st_size);
+   fd = b != NULL ? open(MESA_SRC, O_RDONLY) : -1;
+   if (fd < 0 || read(fd, b, (size_t)src.st_size) != (ssize_t)src.st_size) {
+      say("glca16: cannot read %s: the original library", MESA_SRC);
+      if (fd >= 0)
+         close(fd);
+      free(b);
+      return NULL;
+   }
+   close(fd);
+   if (!mesa_uuid_matches(b, (size_t)src.st_size)) {
+      say("glca16: %s is not the Mesa build the fix is for (UUID): the original library", MESA_SRC);
+      free(b);
+      return NULL;
+   }
+   for (size_t i = 0; i < n; i++) {
+      size_t len = mesa_fixes[i].length;
+
+      if (mesa_fixes[i].offset + len > (size_t)src.st_size ||
+          memcmp(b + mesa_fixes[i].offset, mesa_fixes[i].was, len) != 0) {
+         say("glca16: %s has other bytes at %#zx: the original library", MESA_SRC, mesa_fixes[i].offset);
+         free(b);
+         return NULL;
+      }
+      memcpy(b + mesa_fixes[i].offset, mesa_fixes[i].fixed, len);
+   }
+   fd = open(MESA_FIXED ".new", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   ok = fd >= 0 && write(fd, b, (size_t)src.st_size) == (ssize_t)src.st_size && fsync(fd) == 0;
+   if (fd >= 0)
+      close(fd);
+   free(b);
+   if (!ok || rename(MESA_FIXED ".new", MESA_FIXED) != 0) {
+      say("glca16: cannot write %s: the original library", MESA_FIXED);
+      return NULL;
+   }
+   say("glca17b: %s made from %s with %zu fixes (preload padding descriptor; madvise "
+       "answered in place)", MESA_FIXED, MESA_SRC, n);
+   return MESA_FIXED;
+}
+
+/*
  * Where the library may be: the one beside this one first (the phone's root has
  * both in the same directory), then the same library a directory up, then
  * whatever the loader's own search finds.  JACKPOTLTE_GL_LIBRARY answers for
@@ -110,6 +252,16 @@ open_library(void)
    if (wanted != NULL && wanted[0] != '\0') {
       lib.handle = dlopen(wanted, RTLD_NOW | RTLD_LOCAL);
       lib.where = wanted;
+   }
+   if (lib.handle == NULL) {
+      const char *fixed = mesa_fixed_copy();      /* glca16 */
+
+      if (fixed != NULL) {
+         lib.handle = dlopen(fixed, RTLD_NOW | RTLD_LOCAL);
+         lib.where = fixed;
+         if (lib.handle == NULL)
+            say("glca16: %s did not load (%s): the original library", fixed, dlerror());
+      }
    }
    for (i = 0; i < sizeof(beside) / sizeof(beside[0]) && lib.handle == NULL; i++) {
       lib.handle = dlopen(beside[i], RTLD_NOW | RTLD_LOCAL);
@@ -196,11 +348,16 @@ jackpotlte_gl_create(int version)
    return gl;
 }
 
+/* glca15: real OSMesaMakeCurrent calls (a thread changing contexts), for the
+ * perf2 line */
+unsigned long jackpotlte_gl_switches;
+
 int
 jackpotlte_gl_make_current(struct jackpotlte_gl *gl)
 {
    if (gl == current)
       return 1;
+   jackpotlte_gl_switches++;
 
    /* NULL, NULL: no context on this thread, which is how OSMesa is told. */
    if (!lib.make_current(gl != NULL ? gl->context : NULL,

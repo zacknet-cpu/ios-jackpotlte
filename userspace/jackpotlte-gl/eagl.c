@@ -225,10 +225,176 @@ jackpotlte_gl_note_unsupported(unsigned offset)
  * thread where its context is current.  CoreAnimation's renderer is not always
  * the thread that made the context.
  */
+/*
+ * glca15: a profile of the GL calls (switch file a8gl-prof "1"): calls a
+ * frame, context switches, the time from a draw call's start to its return
+ * (Mesa's draw, with the make-current) and the shim's own work after each
+ * draw.  One "perf2:" line next to each "perf:" line, and the process's
+ * images (load address and path) written once to a8gl-images.txt, so the
+ * console's "sample backboardd" addresses can be put to a library.
+ */
+static int prof = -1;
+static uint64_t prof_call_start;
+static struct {
+   unsigned long calls, draws;
+   uint64_t draw, shim;                /* mach ticks */
+   unsigned long switches0;
+} pf;
+extern unsigned long jackpotlte_gl_switches;     /* jackpotlte_gl_osmesa.c */
+
+static int
+prof_on(void)
+{
+   if (prof < 0) {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-prof", "r");
+      int c = f != NULL ? fgetc(f) : EOF;
+
+      prof = c == '1' ? 1 : c == '2' ? 2 : 0;
+      if (f != NULL)
+         fclose(f);
+   }
+   return prof;
+}
+
+/*
+ * glca15b: a sampling profile of CoreAnimation's render thread (a8gl-prof "2").
+ * A helper thread waits until the first byte of a8gl-sample changes, then
+ * suspends the render thread about 1000 times a second for 6 s, keeps its pc,
+ * lr and frame-pointer chain (12 addresses), and writes them to
+ * a8gl-samples.txt, one sample a line.  Nothing is allocated and no lock is
+ * taken while the render thread is suspended.
+ */
+#include <pthread.h>
+static uint64_t ticks_us(uint64_t ticks);
+#define PS_MAX   6000
+#define PS_DEPTH 12
+static thread_act_t prof_rt = MACH_PORT_NULL;
+
+static int
+sample_trigger(void)
+{
+   FILE *f = fopen("/private/var/mobile/Library/a8gl-sample", "r");
+   int c = f != NULL ? fgetc(f) : EOF;
+
+   if (f != NULL)
+      fclose(f);
+   return c;
+}
+
+static void *
+sampler_main(void *arg)
+{
+   thread_act_t rt = (thread_act_t)(uintptr_t)arg;
+   pthread_t pt = pthread_from_mach_thread_np(rt);
+   uintptr_t hi = pt != NULL ? (uintptr_t)pthread_get_stackaddr_np(pt) : 0;
+   uintptr_t lo = pt != NULL ? hi - pthread_get_stacksize_np(pt) : 0;
+   uint64_t *buf = calloc((size_t)PS_MAX * PS_DEPTH, sizeof(uint64_t));
+   int last = sample_trigger();
+
+   if (buf == NULL)
+      return NULL;
+   say("glca15b: sampler ready for the render thread (stack %#lx-%#lx): write a8gl-sample to start",
+       (unsigned long)lo, (unsigned long)hi);
+   for (;;) {
+      unsigned n = 0;
+      uint64_t t0;
+      FILE *f;
+      int now;
+
+      sleep(1);
+      now = sample_trigger();
+      if (now == last)
+         continue;
+      last = now;
+      t0 = mach_absolute_time();
+      while (n < PS_MAX && ticks_us(mach_absolute_time() - t0) < 6000000ull) {
+         arm_thread_state64_t st;
+         mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+         uint64_t *row = buf + (size_t)n * PS_DEPTH;
+
+         usleep(1000);
+         memset(row, 0, PS_DEPTH * sizeof(uint64_t));
+         if (thread_suspend(rt) != KERN_SUCCESS)
+            break;
+         if (thread_get_state(rt, ARM_THREAD_STATE64, (thread_state_t)&st, &count) == KERN_SUCCESS) {
+            uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
+
+            row[0] = (uint64_t)arm_thread_state64_get_pc(st);
+            row[1] = (uint64_t)arm_thread_state64_get_lr(st);
+            for (int d = 2; d < PS_DEPTH && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; d++) {
+               uint64_t next = ((const uint64_t *)(uintptr_t)fp)[0];
+
+               row[d] = ((const uint64_t *)(uintptr_t)fp)[1];
+               if (next <= fp)
+                  break;
+               fp = next;
+            }
+            n++;
+         }
+         thread_resume(rt);
+      }
+      f = fopen("/private/var/mobile/Library/a8gl-samples.txt", "w");
+      if (f != NULL) {
+         for (unsigned i = 0; i < n; i++) {
+            const uint64_t *row = buf + (size_t)i * PS_DEPTH;
+
+            for (int d = 0; d < PS_DEPTH && (d < 2 || row[d] != 0); d++)
+               fprintf(f, d ? " %#llx" : "%#llx", (unsigned long long)row[d]);
+            fputc('\n', f);
+         }
+         fclose(f);
+      }
+      say("glca15b: %u samples of the render thread written to a8gl-samples.txt", n);
+   }
+   return NULL;
+}
+
+static void
+sampler_start(void)
+{
+   static int started;
+   pthread_t t;
+
+   if (started || prof_on() != 2)
+      return;
+   started = 1;
+   prof_rt = mach_thread_self();
+   if (pthread_create(&t, NULL, sampler_main, (void *)(uintptr_t)prof_rt) == 0)
+      pthread_detach(t);
+}
+
+static void
+images_dump(void)
+{
+   static int done;
+   FILE *f;
+   uint32_t n;
+
+   if (done)
+      return;
+   done = 1;
+   f = fopen("/private/var/mobile/Library/a8gl-images.txt", "w");
+   if (f == NULL)
+      return;
+   n = _dyld_image_count();
+   for (uint32_t i = 0; i < n; i++) {
+      const char *name = _dyld_get_image_name(i);
+
+      fprintf(f, "%#llx %s\n", (unsigned long long)(uintptr_t)_dyld_get_image_header(i),
+              name != NULL ? name : "?");
+   }
+   fclose(f);
+}
+
 void
 jackpotlte_gl_use(void *context)
 {
    struct jackpotlte_eagl *e = context;
+
+   if (prof > 0) {
+      pf.calls++;
+      prof_call_start = mach_absolute_time();
+   }
 
    if (e != NULL && e->gl != NULL)
       jackpotlte_gl_make_current(e->gl);
@@ -570,6 +736,14 @@ perf_frame(void)
           (unsigned long long)(ticks_us(perf.clean) / n),
           (unsigned long long)(perf.latch / n), (unsigned long long)perf.latch_max,
           flip_async, flush_mode(), sync_mode());
+   if (prof_on()) {
+      images_dump();
+      say("perf2: calls %lu/fr draws %lu/fr switches %lu; draw (Mesa) %llu us/fr, shim after draws %llu us/fr",
+          pf.calls / n, pf.draws / n, jackpotlte_gl_switches - pf.switches0,
+          (unsigned long long)(ticks_us(pf.draw) / n), (unsigned long long)(ticks_us(pf.shim) / n));
+      memset(&pf, 0, sizeof(pf));
+      pf.switches0 = jackpotlte_gl_switches;
+   }
    {
       uint64_t done = perf.frame_done;
 
@@ -733,6 +907,7 @@ frame_end(const char *why, int finished)
       return;
    frame_drawn = 0;
    bind_big_once();                /* glca14 */
+   sampler_start();                /* glca15b (a8gl-prof "2") */
    if (perf.frame_start != 0)
       perf.build += mach_absolute_time() - perf.frame_start;
    if (flush_mode() == 0)
@@ -791,7 +966,14 @@ jackpotlte_gl_after_draw(void)
 
    void (*flush)(void) = (void (*)(void))jackpotlte_gl_proc("glFlush");
    int mode = sync_mode();
+   uint64_t shim_start = 0;
 
+   if (prof_on()) {
+      shim_start = mach_absolute_time();
+      if (prof_call_start != 0 && shim_start > prof_call_start)
+         pf.draw += shim_start - prof_call_start;
+      pf.draws++;
+   }
    draws++;
    perf.draws++;
    perf.on_cpu++;
@@ -825,6 +1007,8 @@ jackpotlte_gl_after_draw(void)
    if (draws <= 20 || draws % 600 == 0)
       say("draws: %lu, %u surfaces kept, %lu cleans, %lu GPU waits, %lu frames",
           draws, shared_count(), cleans, finishes, frames);
+   if (shim_start != 0)
+      pf.shim += mach_absolute_time() - shim_start;
 }
 
 /* ---- entries CoreAnimation calls that the library answered wrongly ------ */
