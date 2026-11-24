@@ -278,6 +278,29 @@ static struct {
    int target;                         /* drawn into (-attachImage:) */
 } shared[SHARED_MAX];
 static unsigned shared_next;
+
+/*
+ * glca9: textures made as a copy of a surface (surface_copy_texture: pixel
+ * format 0 masks, alpha and luminance-alpha surfaces). A copy is a snapshot,
+ * and CoreAnimation binds the texture again without asking for the surface
+ * again, so a surface its writer filled after the first copy stayed empty on
+ * screen (apps' SF Symbols: the back chevron, search glass, slider suns, a
+ * 33x57 RGBA8 texture whose alpha was 0 everywhere in a trace). The copy is
+ * remembered here and made again when the texture is bound and the surface's
+ * seed has moved.
+ */
+#define COPIED_MAX 96
+static struct {
+   IOSurfaceRef surface;               /* retained while it is in here */
+   void *owner;
+   int texture;
+   uint32_t seed;
+   int width, height;
+   unsigned long internal, format, type;
+   BOOL invert;
+} copied[COPIED_MAX];
+static unsigned copied_next, copied_used;
+static unsigned long recopies;
 static unsigned long draws, cleans, finishes, frames, forgotten;
 static int frame_drawn;                /* a draw since the last frame_end() */
 
@@ -545,6 +568,14 @@ shared_forget(void *owner, int texture)
          forgotten++;
       }
    }
+   for (i = 0; copied_used != 0 && i < COPIED_MAX; i++) {
+      if (copied[i].surface != NULL && copied[i].owner == owner &&
+          copied[i].texture == texture) {
+         CFRelease(copied[i].surface);
+         copied[i].surface = NULL;
+         copied_used--;
+      }
+   }
 }
 
 static void
@@ -613,8 +644,9 @@ frame_end(const char *why, int finished)
    perf.frame_done = mach_absolute_time();
    if (frames <= 30 || frames % 300 == 0)
       say("frame %lu ended by %s: %lu draws, %u render targets cleaned, "
-          "%lu GPU waits, %u surfaces kept, %lu let go", frames, why, draws,
-          targets, finishes, shared_count(), forgotten);
+          "%lu GPU waits, %u surfaces kept, %lu let go, %u copies, %lu made again",
+          frames, why, draws, targets, finishes, shared_count(), forgotten,
+          copied_used, recopies);
 }
 
 /*
@@ -818,9 +850,12 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 /* Offsets from eagl_slots.txt (gl_slots.c): index = offset / 8. */
 void ca_fixes_install(void *table[JACKPOTLTE_GL_SLOTS]);   /* ca_fixes.c */
 
+static void my_glBindTexture(void *context, GLenum target, GLuint texture);
+
 static void
 install_fixes(void *table[JACKPOTLTE_GL_SLOTS])
 {
+   table[0x006] = (void *)my_glBindTexture;          /* 0x0030 */
    table[0x03c] = (void *)my_glDeleteTextures;       /* 0x01e0 */
    table[0x05a] = (void *)my_glFinish;               /* 0x02d0 */
    table[0x05b] = (void *)my_glFlush;                /* 0x02d8 */
@@ -1111,6 +1146,51 @@ bytes_a_pixel(unsigned long format, unsigned long type)
  * for a surface the caller draws *into* (-attachImage: keeps refusing), but for
  * one it only samples, the pixels are all that is wanted.
  */
+/* glca9: a texture of `owner`'s is now a copy of `surface` (see copied[]). */
+static void
+copied_note(void *owner, int texture, IOSurfaceRef surface, uint32_t seed,
+            int width, int height, unsigned long internal, unsigned long format,
+            unsigned long type, BOOL invert)
+{
+   unsigned i, slot = COPIED_MAX;
+
+   if (texture == 0 || surface == NULL)
+      return;
+   for (i = 0; i < COPIED_MAX; i++) {
+      if (copied[i].surface != NULL && copied[i].owner == owner &&
+          copied[i].texture == texture) {
+         slot = i;                     /* the same texture, copied again */
+         break;
+      }
+   }
+   for (i = 0; slot == COPIED_MAX && i < COPIED_MAX; i++) {
+      if (copied[i].surface == NULL)
+         slot = i;
+   }
+   if (slot == COPIED_MAX)
+      slot = copied_next++ % COPIED_MAX;  /* full: an old one goes */
+   if (copied[slot].surface != NULL) {
+      if (copied[slot].surface != surface) {
+         CFRelease(copied[slot].surface);
+         copied[slot].surface = (IOSurfaceRef)CFRetain(surface);
+      }
+   } else {
+      copied[slot].surface = (IOSurfaceRef)CFRetain(surface);
+      copied_used++;
+   }
+   copied[slot].owner = owner;
+   copied[slot].texture = texture;
+   copied[slot].seed = seed;
+   copied[slot].width = width;
+   copied[slot].height = height;
+   copied[slot].internal = internal;
+   copied[slot].format = format;
+   copied[slot].type = type;
+   copied[slot].invert = invert;
+}
+
+static int copy_again;                 /* surface_copy_texture from a bind: keep CA's filters */
+
 static BOOL
 surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
                      int width, int height, unsigned long internal,
@@ -1135,6 +1215,9 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
    uint32_t seed = 0;
    uint32_t pixels = IOSurfaceGetPixelFormat(surface);
    int locked;
+   uint32_t copy_seed = 0;
+   const int asked_width = width, asked_height = height;
+   const unsigned long asked_internal = internal, asked_format = format, asked_type = type;
 
    if (!resolve_helpers() || !jackpotlte_gl_make_current(e->gl))
       return NO;
@@ -1240,6 +1323,7 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
    total = row * (size_t)height;
 
    locked = IOSurfaceLock(surface, SURFACE_LOCK_READ_ONLY, &seed) == 0;
+   copy_seed = IOSurfaceGetSeed(surface);   /* what this copy shows (glca9) */
    base = (const unsigned char *)IOSurfaceGetBaseAddress(surface);
    if (base == NULL || total == 0) {
       if (locked) {
@@ -1306,11 +1390,17 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
       return NO;
    }
    /* Complete the texture: without a mipmap level, the default minification
-    * filter samples nothing, whatever was uploaded. */
-   if (tex_parameter != NULL) {
+    * filter samples nothing, whatever was uploaded.  A copy made again from a
+    * bind keeps the filters CoreAnimation set since. */
+   if (tex_parameter != NULL && !copy_again) {
       tex_parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       tex_parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
    }
+   if (!copy_again)
+      copied_note(e, bound_texture(e), surface, copy_seed, asked_width, asked_height,
+                  asked_internal, asked_format, asked_type, invert);
+   if (copy_again)
+      return YES;
    if (logged++ < 16) {
       say("%s: surface %u is '%.4s' %dx%d, row %zu of %zu bytes, %zu B a pixel, "
           "%zu planes, %zu allocated, format %#lx type %#lx: copied into the "
@@ -1321,6 +1411,53 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
           format, type);
    }
    return YES;
+}
+
+/*
+ * glca9: CoreAnimation binds a copied texture again each time it draws it,
+ * and never hands its surface over again.  When the surface's seed has moved
+ * since the copy (its writer drew into it after the first bind), the copy is
+ * made again here, into the texture just bound.
+ */
+static void
+my_glBindTexture(void *context, GLenum target, GLuint texture)
+{
+   static void (*real)(GLenum, GLuint);
+   unsigned i;
+
+   jackpotlte_gl_use(context);
+   if (real == NULL)
+      real = (void (*)(GLenum, GLuint))jackpotlte_gl_proc("glBindTexture");
+   if (real == NULL)
+      return;
+   real(target, texture);
+   if (copied_used == 0 || target != GL_TEXTURE_2D || texture == 0 || context == NULL)
+      return;
+   for (i = 0; i < COPIED_MAX; i++) {
+      uint32_t seed, was;
+
+      if (copied[i].surface == NULL || copied[i].owner != context ||
+          copied[i].texture != (int)texture)
+         continue;
+      seed = IOSurfaceGetSeed(copied[i].surface);
+      if (seed == copied[i].seed)
+         break;
+      was = copied[i].seed;
+      copied[i].seed = seed;           /* a failed copy is not tried again until it moves again */
+      copy_again = 1;
+      if (surface_copy_texture((struct jackpotlte_eagl *)context, copied[i].surface,
+                               copied[i].width, copied[i].height, copied[i].internal,
+                               copied[i].format, copied[i].type, copied[i].invert,
+                               "bind")) {
+         recopies++;
+         if (recopies <= 24 || recopies % 500 == 0)
+            say("copy: texture %u made again from surface %u (seed %u -> %u), %lu made again",
+                (unsigned)texture, (unsigned)IOSurfaceGetID(copied[i].surface), was, seed,
+                recopies);
+      }
+      copy_again = 0;
+      break;
+   }
 }
 
 /*

@@ -26,6 +26,7 @@ struct __IOSurface {
    uint32_t pixel_format;
    size_t width, height, bpr, bpe, planes, alloc;
    unsigned char *bytes;
+   uint32_t seed;
 };
 
 /* Fake GL, in the shapes the phone's are resolved into. */
@@ -52,6 +53,9 @@ glTexImage2D_fake(unsigned target, int level, int internal, int w, int h,
       fake_error = 0x500;
    }
 }
+static unsigned bound_fake;
+static void glBindTexture_fake(unsigned t, unsigned name)
+{ (void)t; bound_fake = name; }
 static void glTexParameteri_fake(unsigned t, unsigned p, int v)
 { (void)t; (void)p; (void)v; }
 static unsigned glGetError_fake(void)
@@ -74,7 +78,7 @@ size_t IOSurfaceGetAllocSize(struct __IOSurface *s) { return s->alloc; }
 size_t IOSurfaceGetWidth(struct __IOSurface *s) { return s->width; }
 size_t IOSurfaceGetHeight(struct __IOSurface *s) { return s->height; }
 void *IOSurfaceGetBaseAddress(struct __IOSurface *s) { return s->bytes; }
-uint32_t IOSurfaceGetSeed(struct __IOSurface *s) { (void)s; return 1; }
+uint32_t IOSurfaceGetSeed(struct __IOSurface *s) { return s->seed; }
 const void *CFRetain(const void *p) { return p; }
 void CFRelease(const void *p) { (void)p; }
 int IOSurfaceLock(struct __IOSurface *s, uint32_t o, uint32_t *seed)
@@ -85,6 +89,7 @@ int IOSurfaceUnlock(struct __IOSurface *s, uint32_t o, uint32_t *seed)
 jackpotlte_gl_func
 jackpotlte_gl_proc(const char *name)
 {
+   if (strcmp(name, "glBindTexture") == 0) return (jackpotlte_gl_func)glBindTexture_fake;
    if (strcmp(name, "glTexImage2D") == 0) return (jackpotlte_gl_func)glTexImage2D_fake;
    if (strcmp(name, "glTexParameteri") == 0) return (jackpotlte_gl_func)glTexParameteri_fake;
    if (strcmp(name, "glGetError") == 0) return (jackpotlte_gl_func)glGetError_fake;
@@ -115,6 +120,7 @@ surface_new(uint32_t id, uint32_t fmt, size_t w, size_t h, size_t bpr,
    s->id = id; s->pixel_format = fmt; s->width = w; s->height = h;
    s->bpr = bpr; s->bpe = bpe; s->alloc = n;
    s->bytes = calloc(1, n);
+   s->seed = 1;
    for (size_t i = 0; i < n; i++)
       s->bytes[i] = (unsigned char)(i * 7 + 1);
    return s;
@@ -240,6 +246,39 @@ main(void)
       check("a surface with no derivable pixel size is refused",
             surface_copy_texture(&eagl, s, 0, 0, 0, 0, 0, NO, "-t") == NO);
       check("  and nothing was uploaded", !upload.called);
+   }
+
+   /* 8. glca9: a copied surface its writer fills in after the first copy (an
+    *    app's SF Symbol, a 33x57 mask that came out empty) is copied again at
+    *    the next bind of its texture, and only when its seed has moved. */
+   memset(&upload, 0, sizeof(upload));
+   memset(captured, 0, sizeof(captured));
+   {
+      struct __IOSurface *s = surface_new(11, 0, 33, 57, 132, 4, 132 * 57);
+      GLuint name = (GLuint)fake_texture;
+
+      memset(s->bytes, 0, s->alloc);              /* empty when first bound */
+      check("an empty 33x57 mask is copied",
+            surface_copy_texture(&eagl, s, 0, 0, GL_RGBA8, GL_BGRA,
+                                 GL_UNSIGNED_BYTE, NO, "-t") == YES);
+      check("  and is empty", upload.called && captured[3] == 0);
+      memset(&upload, 0, sizeof(upload));
+      my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
+      check("  a bind with the seed unmoved copies nothing",
+            !upload.called && bound_fake == name);
+      s->bytes[3] = 0xff;                          /* the writer draws */
+      s->seed++;
+      my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
+      check("  a bind after the writer drew copies it again",
+            upload.called && captured[3] == 0xff);
+      check("  at the same size", upload.w == 33 && upload.h == 57);
+      memset(&upload, 0, sizeof(upload));
+      my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
+      check("  and only once", !upload.called);
+      my_glDeleteTextures(&eagl, 1, &name);
+      s->seed++;
+      my_glBindTexture(&eagl, GL_TEXTURE_2D, name);
+      check("  a deleted texture is forgotten", !upload.called);
    }
 
    printf("\n%s\n", failures ? "FAILURES" : "all checks passed");
