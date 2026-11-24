@@ -298,6 +298,8 @@ static struct {
    int width, height;
    unsigned long internal, format, type;
    BOOL invert;
+   int target;                         /* made by -attachImage: (drawn into) */
+   int told;                           /* glca9c: its first draw was said */
 } copied[COPIED_MAX];
 static unsigned copied_next, copied_used;
 static unsigned long recopies;
@@ -662,9 +664,58 @@ frame_end(const char *why, int finished)
  * surfaces only once the flush has submitted the batch.  A draw also marks the
  * frame as drawn, for frame_end().
  */
+unsigned ca_fixes_function(void);      /* ca_fixes.c */
+static int resolve_helpers(void);
+
+/*
+ * glca9c: a surface CoreAnimation attaches to draw into, but that is not BGRA,
+ * is a copy here, and apps' SF Symbols came out of such copies with nothing in
+ * them (33x57, alpha 0 everywhere).  Say, once for each, what draws into one.
+ */
+static void
+copy_target_draw(void)
+{
+   static void (*attachment)(unsigned, unsigned, unsigned, int *);
+   static unsigned said;
+   int framebuffer = 0, kind = 0, name = 0, program = 0;
+   unsigned i, function;
+
+   if (copied_used == 0 || said >= 60 || !resolve_helpers())
+      return;
+   if (attachment == NULL) {
+      attachment = (void (*)(unsigned, unsigned, unsigned, int *))
+         jackpotlte_gl_proc("glGetFramebufferAttachmentParameteriv");
+      if (attachment == NULL)
+         return;
+   }
+   helpers.get_integerv(0x8ca6 /* GL_FRAMEBUFFER_BINDING */, &framebuffer);
+   if (framebuffer == 0)
+      return;
+   attachment(0x8d40 /* GL_FRAMEBUFFER */, 0x8ce0 /* COLOR_ATTACHMENT0 */,
+              0x8cd0 /* ATTACHMENT_OBJECT_TYPE */, &kind);
+   if (kind != 0x1702 /* GL_TEXTURE */)
+      return;
+   attachment(0x8d40, 0x8ce0, 0x8cd1 /* ATTACHMENT_OBJECT_NAME */, &name);
+   for (i = 0; i < COPIED_MAX; i++) {
+      if (copied[i].surface == NULL || copied[i].texture != name || copied[i].told)
+         continue;
+      copied[i].told = 1;
+      said++;
+      helpers.get_integerv(0x8b8d /* GL_CURRENT_PROGRAM */, &program);
+      function = ca_fixes_function();
+      say("copy: a draw into texture %d (copy of surface %u, %zux%zu, %s): CA function %u, "
+          "program %d", name, (unsigned)IOSurfaceGetID(copied[i].surface),
+          IOSurfaceGetWidth(copied[i].surface), IOSurfaceGetHeight(copied[i].surface),
+          copied[i].target ? "attached" : "sampled", function, program);
+      break;
+   }
+}
+
 void
 jackpotlte_gl_after_draw(void)
 {
+   copy_target_draw();
+
    void (*flush)(void) = (void (*)(void))jackpotlte_gl_proc("glFlush");
    int mode = sync_mode();
 
@@ -1157,7 +1208,7 @@ bytes_a_pixel(unsigned long format, unsigned long type)
 static void
 copied_note(void *owner, int texture, IOSurfaceRef surface, uint32_t seed,
             int width, int height, unsigned long internal, unsigned long format,
-            unsigned long type, BOOL invert)
+            unsigned long type, BOOL invert, int target)
 {
    unsigned i, slot = COPIED_MAX;
 
@@ -1194,6 +1245,8 @@ copied_note(void *owner, int texture, IOSurfaceRef surface, uint32_t seed,
    copied[slot].format = format;
    copied[slot].type = type;
    copied[slot].invert = invert;
+   copied[slot].target = target;
+   copied[slot].told = 0;
 }
 
 static int copy_again;                 /* surface_copy_texture from a bind: keep CA's filters */
@@ -1407,7 +1460,8 @@ surface_copy_texture(struct jackpotlte_eagl *e, IOSurfaceRef surface,
    }
    if (!copy_again)
       copied_note(e, bound_texture(e), surface, copy_seed, asked_width, asked_height,
-                  asked_internal, asked_format, asked_type, invert);
+                  asked_internal, asked_format, asked_type, invert,
+                  strcmp(method, "-attachImage:") == 0);
    if (copy_again)
       return YES;
    {
