@@ -567,6 +567,8 @@ frame_end(const char *why, int finished)
    frame_drawn = 0;
    if (perf.frame_start != 0)
       perf.build += mach_absolute_time() - perf.frame_start;
+   if (flush_mode() == 0)
+      shared_sync();               /* before the batch goes to the GPU (glFinish below) */
    if (!finished) {
       void (*finish)(void) = (void (*)(void))jackpotlte_gl_proc("glFinish");
 
@@ -622,7 +624,12 @@ jackpotlte_gl_after_draw(void)
          perf.between += perf.frame_start - perf.frame_done;
    }
    frame_drawn = 1;
-   if (mode != 0)
+   /*
+    * glca7: with one batch a frame (jtglflush=0) nothing reaches the GPU
+    * before frame_end(), so the textures are synced there, once a frame,
+    * instead of after every draw (32 surfaces' seeds read 80 times a frame).
+    */
+   if (mode != 0 && flush_mode() != 0)
       shared_sync();
    if (flush != NULL && flush_mode() != 0) {
       uint64_t t0 = mach_absolute_time();
