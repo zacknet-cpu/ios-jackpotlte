@@ -34,6 +34,13 @@ jobs:
           done < out/preload-files.txt
           mkdir -p out/src/panfrost/lib/kmod
           cp "$src"/src/panfrost/lib/kmod/*.c "$src"/src/panfrost/lib/kmod/*.h out/src/panfrost/lib/kmod/ 2>/dev/null || true
+          # 11-25: the whole gallium panfrost driver and the panfrost lib, for
+          # reading the batch/resource code (flush and BO-renaming paths)
+          mkdir -p out/src/gallium/drivers out/src/panfrost
+          cp -r "$src"/src/gallium/drivers/panfrost out/src/gallium/drivers/
+          cp -r "$src"/src/panfrost/lib out/src/panfrost/
+          mkdir -p out/src/gallium/auxiliary/util
+          cp "$src"/src/gallium/auxiliary/util/u_transfer_helper.* out/src/gallium/auxiliary/util/ 2>/dev/null || true
           cd out
           git init -q
           git checkout -q -b mesa-src
