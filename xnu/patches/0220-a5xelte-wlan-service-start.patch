@@ -1,0 +1,540 @@
+From 797e030c0cd5270e3d247c95bc0f3b20e94e8dfd Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 07:20:36 -0500
+Subject: [PATCH] 0220-a5xelte-wlan-service-start.patch
+
+---
+ bsd/conf/files                |   1 +
+ bsd/dev/a5xelte_bt.c          |  34 +++-
+ bsd/dev/a5xelte_scsc.c        |  24 +++
+ bsd/dev/a5xelte_scsc.h        |   5 +
+ bsd/dev/a5xelte_wlan.c        | 357 ++++++++++++++++++++++++++++++++++
+ iokit/bsddev/IOKitBSDInit.cpp |   4 +
+ 6 files changed, 423 insertions(+), 2 deletions(-)
+ create mode 100644 bsd/dev/a5xelte_wlan.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e90e75a..80f1219 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/a8_acpm.c			standard
+ bsd/dev/a8_slots.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
+ bsd/dev/a5xelte_bt.c			standard
++bsd/dev/a5xelte_wlan.c			standard
+ bsd/dev/a5xelte_sensors.c		standard
+ bsd/dev/a5xelte_wifi.c			standard
+ bsd/dev/a5xelte_flashlight.c		standard
+diff --git a/bsd/dev/a5xelte_bt.c b/bsd/dev/a5xelte_bt.c
+index 78130c4..bb45ff0 100644
+--- a/bsd/dev/a5xelte_bt.c
++++ b/bsd/dev/a5xelte_bt.c
+@@ -445,7 +445,7 @@ a5bt_service_start(uint32_t *waited_ms)
+ 	body[2] = (uint8_t)((a5bt.bhcs_ref >> 8) & 0xff);
+ 	body[3] = (uint8_t)((a5bt.bhcs_ref >> 16) & 0xff);
+ 	body[4] = (uint8_t)((a5bt.bhcs_ref >> 24) & 0xff);
+-	a5scsc_mxmgmt_register(A5SCSC_MMTRANS_CHAN_SERVICE, a5bt_sm, NULL);
++	a5scsc_sm_register(A5SCSC_SERVICE_ID_BT, a5bt_sm, NULL);      /* 0220: shared with WLAN */
+ 	err = a5scsc_mxmgmt_send(A5SCSC_MMTRANS_CHAN_SERVICE,
+ 	    A5SCSC_SERVICE_ID_BT, body, sizeof(body));
+ 	if (err != 0) {
+@@ -499,8 +499,21 @@ a5bt_report(const char *when)
+ 	    a5bt.events, a5bt.unknown_sm);
+ }
+ 
++/* 0220: true once BT's bring-up has finished, or when it does not run, so
++ * that the WLAN service (a5xelte_wlan.c) starts after it: the transport's
++ * streams take no lock. */
++static volatile bool a5bt_done = true;
++
++bool a5xelte_bt_settled(void);
++
++bool
++a5xelte_bt_settled(void)
++{
++	return a5bt_done;
++}
++
+ static void
+-a5bt_bringup_thread(void *param __unused, wait_result_t wr __unused)
++a5bt_bringup_run(void)
+ {
+ 	uint8_t *bhcs;
+ 	uint32_t waited;
+@@ -573,6 +586,13 @@ a5bt_bringup_thread(void *param __unused, wait_result_t wr __unused)
+ 	printf("A5XELTE BT: up: controller answered HCI Reset\n");
+ }
+ 
++static void
++a5bt_bringup_thread(void *param __unused, wait_result_t wr __unused)
++{
++	a5bt_bringup_run();
++	a5bt_done = true;
++}
++
+ /* ---- public entry point --------------------------------------------------- */
+ 
+ void
+@@ -585,9 +605,11 @@ a5xelte_bt_probe(void)
+ 	if (!enabled) {
+ 		return;
+ 	}
++	a5bt_done = false;
+ 	if (kernel_thread_start((thread_continue_t)a5bt_bringup_thread, NULL,
+ 	    &thread) != KERN_SUCCESS) {
+ 		printf("A5XELTE BT: bring-up thread failed to start\n");
++		a5bt_done = true;
+ 		return;
+ 	}
+ 	thread_deallocate(thread);
+@@ -600,4 +622,12 @@ a5xelte_bt_probe(void)
+ {
+ }
+ 
++bool a5xelte_bt_settled(void);
++
++bool
++a5xelte_bt_settled(void)
++{
++	return true;
++}
++
+ #endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+\ No newline at end of file
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index 40247f5..2e72e41 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -711,6 +711,30 @@ a5scsc_mxmgmt_register(uint8_t channel, a5scsc_mxmgmt_fn fn, void *arg)
+ 	a5scsc.mxmgmt_arg[channel] = arg;
+ }
+ 
++/* 0220: see a5xelte_scsc.h. */
++static a5scsc_mxmgmt_fn a5scsc_sm_fn[4];
++static void *a5scsc_sm_arg[4];
++
++static void
++a5scsc_sm_dispatch(const uint8_t *p, void *arg __unused)
++{
++	uint8_t id = p[0];
++
++	if (id < 4 && a5scsc_sm_fn[id] != NULL) {
++		a5scsc_sm_fn[id](p, a5scsc_sm_arg[id]);
++	}
++}
++
++void
++a5scsc_sm_register(uint8_t service, a5scsc_mxmgmt_fn fn, void *arg)
++{
++	if (service < 4) {
++		a5scsc_sm_arg[service] = arg;
++		a5scsc_sm_fn[service] = fn;
++	}
++	a5scsc_mxmgmt_register(A5SCSC_MMTRANS_CHAN_SERVICE, a5scsc_sm_dispatch, NULL);
++}
++
+ /* Drains the inbound ring, delivering each packet to its channel handler and
+  * retiring it afterwards (mxmgmt_transport.c:133-155).  Runs in the poll
+  * thread, so handlers may sleep. */
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index 564e131..f2c9f7d 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -340,4 +340,9 @@ void a5scsc_mxlog_more(uint32_t records);
+ typedef void (*a5scsc_mxmgmt_fn)(const uint8_t *payload, void *arg);
+ void a5scsc_mxmgmt_register(uint8_t channel, a5scsc_mxmgmt_fn fn, void *arg);
+ 
++/* 0220: the service management channel carries the messages of every service
++ * (payload byte 0: the service id); one handler a service on top of it, so
++ * that the BT and WLAN services can both listen. */
++void a5scsc_sm_register(uint8_t service, a5scsc_mxmgmt_fn fn, void *arg);
++
+ #endif /* _A5XELTE_SCSC_H_ */
+diff --git a/bsd/dev/a5xelte_wlan.c b/bsd/dev/a5xelte_wlan.c
+new file mode 100644
+index 0000000..25aa699
+--- /dev/null
++++ b/bsd/dev/a5xelte_wlan.c
+@@ -0,0 +1,357 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) WLAN service over the
++ * Samsung SCSC / Maxwell (MX140) shared-memory transport: step 4 of the Wi-Fi
++ * port (0220).
++ *
++ * The WLBT core boots with the transport in bsd/dev/a5xelte_scsc.c (0181/0208,
++ * MM_START_IND); the Bluetooth service runs on it (bsd/dev/a5xelte_bt.c).  This
++ * file starts the third piece, the firmware's WLAN service (service 1), the way
++ * Samsung's driver for this phone does (drivers/net/wireless/scsc/hip4.c and
++ * hip4.h of the jackpotlte kernel, hip4_init and slsi_mib_open_file):
++ *
++ *   - a 1.5 MB region in MIF shared DRAM, 4 KB aligned: an 8 KB control area,
++ *     a 4 KB MIB, 500 KB of from-host blocks (436 KB data = 218 slots of 2 KB,
++ *     then 64 KB control = 32 slots), 1 MB of to-host blocks;
++ *   - the control area is struct hip4_hip_control: the init block at 0 (magic
++ *     0xcaaa0400, then the version the firmware takes, written by it, then the
++ *     locations of config A = version 4 and config B = version 3), the two
++ *     configs at 32 and 160 (120 bytes each, magic 0xcaba0401), the scoreboard
++ *     at 320 (256 words), the six queues at 1344 + n * 1088 (256 words, then
++ *     read / write / total bytes, 64 aligned);
++ *   - the MIB is mx140_wlan.hcf less its 8-byte header (its last byte 1: the
++ *     first file format), as slsi_mib_open_file does on this phone's kernel;
++ *   - one to-host and one from-host interrupt bit from the transport's
++ *     allocator, written into both configs;
++ *   - SM_MSG_START_REQ for service 1 with the region's offset on the service
++ *     management channel, and the firmware's SM_MSG_START_CFM waited for.
++ *
++ * The way it is done on XNU follows the Galaxy A51 port, which has the whole
++ * path working on a newer core of the same family (AnkitChoudhary-1/
++ * Hakios-Galaxy-A515F, platform/devices/a51/drivers/wifi/hakios.a51wifi.c,
++ * step 4; MIT).  The A51's firmware takes HIP4 configs 4 and 5 in a 2.1 MB
++ * region of 16 MB; this phone's takes 3 and 4 in 1.5 MB of 4 MB.
++ *
++ * Not here yet (next steps, as the A51's 5-8): HIP4 queue handling, MLME-ADD-VIF,
++ * scan, join, WPA2, data, and the Apple80211 side (a5xelte_wifi.c).
++ *
++ * Gate: runs when the WLBT core does (a8wifi=1), unless a8wlan=0.  Success
++ * prints "A5XELTE WLAN: step 4: SM_MSG_START_CFM after N ms".
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++#include "a5xelte_scsc.h"
++
++void a5xelte_wlan_probe(void);
++extern bool a5xelte_bt_settled(void);           /* a5xelte_bt.c, 0220 */
++
++#define A5WLAN_MIB_PATH         "/private/var/mobile/Library/mx140_wlan.hcf"
++
++/* the region (hip4.c IMG_MGR_SEC_WLAN_*) */
++#define W_CONFIG                0x000000u
++#define W_CONFIG_SIZE           0x002000u
++#define W_MIB                   0x002000u
++#define W_MIB_SIZE              0x001000u
++#define W_TX                    0x003000u
++#define W_TX_SIZE               0x07d000u
++#define W_RX                    0x080000u
++#define W_RX_SIZE               0x100000u
++#define W_TOTAL                 0x180000u
++
++/* struct hip4_hip_control (hip4.h), offsets in the control area */
++#define C_INIT_MAGIC            0u      /* 0xcaaa0400 */
++#define C_INIT_TAKEN            4u      /* conf_hip4_ver: written by the firmware */
++#define C_INIT_A                8u      /* version_a_ref: config v4 */
++#define C_INIT_B                12u     /* version_b_ref: config v3 */
++#define C_V3                    32u
++#define C_V4                    160u
++#define C_SCOREBOARD            320u
++#define C_Q(n)                  (1344u + (uint32_t)(n) * 1088u)
++#define C_CONFIG_LEN            120u
++#define C_QUEUES                6u
++
++/* struct hip4_hip_config_version_3/4 (hip4.h, packed), field offsets */
++#define F_MAGIC                 0u      /* 0xcaba0401 */
++#define F_VER                   4u
++#define F_LEN                   6u
++#define F_COMPAT                8u      /* firmware owned from here ... */
++#define F_SAP_MLME              12u
++#define F_SAP_MA                14u
++#define F_SAP_DEBUG             16u
++#define F_SAP_TEST              18u
++#define F_BUILD                 20u
++#define F_PATCH                 24u
++#define F_HEADROOM              28u
++#define F_TAILROOM              29u
++#define F_ALIGN                 30u     /* ... to here */
++#define F_CACHE_LINE            31u
++#define F_HOST_BUF              32u
++#define F_HOST_BUF_SZ           36u
++#define F_FW_BUF                40u
++#define F_FW_BUF_SZ             44u
++#define F_MIB                   48u
++#define F_MIB_SZ                52u
++#define F_LOG                   56u
++#define F_LOG_SZ                60u
++#define F_FH_BIT                64u
++#define F_TH_BIT                65u
++#define F_SCOREBOARD            68u
++#define F_Q_NUM                 72u
++#define F_Q_LEN                 74u
++#define F_Q_IDX_SZ              76u
++#define F_Q_LOC                 80u
++
++#define A5WLAN_START_TIMEOUT_MS 10000u  /* Samsung waits 1 s; longer, to see a late answer */
++
++static struct {
++	uint32_t           ref;         /* MIF offset of the region */
++	volatile uint8_t  *va;
++	int                bit_tohost;
++	int                bit_fromhost;
++	uint32_t           mib_len;
++	volatile bool      start_cfm;
++	volatile uint32_t  other_sm;    /* other service-manager messages for service 1 */
++	volatile uint32_t  tohost;      /* to-host interrupts seen */
++	volatile uint32_t  last_msg;
++} a5wlan;
++
++static uint8_t a5wlan_mib_buf[8192];
++
++static inline void
++w8(uint32_t off, uint8_t v)
++{
++	a5wlan.va[off] = v;
++}
++
++static inline void
++w16(uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(a5wlan.va + off) = v;
++}
++
++static inline void
++w32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a5wlan.va + off) = v;
++}
++
++static inline uint8_t
++r8(uint32_t off)
++{
++	return a5wlan.va[off];
++}
++
++static inline uint16_t
++r16(uint32_t off)
++{
++	return *(volatile uint16_t *)(a5wlan.va + off);
++}
++
++static inline uint32_t
++r32(uint32_t off)
++{
++	return *(volatile uint32_t *)(a5wlan.va + off);
++}
++
++static void
++a5wlan_mb(void)
++{
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
++static void
++a5wlan_sleep_ms(uint32_t ms)
++{
++	assert_wait_timeout((event_t)&a5wlan.va, THREAD_UNINT, ms, 1000 * NSEC_PER_USEC);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* The service manager's answers for service 1 (sm_msg_packet: { id, msg, ... }). */
++static void
++a5wlan_sm(const uint8_t *p, void *arg __unused)
++{
++	a5wlan.last_msg = p[1];
++	if (p[1] == A5SCSC_SM_MSG_START_CFM) {
++		a5wlan.start_cfm = true;
++	} else {
++		a5wlan.other_sm++;
++	}
++}
++
++/* The to-host bit: only counted for now (HIP4 queues are the next step). */
++static void
++a5wlan_tohost(int bit __unused, void *arg __unused)
++{
++	a5wlan.tohost++;
++}
++
++/* What of mx140_wlan.hcf goes into the MIB area; 0 when there is none. */
++static uint32_t
++a5wlan_mib(void)
++{
++	size_t size = 0;
++	int err = a5scsc_read_file(A5WLAN_MIB_PATH, a5wlan_mib_buf, sizeof(a5wlan_mib_buf), &size);
++
++	if (err != 0) {
++		printf("A5XELTE WLAN: MIB: %s not read (%d): starting without one\n", A5WLAN_MIB_PATH, err);
++		return 0;
++	}
++	if (size < 8 || a5wlan_mib_buf[7] != 1) {
++		printf("A5XELTE WLAN: MIB: %s has no first-format header (%u bytes): not used\n",
++		    A5WLAN_MIB_PATH, (unsigned)size);
++		return 0;
++	}
++	if (size - 8 > W_MIB_SIZE) {
++		printf("A5XELTE WLAN: MIB: %u bytes, more than the %u-byte area: not used\n",
++		    (unsigned)(size - 8), W_MIB_SIZE);
++		return 0;
++	}
++	for (uint32_t i = 0; i < size - 8; i++) {
++		w8(W_MIB + i, a5wlan_mib_buf[8 + i]);
++	}
++	return (uint32_t)(size - 8);
++}
++
++static void
++a5wlan_config(uint32_t c, uint16_t version)
++{
++	w32(c + F_MAGIC, 0xcaba0401u);
++	w16(c + F_VER, version);
++	w16(c + F_LEN, (uint16_t)C_CONFIG_LEN);
++	w8(c + F_CACHE_LINE, 64);
++	w32(c + F_HOST_BUF, a5wlan.ref + W_TX);
++	w32(c + F_HOST_BUF_SZ, W_TX_SIZE);
++	w32(c + F_FW_BUF, a5wlan.ref + W_RX);
++	w32(c + F_FW_BUF_SZ, W_RX_SIZE);
++	w32(c + F_MIB, a5wlan.mib_len != 0 ? a5wlan.ref + W_MIB : 0);
++	w32(c + F_MIB_SZ, a5wlan.mib_len);
++	w32(c + F_LOG, 0);
++	w32(c + F_LOG_SZ, 0);
++	w8(c + F_FH_BIT, (uint8_t)a5wlan.bit_fromhost);
++	w8(c + F_TH_BIT, (uint8_t)a5wlan.bit_tohost);
++	w32(c + F_SCOREBOARD, a5wlan.ref + W_CONFIG + C_SCOREBOARD);
++	w16(c + F_Q_NUM, C_QUEUES);
++	w16(c + F_Q_LEN, 256);
++	w16(c + F_Q_IDX_SZ, 1);
++	for (uint32_t q = 0; q < C_QUEUES; q++) {
++		w32(c + F_Q_LOC + 4 * q, a5wlan.ref + W_CONFIG + C_Q(q));
++	}
++}
++
++static void
++a5wlan_report(const char *what, uint32_t waited)
++{
++	uint32_t taken = r32(C_INIT_TAKEN);
++	uint32_t c = taken == 3 ? C_V3 : C_V4;
++
++	printf("A5XELTE WLAN: step 4: %s after %u ms; the firmware took config version %u: compat 0x%x, SAP MLME 0x%x "
++	    "MA 0x%x debug 0x%x test 0x%x, build %u patch %u, headroom %u tailroom %u align %u; MIB %u bytes; "
++	    "to-host interrupts %u, other service messages %u (last %u)\n", what, waited, taken, r32(c + F_COMPAT),
++	    r16(c + F_SAP_MLME), r16(c + F_SAP_MA), r16(c + F_SAP_DEBUG), r16(c + F_SAP_TEST), r32(c + F_BUILD),
++	    r32(c + F_PATCH), r8(c + F_HEADROOM), r8(c + F_TAILROOM), r8(c + F_ALIGN), a5wlan.mib_len,
++	    a5wlan.tohost, a5wlan.other_sm, a5wlan.last_msg);
++}
++
++static void
++a5wlan_bringup_thread(void *param __unused, wait_result_t wr __unused)
++{
++	uint8_t body[5];
++	uint32_t waited;
++	int attempt, err;
++
++	for (attempt = 0; attempt < 120 && !a5scsc_transport_up(); attempt++) {
++		a5wlan_sleep_ms(250);
++	}
++	if (attempt == 120) {
++		printf("A5XELTE WLAN: shared SCSC transport not up; WLAN not started\n");
++		return;
++	}
++	/* the transport's streams take no lock: one service start at a time */
++	for (attempt = 0; attempt < 200 && !a5xelte_bt_settled(); attempt++) {
++		a5wlan_sleep_ms(100);
++	}
++	if (!a5scsc_mifram_alloc(W_TOTAL, 4096, &a5wlan.ref) ||
++	    (a5wlan.va = a5scsc_mifram_ptr(a5wlan.ref)) == NULL) {
++		printf("A5XELTE WLAN: no %u bytes of MIF memory left for the HIP4 region; WLAN not started\n", W_TOTAL);
++		return;
++	}
++	memset((void *)a5wlan.va, 0, W_CONFIG_SIZE + W_MIB_SIZE);
++	a5wlan.mib_len = a5wlan_mib();
++
++	a5wlan.bit_tohost = a5scsc_intrbit_alloc_tohost(a5wlan_tohost, NULL);
++	a5wlan.bit_fromhost = a5scsc_intrbit_alloc_fromhost(A5SCSC_MIF_TARGET_R4, false);
++	if (a5wlan.bit_tohost < 0 || a5wlan.bit_fromhost < 0) {
++		printf("A5XELTE WLAN: interrupt-bit allocation failed (to host %d, from host %d); WLAN not started\n",
++		    a5wlan.bit_tohost, a5wlan.bit_fromhost);
++		return;
++	}
++
++	a5wlan_config(W_CONFIG + C_V4, 4);
++	a5wlan_config(W_CONFIG + C_V3, 3);
++	w32(C_INIT_A, a5wlan.ref + W_CONFIG + C_V4);
++	w32(C_INIT_B, a5wlan.ref + W_CONFIG + C_V3);
++	a5wlan_mb();
++	w32(C_INIT_MAGIC, 0xcaaa0400u);
++	a5wlan_mb();
++	printf("A5XELTE WLAN: step 4: HIP4 region at 0x%x (%u bytes), MIB %u bytes, bits to host %d from host %d; "
++	    "SM_MSG_START_REQ\n", a5wlan.ref, W_TOTAL, a5wlan.mib_len, a5wlan.bit_tohost, a5wlan.bit_fromhost);
++
++	a5scsc_sm_register(A5SCSC_SERVICE_ID_WLAN, a5wlan_sm, NULL);
++	body[0] = A5SCSC_SM_MSG_START_REQ;
++	body[1] = (uint8_t)(a5wlan.ref & 0xff);
++	body[2] = (uint8_t)((a5wlan.ref >> 8) & 0xff);
++	body[3] = (uint8_t)((a5wlan.ref >> 16) & 0xff);
++	body[4] = (uint8_t)((a5wlan.ref >> 24) & 0xff);
++	a5scsc_mxlog_more(400);         /* what the firmware says next */
++	err = a5scsc_mxmgmt_send(A5SCSC_MMTRANS_CHAN_SERVICE, A5SCSC_SERVICE_ID_WLAN, body, sizeof(body));
++	if (err != 0) {
++		printf("A5XELTE WLAN: step 4: SM_MSG_START_REQ not sent (%d)\n", err);
++		return;
++	}
++	for (waited = 0; waited < A5WLAN_START_TIMEOUT_MS && !a5wlan.start_cfm; waited += A5SCSC_POLL_INTERVAL_MS) {
++		a5wlan_sleep_ms(A5SCSC_POLL_INTERVAL_MS);
++	}
++	if (!a5wlan.start_cfm) {
++		a5wlan_report("no SM_MSG_START_CFM", waited);
++		a5scsc_diag("wlan start");
++		return;
++	}
++	a5wlan_report("SM_MSG_START_CFM", waited);
++	printf("A5XELTE WLAN: up: the WLAN service started (next: HIP4 queues, MLME-ADD-VIF, scan)\n");
++}
++
++void
++a5xelte_wlan_probe(void)
++{
++	int wifi = 0, wlan = 1;
++	thread_t thread = THREAD_NULL;
++
++	(void)PE_parse_boot_argn("a8wifi", &wifi, sizeof(wifi));
++	(void)PE_parse_boot_argn("a8wlan", &wlan, sizeof(wlan));
++	if (wifi != 1 || wlan == 0) {
++		return;
++	}
++	if (kernel_thread_start((thread_continue_t)a5wlan_bringup_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("A5XELTE WLAN: bring-up thread failed to start\n");
++		return;
++	}
++	thread_deallocate(thread);
++}
++
++#else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++
++void a5xelte_wlan_probe(void);
++
++void
++a5xelte_wlan_probe(void)
++{
++}
++
++#endif
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 97e2454..3c3f328 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -77,6 +77,7 @@ extern void jackpotlte_mali_service_start(void);
+ extern void a5xelte_usb_probe(void);
+ extern void a5xelte_scsc_probe(void);
+ extern void a5xelte_bt_probe(void);
++extern void a5xelte_wlan_probe(void);  /* bsd/dev/a5xelte_wlan.c, 0220 */
+ extern void a5xelte_sensors_probe(void);
+ extern void a5xelte_wifi_probe(void);
+ extern void a5xelte_flashlight_probe(void);
+@@ -805,6 +806,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	/* Galaxy A8 2018: Bluetooth service on the same SCSC R4, off unless
+ 	 * "a8bt" is 1 (bsd/dev/a5xelte_bt.c). */
+ 	a5xelte_bt_probe();
++	/* Galaxy A8 2018: the WLAN service on the same R4 (HIP4, step 4), with
++	 * "a8wifi" 1 unless "a8wlan" is 0 (bsd/dev/a5xelte_wlan.c). */
++	a5xelte_wlan_probe();
+ 	/* Galaxy A8 2018: hall/grip/sensor-hub probe, off unless
+ 	 * "a8sensors" is 1 (bsd/dev/a5xelte_sensors.c). */
+ 	a5xelte_sensors_probe();
+-- 
+2.43.0
+
