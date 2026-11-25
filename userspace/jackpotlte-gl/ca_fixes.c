@@ -972,6 +972,17 @@ static struct our_program plain, table, vibrant, masking, blur4, box, wide, vblu
 static GLint vblur_radius = -1;          /* glca22: its "radius" uniform */
 static int vblur_px = 18;                /* a8gl-vblur: 0 off, else the radius in pixels */
 static int alt_on;                       /* a8gl-alt "1": the alpha threshold stand-in */
+/*
+ * glca22b: a draw with no program that we do not draw is not handed on
+ * either. Handed on, Mesa still wrote into the target: the variable blur's
+ * two "vrd" passes (which read the texture they write) turned the backdrop
+ * copy to 0,0,0,0 (trace pixels 11-25: 1087c7ff before, 00000000 after), and
+ * that is what the Dynamic Island's black block was made of. Switch
+ * a8gl-skipnp "0": hand them on as before.
+ */
+static int skipnp_on = 1;
+static bool plain_skip;                  /* plain_begin: leave this draw out */
+static unsigned long skipped_np;         /* how many were left out */
 static GLint wide_reach = -1;          /* its "reach" uniform */
 static int wide_on = 1;                /* a8gl-wide "0": the 16-sample stand-in instead */
 
@@ -1130,6 +1141,7 @@ plain_begin(void *context, struct plain_state *state)
    unsigned function;
    float reach = 0;
 
+   plain_skip = false;
    if (!plain_on)
       return false;
    jackpotlte_gl_use(context);
@@ -1154,6 +1166,7 @@ plain_begin(void *context, struct plain_state *state)
    if (texture0 == 0 || texture0 == colour_texture()) {
       gl.active_texture((GLenum)state->active);
       census(function, texture0 == 0 ? "no texture, not drawn" : "reads what it writes, not drawn");
+      plain_skip = true;
       return false;
    }
 
@@ -1199,6 +1212,7 @@ plain_begin(void *context, struct plain_state *state)
        * red veil (vcm) or blocks (the blur chain), so it is left out */
       gl.active_texture((GLenum)state->active);
       census(function, "no stand-in, not drawn");
+      plain_skip = true;
       return false;
    } else if (texture1 != 0 && rows == 1) {
       if (!table.tried)
@@ -1213,6 +1227,7 @@ plain_begin(void *context, struct plain_state *state)
       gl.use_program(0);
       gl.active_texture((GLenum)state->active);
       census(function, "our program did not build, not drawn");
+      plain_skip = true;
       return false;
    }
 
@@ -1508,8 +1523,8 @@ bounds_end(struct bounds_state *state)
    if (!state->was_on)
       gl.disable(0x0C11);
    if ((bounds_draws & 16383) == 0)
-      say("glca21: %lu draws, %lu scissored to their vertices, %lu left alone",
-          bounds_draws, bounds_cut, bounds_left);
+      say("glca21: %lu draws, %lu scissored to their vertices, %lu left alone; %lu no-program draws left out",
+          bounds_draws, bounds_cut, bounds_left, skipped_np);
 }
 
 static void
@@ -1518,8 +1533,13 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
    struct plain_state state;
    struct bounds_state bounds;
    bool ours = plain_begin(context, &state);
-   bool cut = bounds_begin(first, count, 0, NULL, &bounds);
+   bool cut;
 
+   if (!ours && plain_skip && skipnp_on) {
+      skipped_np++;
+      return;           /* glca22b: a no-program draw we cannot draw is left out */
+   }
+   cut = bounds_begin(first, count, 0, NULL, &bounds);
    next_draw_arrays(context, mode, first, count);
    if (cut)
       bounds_end(&bounds);
@@ -1533,8 +1553,13 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
    struct plain_state state;
    struct bounds_state bounds;
    bool ours = plain_begin(context, &state);
-   bool cut = bounds_begin(0, count, type, indices, &bounds);
+   bool cut;
 
+   if (!ours && plain_skip && skipnp_on) {
+      skipped_np++;
+      return;           /* glca22b: as in my_glDrawArrays */
+   }
+   cut = bounds_begin(0, count, type, indices, &bounds);
    next_draw_elements(context, mode, count, type, indices);
    if (cut)
       bounds_end(&bounds);
@@ -1591,15 +1616,20 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
                vblur_px = v < 0 ? 0 : v > 64 ? 64 : v;
             fclose(f);
          }
+         f = fopen("/private/var/mobile/Library/a8gl-skipnp", "r");         /* glca22b */
+         skipnp_on = !(f != NULL && fgetc(f) == '0');
+         if (f != NULL)
+            fclose(f);
          f = fopen("/private/var/mobile/Library/a8gl-alt", "r");            /* glca22 */
          alt_on = f != NULL && fgetc(f) == '1';
          if (f != NULL)
             fclose(f);
       }
       say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s, wide downsample %s, "
-          "draws scissored to their vertices %s, variable blur %d px, alpha threshold %s%s",
+          "draws scissored to their vertices %s, variable blur %d px, alpha threshold %s, "
+          "no-program draws we cannot draw %s%s",
           glsl_on ? "on" : "off", plain_on ? "on" : "off", shapes_on ? "on" : "off", wide_on ? "on" : "off",
-          bounds_on ? "on" : "off", vblur_px, alt_on ? "on" : "off",
+          bounds_on ? "on" : "off", vblur_px, alt_on ? "on" : "off", skipnp_on ? "left out" : "handed on",
           debug_shape ? ", SHAPE DEBUG (a8gl-dbg-shape)" : "");
       if (access("/private/var/mobile/Library/a8gl-nohooks", F_OK) != 0)
          hook_coreanimation();
