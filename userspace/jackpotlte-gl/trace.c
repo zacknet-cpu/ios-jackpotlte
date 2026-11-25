@@ -98,6 +98,7 @@
 static struct {
    void (*get_integerv)(GLenum, GLint *);
    void (*get_booleanv)(GLenum, GLboolean *);
+   void (*get_floatv)(GLenum, GLfloat *);           /* glca22c */
    GLboolean (*is_enabled)(GLenum);
    void (*active_texture)(GLenum);
    void (*get_tex_level_parameteriv)(GLenum, GLint, GLenum, GLint *);
@@ -130,6 +131,7 @@ load(void)
    gl.loaded = 1;
    PROC(get_integerv, "glGetIntegerv");
    PROC(get_booleanv, "glGetBooleanv");
+   PROC(get_floatv, "glGetFloatv");
    PROC(is_enabled, "glIsEnabled");
    PROC(active_texture, "glActiveTexture");
    PROC(get_tex_level_parameteriv, "glGetTexLevelParameteriv");
@@ -892,6 +894,110 @@ trace_frame(void)
    }
 }
 
+/*
+ * glca22c: the calls between draws that change what a target holds, as
+ * "C" lines in the frame being traced (a clear, a texture made again, a
+ * framebuffer's attachment, a copy, mipmaps): the variable blur's backdrop copy
+ * read back as 0,0,0,0 after a draw that was not even handed on.
+ */
+static void (*next_clear)(void *, GLbitfield);
+static void (*next_tex_image_2d)(void *, GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum,
+                                 const void *);
+static void (*next_framebuffer_texture_2d)(void *, GLenum, GLenum, GLenum, GLuint, GLint);
+static void (*next_bind_framebuffer)(void *, GLenum, GLuint);
+static void (*next_copy_tex_sub_image_2d)(void *, GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei);
+static void (*next_generate_mipmap)(void *, GLenum);
+
+static bool
+calls_traced(void *context)
+{
+   if (!(armed_frames > 0 && trace != NULL))
+      return false;
+   jackpotlte_gl_use(context);
+   return load();
+}
+
+static void
+my_glClear(void *context, GLbitfield mask)
+{
+   if (calls_traced(context)) {
+      GLint framebuffer = 0, scissor[4] = { 0, 0, 0, 0 };
+      GLfloat colour[4] = { 0, 0, 0, 0 };
+
+      gl.get_integerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+      gl.get_integerv(GL_SCISSOR_BOX, scissor);
+      if (gl.get_floatv != NULL)
+         gl.get_floatv(0x0C22 /* COLOR_CLEAR_VALUE */, colour);
+      out("C %lu.%lu clear %#x fb %d sc %s %d,%d %dx%d colour %g %g %g %g\n", trace_frame_number,
+          trace_draw_number, mask, framebuffer, gl.is_enabled(GL_SCISSOR_TEST) ? "on" : "off", scissor[0],
+          scissor[1], scissor[2], scissor[3], colour[0], colour[1], colour[2], colour[3]);
+   }
+   next_clear(context, mask);
+}
+
+static void
+my_glTexImage2D(void *context, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
+                GLint border, GLenum format, GLenum type, const void *pixels)
+{
+   if (calls_traced(context)) {
+      GLint texture = 0;
+
+      gl.get_integerv(GL_TEXTURE_BINDING_2D, &texture);
+      out("C %lu.%lu teximage texture %d level %d %dx%d format %#x type %#x %s\n", trace_frame_number,
+          trace_draw_number, texture, level, width, height, format, type, pixels ? "with pixels" : "empty");
+   }
+   next_tex_image_2d(context, target, level, internalformat, width, height, border, format, type, pixels);
+}
+
+static void
+my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
+                          GLint level)
+{
+   if (calls_traced(context)) {
+      GLint framebuffer = 0;
+
+      gl.get_integerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+      out("C %lu.%lu attach fb %d %#x texture %u level %d\n", trace_frame_number, trace_draw_number,
+          framebuffer, attachment, texture, level);
+   }
+   next_framebuffer_texture_2d(context, target, attachment, textarget, texture, level);
+}
+
+static void
+my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
+{
+   if (calls_traced(context))
+      out("C %lu.%lu bind fb %u\n", trace_frame_number, trace_draw_number, framebuffer);
+   next_bind_framebuffer(context, target, framebuffer);
+}
+
+static void
+my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y,
+                       GLsizei width, GLsizei height)
+{
+   if (calls_traced(context)) {
+      GLint texture = 0, framebuffer = 0;
+
+      gl.get_integerv(GL_TEXTURE_BINDING_2D, &texture);
+      gl.get_integerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+      out("C %lu.%lu copy fb %d %d,%d %dx%d into texture %d level %d at %d,%d\n", trace_frame_number,
+          trace_draw_number, framebuffer, x, y, width, height, texture, level, xoffset, yoffset);
+   }
+   next_copy_tex_sub_image_2d(context, target, level, xoffset, yoffset, x, y, width, height);
+}
+
+static void
+my_glGenerateMipmap(void *context, GLenum target)
+{
+   if (calls_traced(context)) {
+      GLint texture = 0;
+
+      gl.get_integerv(GL_TEXTURE_BINDING_2D, &texture);
+      out("C %lu.%lu mipmaps texture %d\n", trace_frame_number, trace_draw_number, texture);
+   }
+   next_generate_mipmap(context, target);
+}
+
 /* Offsets from eagl_slots.txt: index = offset / 8. After ca_fixes_install. */
 void
 trace_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
@@ -906,4 +1012,23 @@ trace_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
    table_entries[0x258] = (void *)my_glLinkProgram;        /* 0x12c0 */
    table_entries[0x042] = (void *)my_glDrawArrays;         /* 0x0210 */
    table_entries[0x044] = (void *)my_glDrawElements;       /* 0x0220 */
+   /* glca22c */
+   memcpy(&next_clear, &table_entries[0x00b], sizeof(next_clear));
+   memcpy(&next_tex_image_2d, &table_entries[0x12e], sizeof(next_tex_image_2d));
+   memcpy(&next_framebuffer_texture_2d, &table_entries[0x2a6], sizeof(next_framebuffer_texture_2d));
+   memcpy(&next_bind_framebuffer, &table_entries[0x2a1], sizeof(next_bind_framebuffer));
+   memcpy(&next_copy_tex_sub_image_2d, &table_entries[0x039], sizeof(next_copy_tex_sub_image_2d));
+   memcpy(&next_generate_mipmap, &table_entries[0x2aa], sizeof(next_generate_mipmap));
+   if (next_clear != NULL)
+      table_entries[0x00b] = (void *)my_glClear;               /* 0x0058 */
+   if (next_tex_image_2d != NULL)
+      table_entries[0x12e] = (void *)my_glTexImage2D;          /* 0x0970 */
+   if (next_framebuffer_texture_2d != NULL)
+      table_entries[0x2a6] = (void *)my_glFramebufferTexture2D; /* 0x1530 */
+   if (next_bind_framebuffer != NULL)
+      table_entries[0x2a1] = (void *)my_glBindFramebuffer;     /* 0x1508 */
+   if (next_copy_tex_sub_image_2d != NULL)
+      table_entries[0x039] = (void *)my_glCopyTexSubImage2D;   /* 0x01c8 */
+   if (next_generate_mipmap != NULL)
+      table_entries[0x2aa] = (void *)my_glGenerateMipmap;      /* 0x1550 */
 }
