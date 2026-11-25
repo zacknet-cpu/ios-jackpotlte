@@ -161,6 +161,7 @@ load(void)
 /* ca_fixes.c: the function CoreAnimation is drawing (>= 90: not known), and
  * the matrix it last gave a program of its own */
 unsigned ca_fixes_function(void);
+const float *ca_fixes_function_values(unsigned function, unsigned *count);   /* glca22 */
 const float *ca_fixes_matrix(void);
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -674,6 +675,26 @@ trace_draw(bool elements, GLenum mode, GLint first, GLsizei count, GLenum type, 
    if (gl.is_enabled(GL_STENCIL_TEST) || gl.is_enabled(GL_DEPTH_TEST))
       out("   stencil %d depth %d\n", gl.is_enabled(GL_STENCIL_TEST), gl.is_enabled(GL_DEPTH_TEST));
    textures_out();
+   if (framebuffer != 0 && attachment_type == 0x1702 /* TEXTURE */) {
+      GLint level = 0;
+
+      gl.get_framebuffer_attachment_parameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                0x8CD2 /* TEXTURE_LEVEL */, &level);
+      if (level != 0)
+         out("   draws into level %d of texture %d\n", level, attachment);
+   }
+   if (program == 0) {
+      /* glca22: a draw with no program is a CA function; its numbers */
+      unsigned given = 0;
+      const float *v = ca_fixes_function_values(function, &given);
+
+      if (v != NULL && given > 0) {
+         out("   function %u values:", function);
+         for (unsigned i = 0; i < given; i++)
+            out(" %g", v[i]);
+         out("\n");
+      }
+   }
    attributes_out(program, indices, n);
    uniforms_out(program);
 }

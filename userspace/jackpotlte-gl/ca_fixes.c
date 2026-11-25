@@ -690,6 +690,82 @@ static const char wide_fragment[] =
    "  result = sum / weights;\n"
    "}\n";
 
+/*
+ * glca22: "vrb" (39), CoreAnimation's variable blur (CAFilter variableBlur):
+ * the backdrop under the expanded Dynamic Island, Spotlight's top. Its draw
+ * reads the backdrop (unit 0, source pixels in texcoord0) and a one-column
+ * mask (unit 1, e.g. 1x2381, coordinates in vertex_texcoord1, attribute 3);
+ * the result is put on the screen with blending off, so with no shader for
+ * it (nothing drawn) the screen got the target's empty pixels: a black block
+ * the width of the screen and ~610 px tall (user report 11-25). The two "vrd"
+ * (38) passes before it read the texture they write and are still left out,
+ * so the source is the unblurred backdrop. Here each pixel averages 17
+ * samples on a golden-angle spiral of radius `radius` x the mask's alpha.
+ * The four numbers CA gives are logged ("glca22: function 39 values") but not
+ * used yet. Switch a8gl-vblur: "0" off (old behaviour), "N" radius N pixels
+ * (default 18).
+ */
+static const char vblur_vertex[] =
+   "#version 300 es\n"
+   "uniform highp mat4 vertex_matrix;\n"
+   "in highp vec4 vertex_position;\n"
+   "in lowp vec4 vertex_color;\n"
+   "in highp vec2 vertex_texcoord0;\n"
+   "in highp vec2 vertex_texcoord1;\n"
+   "out lowp vec4 color;\n"
+   "out highp vec2 texcoord;\n"
+   "out highp vec2 texcoord1;\n"
+   "void main() {\n"
+   "  gl_Position = vertex_matrix * vertex_position;\n"
+   "  color = vertex_color;\n"
+   "  texcoord = vertex_texcoord0;\n"
+   "  texcoord1 = vertex_texcoord1;\n"
+   "}\n";
+
+static const char vblur_fragment[] =
+   "#version 300 es\n"
+   "uniform highp sampler2D texture0;\n"
+   "uniform highp sampler2D mask;\n"
+   "uniform highp float radius;\n"
+   "in lowp vec4 color;\n"
+   "in highp vec2 texcoord;\n"
+   "in highp vec2 texcoord1;\n"
+   "out highp vec4 result;\n"
+   "void main() {\n"
+   "  highp vec2 size = vec2(textureSize(texture0, 0));\n"
+   "  highp vec2 at = texcoord / size;\n"
+   "  highp float r = radius * clamp(texture(mask, texcoord1).a, 0., 1.);\n"
+   "  highp vec4 sum = texture(texture0, at);\n"
+   "  if (r >= .75) {\n"
+   "    for (int i = 0; i < 16; i++) {\n"
+   "      highp float k = float(i) + .5;\n"
+   "      highp vec2 o = vec2(cos(k * 2.39996323), sin(k * 2.39996323)) * (sqrt(k / 16.) * r);\n"
+   "      sum += texture(texture0, at + o / size);\n"
+   "    }\n"
+   "    sum *= 1. / 17.;\n"
+   "  }\n"
+   "  result = color * sum;\n"
+   "}\n";
+
+/*
+ * glca22: "alt" (59), taken to be an alpha threshold (2 numbers: the
+ * threshold, then a width or 0). Off unless the switch a8gl-alt holds "1":
+ * where CA uses it is not known yet (its values are logged).
+ */
+static const char alt_fragment[] =
+   "#version 300 es\n"
+   "uniform lowp sampler2D texture0;\n"
+   "uniform highp vec4 values;\n"
+   "in lowp vec4 color;\n"
+   "in highp vec2 texcoord;\n"
+   "out lowp vec4 result;\n"
+   "void main() {\n"
+   "  mediump vec4 s = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+   "  highp float w = (values.y > 0. && values.y < .5) ? max(values.y, .004) : .02;\n"
+   "  highp float a = smoothstep(values.x - w, values.x + w, s.a);\n"
+   "  result = vec4(s.rgb / max(s.a, .004) * a, a);\n"
+   "}\n";
+
 static const char box_fragment[] =
    "#version 300 es\n"
    "uniform lowp sampler2D texture0;\n"
@@ -712,6 +788,8 @@ static const char box_fragment[] =
 #define FUNCTION_SHADOW_BLUR            40
 #define FUNCTION_VIBRANT_MATRIX         45
 #define FUNCTION_HOME_AFFORDANCE        53
+#define FUNCTION_VARIABLE_BLUR          39   /* glca22 "vrb" */
+#define FUNCTION_ALPHA_THRESHOLD        59   /* glca22 "alt" */
 #define FUNCTION_CUSTOM                 89
 #define FUNCTIONS                       90
 
@@ -735,12 +813,25 @@ current_function(void)
 
 /* trace.c's view of them */
 unsigned ca_fixes_function(void);
+const float *ca_fixes_function_values(unsigned function, unsigned *count);
 const float *ca_fixes_matrix(void);
 
 unsigned
 ca_fixes_function(void)
 {
    return current_function();
+}
+
+/* glca22: the numbers CA last gave a function (trace.c prints them) */
+const float *
+ca_fixes_function_values(unsigned function, unsigned *count)
+{
+   if (function >= FUNCTIONS) {
+      *count = 0;
+      return NULL;
+   }
+   *count = function_given[function];
+   return function_values[function];
 }
 
 /* ---- hooks into CoreAnimation's GLES context (QuartzCore 20H392) -------- */
@@ -784,6 +875,23 @@ my_function_uniform(void *context, unsigned index, size_t components, size_t cou
          said[function] = 1;
          say("CA gives function %u (\"%.3s\") %zu numbers", function, function_names + 4 * function,
              components * count);
+      }
+      {
+         /* glca22: the numbers themselves, a few times, for the functions
+          * whose stand-ins are being worked out */
+         static uint8_t told[FUNCTIONS];
+
+         if ((function == 38 || function == FUNCTION_VARIABLE_BLUR || function == FUNCTION_ALPHA_THRESHOLD ||
+              function == 61) && told[function] < 4) {
+            char line[200];
+            int at = 0;
+
+            told[function]++;
+            line[0] = '\0';
+            for (size_t i = 0; i < components * count && at < (int)sizeof(line) - 16; i++)
+               at += snprintf(line + at, sizeof(line) - (size_t)at, " %g", values[i]);
+            say("glca22: function %u (\"%.3s\") values:%s", function, function_names + 4 * function, line);
+         }
       }
    }
    orig_function_uniform(context, index, components, count, values);
@@ -860,12 +968,16 @@ struct our_program {
    GLint numbers;      /* "colours" or "places", -1 if none */
    int tried;
 };
-static struct our_program plain, table, vibrant, masking, blur4, box, wide;
+static struct our_program plain, table, vibrant, masking, blur4, box, wide, vblur, athresh;
+static GLint vblur_radius = -1;          /* glca22: its "radius" uniform */
+static int vblur_px = 18;                /* a8gl-vblur: 0 off, else the radius in pixels */
+static int alt_on;                       /* a8gl-alt "1": the alpha threshold stand-in */
 static GLint wide_reach = -1;          /* its "reach" uniform */
 static int wide_on = 1;                /* a8gl-wide "0": the 16-sample stand-in instead */
 
 static void
-make_program(struct our_program *our, const char *fragment, const char *numbers, const char *what)
+make_program_with(struct our_program *our, const char *vertex, const char *fragment, const char *numbers,
+                  const char *what)
 {
    GLuint p, shader;
    const GLchar *text;
@@ -874,7 +986,7 @@ make_program(struct our_program *our, const char *fragment, const char *numbers,
    our->tried = 1;
    p = gl.create_program();
    shader = gl.create_shader(GL_VERTEX_SHADER);
-   text = plain_vertex;
+   text = vertex;
    gl.shader_source(shader, 1, &text, NULL);
    gl.compile_shader(shader);
    gl.attach_shader(p, shader);
@@ -886,6 +998,7 @@ make_program(struct our_program *our, const char *fragment, const char *numbers,
    gl.bind_attrib_location(p, 0, "vertex_position");
    gl.bind_attrib_location(p, 1, "vertex_color");
    gl.bind_attrib_location(p, 2, "vertex_texcoord0");
+   gl.bind_attrib_location(p, 3, "vertex_texcoord1");     /* glca22: the variable blur's mask */
    gl.link_program(p);
    gl.get_programiv(p, GL_LINK_STATUS, &good);
    say("a program of ours for draws with no program (%s): %s", what, good ? "made" : "NOT MADE");
@@ -905,6 +1018,14 @@ make_program(struct our_program *our, const char *fragment, const char *numbers,
    gl.uniform1i(gl.get_uniform_location(p, "texture0"), 0);
    if (fragment == table_fragment)
       gl.uniform1i(gl.get_uniform_location(p, "table"), 1);
+   if (gl.get_uniform_location(p, "mask") >= 0)
+      gl.uniform1i(gl.get_uniform_location(p, "mask"), 1);
+}
+
+static void
+make_program(struct our_program *our, const char *fragment, const char *numbers, const char *what)
+{
+   make_program_with(our, plain_vertex, fragment, numbers, what);
 }
 
 static bool
@@ -1059,6 +1180,17 @@ plain_begin(void *context, struct plain_state *state)
       if (!box.tried)
          make_program(&box, box_fragment, "places", "eight times smaller");
       our = &box;
+   } else if (function == FUNCTION_VARIABLE_BLUR && vblur_px > 0 && texture1 != 0) {
+      if (!vblur.tried) {
+         make_program_with(&vblur, vblur_vertex, vblur_fragment, NULL, "a variable blur through a one-column mask");
+         if (vblur.program != 0)
+            vblur_radius = gl.get_uniform_location(vblur.program, "radius");
+      }
+      our = &vblur;
+   } else if (function == FUNCTION_ALPHA_THRESHOLD && alt_on) {
+      if (!athresh.tried)
+         make_program(&athresh, alt_fragment, "values", "an alpha threshold");
+      our = &athresh;
    } else if (function == FUNCTION_VIBRANT_MATRIX || function == FUNCTION_MATRIX_PREMULTIPLIED ||
               function == FUNCTION_SHADOW_BLUR || function == FUNCTION_DOWNSAMPLE_8 ||
               (function < FUNCTIONS && function != FUNCTION_CUSTOM &&
@@ -1092,6 +1224,10 @@ plain_begin(void *context, struct plain_state *state)
       gl.uniform2fv(our->numbers, 4, function_values[function]);
    else if (our == &wide)
       gl.uniform1f(wide_reach, reach);
+   else if (our == &vblur)
+      gl.uniform1f(vblur_radius, (GLfloat)vblur_px);
+   else if (our == &athresh)
+      gl.uniform4fv(our->numbers, 1, function_values[function]);
    state->blended = 0;
    if (our == &vibrant && gl.is_enabled(GL_BLEND)) {
       state->blended = 1;      /* the program mixes by itself */
@@ -1107,7 +1243,9 @@ plain_begin(void *context, struct plain_state *state)
                     our == &vibrant ? "drawn with our vibrant colour matrix" :
                     our == &masking ? "drawn with our premultiplied colour matrix" :
                     our == &blur4 ? "drawn with our four-sample blur" :
-                    our == &wide ? "drawn with our wide Gaussian downsample" : "drawn with our 8x downsample");
+                    our == &wide ? "drawn with our wide Gaussian downsample" :
+                    our == &vblur ? "drawn with our variable blur (glca22)" :
+                    our == &athresh ? "drawn with our alpha threshold (glca22)" : "drawn with our 8x downsample");
    return true;
 }
 
@@ -1445,11 +1583,23 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
          bounds_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
             fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-vblur", "r");          /* glca22 */
+         if (f != NULL) {
+            int v = 0;
+
+            if (fscanf(f, "%d", &v) == 1)
+               vblur_px = v < 0 ? 0 : v > 64 ? 64 : v;
+            fclose(f);
+         }
+         f = fopen("/private/var/mobile/Library/a8gl-alt", "r");            /* glca22 */
+         alt_on = f != NULL && fgetc(f) == '1';
+         if (f != NULL)
+            fclose(f);
       }
       say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s, wide downsample %s, "
-          "draws scissored to their vertices %s%s",
+          "draws scissored to their vertices %s, variable blur %d px, alpha threshold %s%s",
           glsl_on ? "on" : "off", plain_on ? "on" : "off", shapes_on ? "on" : "off", wide_on ? "on" : "off",
-          bounds_on ? "on" : "off",
+          bounds_on ? "on" : "off", vblur_px, alt_on ? "on" : "off",
           debug_shape ? ", SHAPE DEBUG (a8gl-dbg-shape)" : "");
       if (access("/private/var/mobile/Library/a8gl-nohooks", F_OK) != 0)
          hook_coreanimation();
