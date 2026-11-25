@@ -1,0 +1,14 @@
+mesa-25.0.7/src/gallium/drivers/panfrost/meson.build
+mesa-25.0.7/src/gallium/drivers/panfrost/pan_cmdstream.c
+mesa-25.0.7/src/gallium/drivers/panfrost/pan_csf.c
+mesa-25.0.7/src/gallium/drivers/panfrost/pan_device.h
+mesa-25.0.7/src/gallium/drivers/panfrost/pan_fb_preload.c
+mesa-25.0.7/src/gallium/drivers/panfrost/pan_fb_preload.h
+mesa-25.0.7/src/gallium/drivers/panfrost/pan_jm.c
+mesa-25.0.7/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+mesa-25.0.7/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+mesa-25.0.7/src/panfrost/vulkan/meson.build
+mesa-25.0.7/src/panfrost/vulkan/panvk_cmd_draw.h
+mesa-25.0.7/src/panfrost/vulkan/panvk_cmd_fb_preload.h
+mesa-25.0.7/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+mesa-25.0.7/src/panfrost/vulkan/panvk_vX_cmd_fb_preload.c
