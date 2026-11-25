@@ -1,0 +1,201 @@
+From 1c7cc172799f9bb4e2881b19c9bbd8e67b75b111 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 00:52:25 -0500
+Subject: [PATCH] 0217-a8-console-fmv-cahz.patch
+
+---
+ bsd/dev/a5xelte_usb.c                 | 21 +++++++++-
+ bsd/dev/a8_files.c                    | 31 +++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 55 +++++++++++++++++++++++++++
+ 3 files changed, 106 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 5053ae7..ea56474 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1655,11 +1655,13 @@ a8s_shot(unsigned scale)
+ /* bsd/dev/a8_files.c */
+ extern void a8f_get(const char *args);
+ extern void a8f_put(const char *args);
++extern void a8f_mv(const char *args);     /* a8_files.c, 0217 */
+ extern void a8f_data(const char *b64);
+ extern void a8f_end(void);
+ extern void a8f_ls(const char *args);
+ extern void a8f_date(const char *args);
+ extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
++extern int sweet_fb_cahz_set(int hz);          /* SweetFramebuffer.cpp, 0217 */
+ extern int sweet_fb_vsync_lock_set(int on);     /* SweetFramebuffer.cpp, 0204 */
+ /* 0192 */
+ extern void a8_acpm_command(const char *args);  /* a8_acpm.c */
+@@ -1718,7 +1720,7 @@ a8s_command(const char *line)
+ 		    "key power|up|down|home [MS] | wake | "
+ 		    "peek ADDR [WORDS] | poke ADDR VALUE | "
+ 		    "reboot [recovery|download]\n");
+-		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | "
++		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | fmv FROM TO | "
+ 		    "fput PATH SIZE CRC32 [MODE UID GID], fd BASE64..., fend "
+ 		    "(only under /private/var/) | date [SECONDS] | flip [0|1]\n");
+ 		printf("A8SH: X Y are panel pixels (1080x2220, as in shot x SCALE); "
+@@ -1930,6 +1932,8 @@ a8s_command(const char *line)
+ 		a8f_end();
+ 	} else if (a8s_word(line, "fls", &rest)) {
+ 		a8f_ls(rest);
++	} else if (a8s_word(line, "fmv", &rest)) {
++		a8f_mv(rest);           /* 0217 */
+ 	} else if (a8s_word(line, "vlock", &rest)) {
+ 		/* 0204: the software vsync locked to the panel's frame starts */
+ 		while (*rest == ' ') {
+@@ -1949,6 +1953,21 @@ a8s_command(const char *line)
+ 		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : *rest == 'd' ? 6 : *rest == 'w' ? 7 :
+ 		    *rest == 'o' ? 8 : *rest == 'e' ? 9 : *rest == 'k' ? 10 : *rest == 'u' ? 11 : -1;
+ 		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
++	} else if (a8s_word(line, "cahz", &rest)) {
++		/* 0217: "cahz N" (30-240) publishes IOMFBDisplayRefresh, "cahz 0"
++		 * removes it, "cahz" reports; then "kill backboardd" */
++		int hz = -1;
++
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest >= '0' && *rest <= '9') {
++			hz = 0;
++			while (*rest >= '0' && *rest <= '9' && hz < 1000) {
++				hz = hz * 10 + (*rest++ - '0');
++			}
++		}
++		printf("A8SH: cahz %d\n", sweet_fb_cahz_set(hz));
+ 	} else if (a8s_word(line, "date", &rest)) {
+ 		while (*rest == ' ') {
+ 			rest++;
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index 6bf7030..b925222 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -44,6 +44,7 @@ void a8f_put(const char *args);
+ void a8f_data(const char *b64);
+ void a8f_end(void);
+ void a8f_ls(const char *args);
++void a8f_mv(const char *args);
+ void a8f_date(const char *args);
+ bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size);
+ bool a8_fix_library_ok(void);
+@@ -495,6 +496,36 @@ a8f_end(void)
+ 	a8f_put_reset();
+ }
+ 
++/*
++ * 0217: console "fmv FROM TO" renames a file or a directory, both paths under
++ * /private/var/ (the data volume; no . or ..), with kernel credentials.  It is
++ * the reversible way to take a file out of the way: move it aside, and back.
++ * First use: LaunchServices' database (InternalDaemon/<id>/Library/Caches/
++ * com.apple.LaunchServices-*.csstore, and its SystemDataOnly- twin) moved
++ * aside, so that lsd builds it anew now that it knows the extension points
++ * (0216).  The Galaxy S7 port removes it once for the same reason
++ * (wardevsa/ios-a5xelte gpu/eagl/test/hero-run.c, remove_ls_db_once).
++ */
++void
++a8f_mv(const char *args)
++{
++	char from[A8F_PATH], to[A8F_PATH];
++	int error;
++
++	if (!a8f_word(&args, from, sizeof(from)) || !a8f_word(&args, to, sizeof(to))) {
++		printf("A8F MV error: fmv FROM TO (both under /private/var/)\n");
++		return;
++	}
++	if (strncmp(from, "/private/var/", 13) != 0 || strncmp(to, "/private/var/", 13) != 0 ||
++	    a8f_has(from, "/../") || a8f_has(from, "/./") ||
++	    a8f_has(to, "/../") || a8f_has(to, "/./")) {
++		printf("A8F MV error: only under /private/var/ (no . or ..): %s -> %s\n", from, to);
++		return;
++	}
++	error = a8_kernel_rename(from, to);
++	printf("A8F MV %s -> %s: %s (%d)\n", from, to, error ? "failed" : "done", error);
++}
++
+ void
+ a8f_ls(const char *args)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 90dc722..b8d01ce 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -231,6 +231,7 @@ static uint32_t sweet_fb_no_present;
+  *  - the panel's pixels for the USB console's "shot" command (a5xelte_usb.c).
+  */
+ static AppleCLCD *sweet_fb_main;
++static uint32_t a8_cahz_boot;              /* 0217: sweetfb_cahz at boot */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
+ /* 0191 scan-out flip state (functions further down, before present()). */
+ static int           a8_flip = -1;              /* -1: boot-arg not read yet */
+@@ -376,6 +377,7 @@ AppleCLCD::start(IOService *provider)
+ 			}
+ 			setProperty("IOMFBDisplayRefresh", refresh);
+ 			refresh->release();
++			a8_cahz_boot = told;
+ 		}
+ 		IOLog("SWEET FB: timer coalescing %s; IOMFBDisplayRefresh %u Hz (0: not published)\n",
+ 		    mach_timer_coalescing_enabled ? "on" : "off", refresh != NULL ? told : 0);
+@@ -1145,6 +1147,59 @@ sweet_fb_flip_set(int on)
+ 	return a8_flip_on();
+ }
+ 
++/*
++ * 0217: console "cahz N" publishes IOMFBDisplayRefresh at N Hz (30-240) on the
++ * framebuffer, "cahz 0" takes it away, "cahz" reports.  CoreAnimation reads it
++ * when backboardd starts, so a change is seen after "kill backboardd".  The
++ * boot-arg sweetfb_cahz does the same at boot, but the line has no room
++ * (598 of 607): this tries 120 Hz (the S7/S9 ports' setting) without a slot.
++ */
++static uint32_t a8_cahz_told;
++
++extern "C" int
++sweet_fb_cahz_set(int hz)
++{
++	AppleCLCD *fb = sweet_fb_main;
++
++	if (fb == NULL) {
++		return -1;
++	}
++	if (a8_cahz_told == 0 && hz < 0) {
++		a8_cahz_told = a8_cahz_boot;
++	}
++	if (hz == 0) {
++		fb->removeProperty("IOMFBDisplayRefresh");
++		a8_cahz_told = 0;
++	} else if (hz >= 30 && hz <= 240) {
++		OSDictionary *refresh = OSDictionary::withCapacity(4);
++		if (refresh != NULL) {
++			uint64_t interval = (1ULL << 32) / (uint32_t)hz, ticks = 0;
++			static const char *const keys[] = {
++				"displayMinRefreshInterval", "displayMaxRefreshInterval", "displayRefreshStep"
++			};
++			nanoseconds_to_absolutetime(NSEC_PER_SEC / (uint32_t)hz, &ticks);
++			for (unsigned k = 0; k < 3; k++) {
++				OSNumber *n = OSNumber::withNumber(interval, 64);
++				if (n != NULL) {
++					refresh->setObject(keys[k], n);
++					n->release();
++				}
++			}
++			OSNumber *t = OSNumber::withNumber(ticks, 64);
++			if (t != NULL) {
++				refresh->setObject("displayRefreshStepMachTime", t);
++				t->release();
++			}
++			fb->setProperty("IOMFBDisplayRefresh", refresh);
++			refresh->release();
++			a8_cahz_told = (uint32_t)hz;
++		}
++	}
++	IOLog("A8 FB: IOMFBDisplayRefresh %s%u%s (seen by CoreAnimation after kill backboardd)\n",
++	    a8_cahz_told ? "" : "not published (", a8_cahz_told, a8_cahz_told ? " Hz" : ")");
++	return (int)a8_cahz_told;
++}
++
+ /*
+  * 0203 sysctls for jackpotlte-gl (backboardd):
+  *   kern.a8_flip_async  1: SwapEnd returns once the panel has its new buffer
+-- 
+2.43.0
+
