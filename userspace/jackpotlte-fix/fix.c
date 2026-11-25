@@ -88,7 +88,8 @@
  * View dump (v6): SIGUSR1 (console "kill NAME 30") makes the process write
  * every visible window's views to stderr, one line each: depth, class, frame
  * in window points, and a label's text ("A8VIEW ..."), seen with tee. It is
- * how an off-center layout (keyboard, Control Center) is found.
+ * how an off-center layout (keyboard, Control Center) is found.  v15 adds a
+ * backdrop layer's class, group name and capture scale.
  *
  * Wallpaper extensions (v11): kernel 0216 lets lsd read the extension point
  * table, but LaunchServices' database was made while every extension was
@@ -1781,6 +1782,25 @@ dump_view(id view, int depth)
 	vl_num(&l, r.h);
 	if (!is(view, sel_registerName("isUserInteractionEnabled")))
 		vl_str(&l, " noui");
+	/* v15: a backdrop layer's class, group and capture scale */
+	{
+		id layer = get(view, sel_registerName("layer"));
+		SEL rts = sel_registerName("respondsToSelector:");
+
+		if (layer != 0 && responds(layer, rts, sel_registerName("groupName"))) {
+			id g = get(layer, sel_registerName("groupName"));
+
+			vl_str(&l, " layer ");
+			vl_str(&l, class_getName(object_getClass(layer)));
+			vl_str(&l, " group ");
+			vl_str(&l, g ? ((const char *(*)(id, SEL))objc_msgSend)(g, sel_registerName("UTF8String")) : "-");
+			if (responds(layer, rts, sel_registerName("scale"))) {
+				vl_str(&l, " scale ");
+				vl_num(&l, dbl(layer, sel_registerName("scale")) * 100.0);
+				vl_str(&l, "%");
+			}
+		}
+	}
 	if (responds(view, sel_registerName("respondsToSelector:"), sel_registerName("isEnabled")) &&
 	    !is(view, sel_registerName("isEnabled")))
 		vl_str(&l, " disabled");
