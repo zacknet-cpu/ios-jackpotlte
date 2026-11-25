@@ -1,0 +1,545 @@
+diff --git a/bsd/dev/a5xelte_bt.c b/bsd/dev/a5xelte_bt.c
+index a595da6..78130c4 100644
+--- a/bsd/dev/a5xelte_bt.c
++++ b/bsd/dev/a5xelte_bt.c
+@@ -68,6 +68,10 @@ struct a5bt_softc {
+ 	int               bit_tohost;    /* bg_to_ap_int_src                */
+ 	int               bit_from_bg;   /* ap_to_bg_int_src                */
+ 	int               bit_from_fg;   /* ap_to_fg_int_src                */
++	int               bit_fg_tohost;   /* fg_to_ap_int_src (0210)       */
++	int               bit_from_fg_m4;  /* ap_to_fg_m4_int_src (0210)    */
++	int               bit_info_from;   /* info_ap_to_bg_int_src (0210)  */
++	int               bit_info_tohost; /* info_bg_to_ap_int_src (0210)  */
+ 
+ 	/* Written by the poll thread, read by the bring-up thread. */
+ 	volatile bool     start_cfm;
+@@ -339,44 +343,90 @@ a5bt_sleep_ms(uint32_t ms)
+ 	(void)thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* 0210: the SoC's 48-bit unique id (exynos-chipid.c: on the 7885 at CHIPID
++ * 0x10000000 + 0x04, low word first), the vendor's device address source. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++#define A5BT_CHIPID_PA          0x10000000ul
++#define A5BT_CHIPID_UNIQUE_ID   0x04u
++
++static uint64_t
++a5bt_soc_unique_id(void)
++{
++	vm_offset_t c = ml_io_map(A5BT_CHIPID_PA, 0x1000);
++	uint64_t id;
++
++	if (c == 0) {
++		return 0;
++	}
++	id = *(volatile uint32_t *)(c + A5BT_CHIPID_UNIQUE_ID);
++	id |= (uint64_t)*(volatile uint32_t *)(c + A5BT_CHIPID_UNIQUE_ID + 4) << 32;
++	return id & 0xffffffffffffull;
++}
++
+ /* Fills BHCS (bhcs.h:39-50, setup_bhcs() in scsc_bt_module.c:556-575).  The
+- * configuration blob and the device address are intentionally zero: the
+- * vendor leaves them zero when the config file is absent, and the address
+- * comes from a source this port does not have. */
++ * configuration blob stays empty: the vendor looks for
++ * mx140/conf/bluetooth/bt.hcf, which the A8's ROM does not have.  0210: the
++ * device address is the vendor's default, made from the SoC unique id
++ * (CONFIG_ARCH_EXYNOS branch of setup_bhcs(); /efs/bluetooth/bt_addr, which
++ * would override it, is not read). */
+ static void
+ a5bt_fill_bhcs(uint8_t *bhcs)
+ {
++	uint64_t id = a5bt_soc_unique_id();
++
+ 	bzero(bhcs, A5BT_BHCS_SIZE);
+ 	a5bt_wr32(bhcs, A5BT_BHCS_VERSION, A5BT_BHCS_VERSION_EXPECT);
+ 	a5bt_wr32(bhcs, A5BT_BHCS_PROTO_OFF, a5bt.proto_ref);
+ 	a5bt_wr32(bhcs, A5BT_BHCS_PROTO_LEN, A5BT_BSMHCP_SIZE);
+-	/* configuration_offset/length, bluetooth_address_* stay 0. */
++	if (id != 0) {
++		a5bt_wr32(bhcs, A5BT_BHCS_LAP, (uint32_t)((id & 0xffffff000000ull) >> 24));
++		bhcs[A5BT_BHCS_UAP] = (uint8_t)(id & 0xffu);
++		a5bt_wr16(bhcs, A5BT_BHCS_NAP, (uint16_t)((id & 0x000000ffff00ull) >> 8));
++	}
++	printf("A5XELTE BT: device address %s\n",
++	    id != 0 ? "from the SoC unique id" : "left 0 (no SoC unique id)");
+ 	a5bt_mb();
+ }
+ 
+-/* Allocates and publishes the three interrupt bits in the vendor's order
+- * (scsc_shm.c:95-131).  Called before the service is started, because the
+- * firmware reads them out of the BSMHCP header at start. */
++/* Allocates and publishes the interrupt bits in the vendor's order.  Called
++ * before the service is started, because the firmware reads them out of the
++ * BSMHCP header at start.  0210: the A8's own kernel uses seven bits, not
++ * three: scsc_bt_shm_init_interrupt() (scsc_shm.c) takes bg_to_ap and
++ * fg_to_ap to-host, ap_to_bg and ap_to_fg from-host on the R4 and
++ * ap_to_fg_m4 on the M4; slsi_sm_bt_service_start() (scsc_bt_module.c)
++ * then takes info_ap_to_bg from-host and info_bg_to_ap to-host.  A bit left
++ * 0 names interrupt 0, which on the from-host side is the firmware's
++ * reserved panic bit (mifintrbit.c). */
+ static int
+ a5bt_bits(void)
+ {
+ 	a5bt.bit_tohost = a5scsc_intrbit_alloc_tohost(a5bt_evt, NULL);
+-	if (a5bt.bit_tohost < 0) {
+-		return ENOSPC;
+-	}
++	a5bt.bit_fg_tohost = a5scsc_intrbit_alloc_tohost(a5bt_evt, NULL);
+ 	a5bt.bit_from_bg = a5scsc_intrbit_alloc_fromhost(
+ 	    A5SCSC_MIF_TARGET_R4, false);
+-	if (a5bt.bit_from_bg < 0) {
+-		return ENOSPC;
+-	}
+ 	a5bt.bit_from_fg = a5scsc_intrbit_alloc_fromhost(
+ 	    A5SCSC_MIF_TARGET_R4, false);
+-	if (a5bt.bit_from_fg < 0) {
++	a5bt.bit_from_fg_m4 = a5scsc_intrbit_alloc_fromhost(
++	    A5SCSC_MIF_TARGET_M4, false);
++	a5bt.bit_info_from = a5scsc_intrbit_alloc_fromhost(
++	    A5SCSC_MIF_TARGET_R4, false);
++	a5bt.bit_info_tohost = a5scsc_intrbit_alloc_tohost(a5bt_evt, NULL);
++	if (a5bt.bit_tohost < 0 || a5bt.bit_fg_tohost < 0 ||
++	    a5bt.bit_from_bg < 0 || a5bt.bit_from_fg < 0 ||
++	    a5bt.bit_from_fg_m4 < 0 || a5bt.bit_info_from < 0 ||
++	    a5bt.bit_info_tohost < 0) {
+ 		return ENOSPC;
+ 	}
+ 	a5bt_wr16(a5bt.proto, A5BT_H_BG_TO_AP, (uint16_t)a5bt.bit_tohost);
++	a5bt_wr16(a5bt.proto, A5BT_H_FG_TO_AP, (uint16_t)a5bt.bit_fg_tohost);
+ 	a5bt_wr16(a5bt.proto, A5BT_H_AP_TO_BG, (uint16_t)a5bt.bit_from_bg);
+ 	a5bt_wr16(a5bt.proto, A5BT_H_AP_TO_FG, (uint16_t)a5bt.bit_from_fg);
++	a5bt_wr16(a5bt.proto, A5BT_H_AP_TO_FG_M4, (uint16_t)a5bt.bit_from_fg_m4);
++	a5bt_wr16(a5bt.proto, A5BT_H_INFO_AP_TO_BG, (uint16_t)a5bt.bit_info_from);
++	a5bt_wr16(a5bt.proto, A5BT_H_INFO_BG_TO_AP, (uint16_t)a5bt.bit_info_tohost);
++	/* mxlog_filter and firmware_control stay 0 (the module defaults);
++	 * abox_offset stays 0, abox_length is the structure size. */
++	a5bt_wr32(a5bt.proto, A5BT_H_ABOX_LENGTH, A5BT_ABOX_LENGTH);
+ 	a5bt_mb();
+ 	return 0;
+ }
+@@ -433,6 +483,22 @@ a5bt_hci_reset(uint32_t *waited_ms)
+ 	return a5bt.reset_cc;
+ }
+ 
++/* 0210: the BSMHCP fields the firmware writes (bsmhcp.h: "AP RO"). */
++static void
++a5bt_report(const char *when)
++{
++	printf("A5XELTE BT: %s: deathbed 0x%04x diatribe 0x%04x, controller flags 0x%08x, "
++	    "firmware features 0x%08x, service state %u, cmd r %u w %u, evt r %u w %u, "
++	    "events %u, unknown service messages %u\n", when,
++	    a5bt_rd16(a5bt.proto, A5BT_H_PANIC), a5bt_rd16(a5bt.proto, A5BT_H_DIATRIBE),
++	    a5bt_rd32(a5bt.proto, A5BT_H_CONTROLLER_FLAGS),
++	    a5bt_rd32(a5bt.proto, A5BT_H_FW_FEATURES),
++	    (unsigned)*(a5bt.proto + A5BT_H_SERVICE_STATE),
++	    a5bt_rd32(a5bt.proto, A5BT_H_CMD_READ), a5bt_rd32(a5bt.proto, A5BT_H_CMD_WRITE),
++	    a5bt_rd32(a5bt.proto, A5BT_H_EVT_READ), a5bt_rd32(a5bt.proto, A5BT_H_EVT_WRITE),
++	    a5bt.events, a5bt.unknown_sm);
++}
++
+ static void
+ a5bt_bringup_thread(void *param __unused, wait_result_t wr __unused)
+ {
+@@ -475,22 +541,31 @@ a5bt_bringup_thread(void *param __unused, wait_result_t wr __unused)
+ 		return;
+ 	}
+ 	a5bt_fill_bhcs(bhcs);
+-	printf("A5XELTE BT: config: bhcs 0x%x protocol 0x%x (%u bytes), bits tohost %d fromhost %d/%d\n",
++	printf("A5XELTE BT: config: bhcs 0x%x protocol 0x%x (%u bytes), bits to host bg %d fg %d "
++	    "info %d, from host R4 bg %d fg %d info %d, M4 fg %d\n",
+ 	    a5bt.bhcs_ref, a5bt.proto_ref, A5BT_BSMHCP_SIZE,
+-	    a5bt.bit_tohost, a5bt.bit_from_bg, a5bt.bit_from_fg);
++	    a5bt.bit_tohost, a5bt.bit_fg_tohost, a5bt.bit_info_tohost,
++	    a5bt.bit_from_bg, a5bt.bit_from_fg, a5bt.bit_info_from,
++	    a5bt.bit_from_fg_m4);
+ 
++	a5scsc_mxlog_more(400);         /* 0210: what the firmware says next */
+ 	if (!a5bt_service_start(&waited)) {
+ 		printf("A5XELTE BT: service: no SM_MSG_START_CFM in %u ms; BT port disabled\n",
+ 		    (unsigned)A5SCSC_SM_TIMEOUT_MS);
++		a5bt_report("no start");
++		a5scsc_diag("bt start");
+ 		return;
+ 	}
+ 	printf("A5XELTE BT: service: SM_MSG_START_CFM after %u ms\n",
+ 	    waited);
++	a5bt_report("started");
+ 
+ 	if (!a5bt_hci_reset(&waited)) {
+ 		printf("A5XELTE BT: hci: no Command Complete for HCI Reset in %u ms (events %u, last cc opcode 0x%04x)\n",
+ 		    (unsigned)A5SCSC_SM_TIMEOUT_MS, a5bt.events,
+ 		    a5bt.last_cc_opcode);
++		a5bt_report("no reset");
++		a5scsc_diag("bt reset");
+ 		return;
+ 	}
+ 	printf("A5XELTE BT: hci: reset complete after %u ms (events %u)\n",
+diff --git a/bsd/dev/a5xelte_bt.h b/bsd/dev/a5xelte_bt.h
+index dc09331..d79dd07 100644
+--- a/bsd/dev/a5xelte_bt.h
++++ b/bsd/dev/a5xelte_bt.h
+@@ -41,6 +41,7 @@
+ /* struct BSMHCP_HEADER (bsmhcp.h:200-272): the fields this port reads/writes.
+  * Everything else (counters, btlog enables, timing/IQ fields) stays zero. */
+ #define A5BT_H_MAGIC            0x00u   /* u32  magic_value                */
++#define A5BT_H_AP_TO_FG_M4      0x04u   /* u16  ap_to_fg_m4_int_src (0210) */
+ #define A5BT_H_SERVICE_REQUEST  0x06u   /* u8   service_request  (left 0)  */
+ #define A5BT_H_ACL_BUF_SIZE     0x08u   /* u32  acl_buffer_size   (left 0) */
+ #define A5BT_H_CMD_EVT_BUF_SIZE 0x0cu   /* u32  cmd_evt_buffer_size(0)     */
+@@ -48,6 +49,7 @@
+ #define A5BT_H_AP_TO_BG         0x14u   /* u16  ap_to_bg_int_src           */
+ #define A5BT_H_AP_TO_FG         0x16u   /* u16  ap_to_fg_int_src           */
+ #define A5BT_H_BG_TO_AP         0x18u   /* u16  bg_to_ap_int_src           */
++#define A5BT_H_FG_TO_AP         0x1au   /* u16  fg_to_ap_int_src    (0210) */
+ #define A5BT_H_MAILBOX_OFFSET   0x1cu   /* u32  mailbox_offset    (left 0) */
+ #define A5BT_H_CMD_WRITE        0x24u   /* u32  mailbox_hci_cmd_write      */
+ #define A5BT_H_EVT_READ         0x28u   /* u32  mailbox_hci_evt_read       */
+@@ -57,6 +59,7 @@
+ #define A5BT_H_ABOX_OFFSET      0x38u   /* u32  abox_offset                */
+ #define A5BT_H_ABOX_LENGTH      0x3cu   /* u32  abox_length                */
+ #define A5BT_H_PANIC            0x40u   /* u16  panic_deathbed_confession  */
++#define A5BT_H_DIATRIBE         0x42u   /* u16  panic_diatribe_value (0210) */
+ #define A5BT_H_CMD_READ         0x44u   /* u32  mailbox_hci_cmd_read       */
+ #define A5BT_H_EVT_WRITE        0x48u   /* u32  mailbox_hci_evt_write      */
+ #define A5BT_H_CONTROLLER_FLAGS 0x4cu   /* u32  controller_flags           */
+@@ -64,6 +67,14 @@
+ #define A5BT_H_SERVICE_STATE    0x56u   /* u8   service_state              */
+ #define A5BT_H_ACL_TX_READ      0x60u   /* u32  mailbox_acl_tx_read        */
+ #define A5BT_H_ACL_FREE_WRITE   0x64u   /* u32  mailbox_acl_free_write     */
++#define A5BT_H_INFO_AP_TO_BG    0xbcu   /* u16  info_ap_to_bg_int_src (0210) */
++#define A5BT_H_INFO_BG_TO_AP    0xbeu   /* u16  info_bg_to_ap_int_src (0210) */
++#define A5BT_H_MXLOG_FILTER     0xc0u   /* u32  mxlog_filter   (left 0)    */
++#define A5BT_H_FW_CONTROL       0xc4u   /* u32  firmware_control (left 0)  */
++/* 0210: sizeof(struct scsc_bt_audio_abox) (bt_audio.h: 256 bytes of header
++ * and two 8 KiB streaming areas); the vendor writes it into abox_length
++ * even when there is no A-Box driver and abox_offset stays 0. */
++#define A5BT_ABOX_LENGTH        0x4100u
+ 
+ /* Transfer rings (bsmhcp.h:278-321).  An entry is a length word followed by an
+  * inline data buffer; the data starts with the H4 packet type. */
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index 6e0bca9..40247f5 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -150,6 +150,11 @@ struct a5scsc_softc {
+ 	bool        transports_ready;
+ 	bool        poll_running;
+ 	uint32_t    mxlog_dropped;      /* packets drained and thrown away */
++	uint32_t    fw_file_len;        /* 0210: bytes of the image file   */
++	uint32_t    mxlog_records;      /* 0210: firmware log records read */
++	uint32_t    mxlog_bad;          /* 0210: words without a sync      */
++	uint32_t    mxlog_budget;       /* 0210: records still to print    */
++	uint32_t    mxlog_quiet;        /* 0210: records read, not printed */
+ };
+ 
+ static struct a5scsc_softc a5scsc;
+@@ -522,6 +527,7 @@ a5scsc_load_firmware(void)
+ 	/* The MIF heap starts after the firmware (mxman.c:971-975). */
+ 	a5scsc.mif_alloc_off = a5scsc.fw_runtime_len;
+ 	a5scsc.mif_free = A5SCSC_MIF_DRAM_SIZE - a5scsc.fw_runtime_len;
++	a5scsc.fw_file_len = (uint32_t)size;
+ 	a5scsc.fw_loaded = true;
+ 	printf("A5XELTE SCSC: stage 1/6 firmware: %u bytes, entry 0x%x runtime 0x%x hdr 0x%x\n",
+ 	    (unsigned)size, a5scsc.fw_entry, a5scsc.fw_runtime_len, hdr_length);
+@@ -881,29 +887,206 @@ a5scsc_mxconf_build(void)
+ 	return 0;
+ }
+ 
+-/* ---- mxlog drain ----------------------------------------------------------
+- * mxlog is a one-way stream of 4-byte records the firmware writes for its own
+- * logging.  Nothing consumes it in this port, but leaving it full would make
+- * the firmware's writes fail, so the poll thread empties it and counts what it
+- * threw away.  STUBBED: no decoding of the records.
++/* ---- the firmware's own log (0210) ----------------------------------------
++ * mxlog_transport.c and mxlog.c of the A8's kernel: every record is a u32
++ * header {sync u16, level u8, length u8} and its payload, in the stream's
++ * 4-byte packets.  Sync 0xA55A (phase 4): `length` bytes of text.  Sync
++ * 0x9669 (phase 5): `length` words {timestamp, offset of the format string
++ * in the firmware's debug/common/log-strings.bin, arguments}; those are
++ * printed raw and tools/jackpotlte/mxlog5.py turns them into text with that
++ * file.  Levels: 0 error, 1 warning, 2 major, 3 minor, 4 detail.  Records
++ * are printed while the budget lasts (a5scsc_mxlog_more()); errors and
++ * warnings are printed anyway; the rest is counted.
+  */
++#define A5SCSC_MXLOG_SYNC4              0xa55au /* mxlog.h SYNC_VALUE_PHASE_4 */
++#define A5SCSC_MXLOG_SYNC5              0x9669u /* mxlog.h SYNC_VALUE_PHASE_5 */
++#define A5SCSC_MXLOG_PRINT_BOOT         200u
++#define A5SCSC_R4_PANIC_HDR_OFF         176u    /* fwhdr.c:29 */
++#define A5SCSC_R4_PANIC_MAX_WORDS       64u     /* version 2 records: 53 words */
++
++static uint32_t
++a5scsc_ring_used(const struct a5scsc_stream *s)
++{
++	uint32_t r = *s->read % s->num_packets;
++	uint32_t w = *s->write % s->num_packets;
++
++	return (w + s->num_packets - r) % s->num_packets;
++}
++
++/* The k-th packet after the read index, as a little-endian word. */
++static uint32_t
++a5scsc_ring_word(const struct a5scsc_stream *s, uint32_t k)
++{
++	uint32_t idx = (*s->read + k) % s->num_packets;
++
++	return *(volatile uint32_t *)(a5scsc.mif + s->buf_off +
++	           idx * s->packet_size);
++}
++
++/* Retires n packets and tells the firmware (mifstream.c:120-130). */
++static void
++a5scsc_ring_drop(struct a5scsc_stream *s, uint32_t n)
++{
++	*s->read = (*s->read + n) % s->num_packets;
++	a5scsc_mb();
++	a5scsc_irq_bit_set(s->read_bit, s->target);
++}
++
++static void
++a5scsc_mxlog_print(const struct a5scsc_stream *s, uint32_t hdr, uint32_t words)
++{
++	uint32_t level = (hdr >> 8) & 0xffu, len = hdr & 0xffu, i;
++	char line[260];
++	int n;
++
++	if (a5scsc.mxlog_budget == 0 && level > 1) {
++		a5scsc.mxlog_quiet++;
++		return;
++	}
++	if (a5scsc.mxlog_budget != 0) {
++		a5scsc.mxlog_budget--;
++	}
++	if ((hdr >> 16) == A5SCSC_MXLOG_SYNC4) {
++		for (i = 0; i < len && i < sizeof(line) - 1; i++) {
++			char c = (char)((a5scsc_ring_word(s, 1 + i / 4) >>
++			    (8 * (i % 4))) & 0xffu);
++
++			if (c == 0) {
++				break;
++			}
++			line[i] = (c >= 0x20 && c < 0x7f) ? c : ' ';
++		}
++		while (i > 0 && line[i - 1] == ' ') {
++			i--;
++		}
++		line[i] = 0;
++		printf("A5XELTE MXLOG4 L%u: %s\n", level, line);
++		return;
++	}
++	n = snprintf(line, sizeof(line), "A5XELTE MXLOG5 L%u", level);
++	for (i = 0; i < words && i < 12 && n > 0 && n < (int)sizeof(line) - 12; i++) {
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %x",
++		    a5scsc_ring_word(s, 1 + i));
++	}
++	printf("%s\n", line);
++}
++
++/* The firmware's writes fail once the ring is full, so this always empties
++ * it.  A record whose payload is not all written yet waits for the next
++ * pass; a word without a sync is dropped alone (resync). */
+ static void
+ a5scsc_mxlog_drain(int bit __unused, void *arg __unused)
+ {
+ 	struct a5scsc_stream *s = &a5scsc.mxlog_in;
+-	const void *packet;
+-	uint32_t drained = 0;
++	uint32_t done = 0;
+ 
+-	if (!s->ready) {
++	if (!s->ready || s->packet_size != 4) {
+ 		return;
+ 	}
+-	packet = a5scsc_stream_peek(s, NULL);
+-	while (packet != NULL && drained < 512) {
+-		drained++;
+-		a5scsc_stream_peek_done(s, packet);
+-		packet = a5scsc_stream_peek(s, packet);
++	while (done < 512) {
++		uint32_t used = a5scsc_ring_used(s), hdr, words;
++
++		if (used == 0) {
++			break;
++		}
++		a5scsc_mb();
++		hdr = a5scsc_ring_word(s, 0);
++		if ((hdr >> 16) == A5SCSC_MXLOG_SYNC4) {
++			words = ((hdr & 0xffu) + 3) / 4;
++		} else if ((hdr >> 16) == A5SCSC_MXLOG_SYNC5) {
++			words = hdr & 0xffu;
++		} else {
++			a5scsc.mxlog_bad++;
++			a5scsc_ring_drop(s, 1);
++			done++;
++			continue;
++		}
++		if (used < 1 + words) {
++			break;
++		}
++		a5scsc_mxlog_print(s, hdr, words);
++		a5scsc_ring_drop(s, 1 + words);
++		a5scsc.mxlog_records++;
++		a5scsc.mxlog_dropped += 1 + words;
++		done++;
++	}
++}
++
++void
++a5scsc_mxlog_more(uint32_t records)
++{
++	a5scsc.mxlog_budget += records;
++}
++
++/* ---- the R4 panic record (0210) -------------------------------------------
++ * fw_panic_record.c of the A8's kernel: version 2 is {version, length in
++ * bytes, ..., checksum}, the checksum being the xor of 0xa5a5a5a5 and every
++ * word before it; word 3 is the panic code (mxman.c:1099) and word 51 the
++ * sympathetic-panic flag.  The record sits in the firmware's runtime area
++ * past the image file, which keeps its contents across a warm reboot, so
++ * the bring-up reports and clears it before the release. */
++static uint32_t
++a5scsc_panic_off(void)
++{
++	uint32_t off;
++
++	if (!a5scsc.mif_mapped || !a5scsc.fw_loaded) {
++		return 0;
++	}
++	off = a5scsc_mif_rd32(A5SCSC_R4_PANIC_HDR_OFF);
++	if (off == 0 || (off & 3) != 0 ||
++	    off > A5SCSC_MIF_DRAM_SIZE - 4 * A5SCSC_R4_PANIC_MAX_WORDS) {
++		return 0;
++	}
++	return off;
++}
++
++static void
++a5scsc_panic_record(const char *when)
++{
++	uint32_t off = a5scsc_panic_off(), ver, len, i, x = 0xa5a5a5a5u;
++
++	if (off == 0) {
++		printf("A5XELTE SCSC: %s: no R4 panic record location\n", when);
++		return;
++	}
++	ver = a5scsc_mif_rd32(off);
++	len = a5scsc_mif_rd32(off + 4) / 4;
++	if (ver != 2 || len < 5 || len > A5SCSC_R4_PANIC_MAX_WORDS) {
++		printf("A5XELTE SCSC: %s: R4 panic record at 0x%x empty (0x%08x 0x%08x)\n",
++		    when, off, ver, a5scsc_mif_rd32(off + 4));
++		return;
++	}
++	for (i = 0; i < len - 1; i++) {
++		x ^= a5scsc_mif_rd32(off + 4 * i);
++	}
++	printf("A5XELTE SCSC: %s: R4 panic record at 0x%x: %u words, checksum %s, "
++	    "code 0x%x, sympathetic %u\n", when, off, len,
++	    x == a5scsc_mif_rd32(off + 4 * (len - 1)) ? "ok" : "bad",
++	    a5scsc_mif_rd32(off + 12), len > 52 ? a5scsc_mif_rd32(off + 4 * 51) : 0);
++	for (i = 0; i < len; i += 8) {
++		printf("A5XELTE SCSC: R4 panic [%2u] %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		    i, a5scsc_mif_rd32(off + 4 * i), a5scsc_mif_rd32(off + 4 * (i + 1)),
++		    a5scsc_mif_rd32(off + 4 * (i + 2)), a5scsc_mif_rd32(off + 4 * (i + 3)),
++		    a5scsc_mif_rd32(off + 4 * (i + 4)), a5scsc_mif_rd32(off + 4 * (i + 5)),
++		    a5scsc_mif_rd32(off + 4 * (i + 6)), a5scsc_mif_rd32(off + 4 * (i + 7)));
++	}
++}
++
++/* Only past the image file: inside it the words would be the firmware's
++ * initialised data. */
++static void
++a5scsc_panic_clear(void)
++{
++	uint32_t off = a5scsc_panic_off(), i;
++
++	if (off == 0 || off < a5scsc.fw_file_len) {
++		return;
++	}
++	for (i = 0; i < A5SCSC_R4_PANIC_MAX_WORDS; i++) {
++		a5scsc_mif_wr32(off + 4 * i, 0);
+ 	}
+-	a5scsc.mxlog_dropped += drained;
++	a5scsc_mb();
+ }
+ 
+ /* ---- mailbox startup (mxman.c:764-792) ------------------------------------ */
+@@ -1003,16 +1186,25 @@ a5scsc_fail_dump(const char *when)
+ 		    a5scsc_rd(m, A5SCSC_ISSR(0)), a5scsc_rd(m, A5SCSC_ISSR(1)),
+ 		    a5scsc_rd(m, A5SCSC_ISSR(2)), a5scsc_rd(m, A5SCSC_ISSR(3)));
+ 	}
+-	if (a5scsc.mif_mapped && a5scsc.fw_loaded) {
+-		uint32_t r4p = a5scsc_mif_rd32(176), m4p = a5scsc_mif_rd32(180);
+-		bool r4ok = r4p <= A5SCSC_MIF_DRAM_SIZE - 16, m4ok = m4p <= A5SCSC_MIF_DRAM_SIZE - 8;
++	/* 0210: the whole R4 record and its checksum (the M4 offset, header
++	 * byte 180, is 0 in the A8's firmware). */
++	a5scsc_panic_record(when);
++}
+ 
+-		printf("A5XELTE SCSC: %s: panic records R4 at 0x%x: 0x%08x 0x%08x 0x%08x 0x%08x, "
+-		    "M4 at 0x%x: 0x%08x 0x%08x\n", when, r4p,
+-		    r4ok ? a5scsc_mif_rd32(r4p) : 0, r4ok ? a5scsc_mif_rd32(r4p + 4) : 0,
+-		    r4ok ? a5scsc_mif_rd32(r4p + 8) : 0, r4ok ? a5scsc_mif_rd32(r4p + 12) : 0, m4p,
+-		    m4ok ? a5scsc_mif_rd32(m4p) : 0, m4ok ? a5scsc_mif_rd32(m4p + 4) : 0);
+-	}
++/* 0210: stream indices and the firmware log counters, then fail_dump(). */
++void
++a5scsc_diag(const char *when)
++{
++	if (a5scsc.transports_ready) {
++		printf("A5XELTE SCSC: %s: mxmgmt in r %u w %u, out r %u w %u (the firmware "
++		    "moves out r when it reads), unknown messages %u; firmware log %u "
++		    "records, %u not printed, %u words without sync, ring r %u w %u\n", when,
++		    *a5scsc.mxmgmt_in.read, *a5scsc.mxmgmt_in.write,
++		    *a5scsc.mxmgmt_out.read, *a5scsc.mxmgmt_out.write, a5scsc.mm_unknown,
++		    a5scsc.mxlog_records, a5scsc.mxlog_quiet, a5scsc.mxlog_bad,
++		    *a5scsc.mxlog_in.read, *a5scsc.mxlog_in.write);
++	}
++	a5scsc_fail_dump(when);
+ }
+ 
+ /*
+@@ -1274,6 +1466,11 @@ a5scsc_transport_up(void)
+ 	 * reset, so the first message cannot be missed (mxman.c:1024-1026). */
+ 	a5scsc_mxmgmt_register(A5SCSC_MMTRANS_CHAN_MAXWELL, a5scsc_mm_handler,
+ 	    NULL);
++	/* 0210: what an earlier run left in the panic record, then clear it,
++	 * so a record after this release is this run's. */
++	a5scsc_panic_record("before release");
++	a5scsc_panic_clear();
++	a5scsc.mxlog_budget = A5SCSC_MXLOG_PRINT_BOOT;
+ 	a5scsc_poll_start();
+ 
+ 	err = a5scsc_pmu_reset_release();
+@@ -1307,6 +1504,7 @@ a5scsc_transport_up(void)
+ 	    a5scsc.rf_hw_ver, waited);
+ 	printf("A5XELTE SCSC: stage 6/6 up: WLBT running, RF 0x%04x\n",
+ 	    a5scsc.rf_hw_ver);
++	a5scsc_panic_record("running");
+ 	return 1;
+ }
+ 
+@@ -1458,7 +1656,7 @@ a5xelte_scsc_command(const char *args)
+ 		return;
+ 	}
+ 	if (!start && !hold) {
+-		a5scsc_fail_dump("now");
++		a5scsc_diag("now");
+ 		printf("A5XELTE SCSC: transport %d, firmware %s, MM_START_IND %s, poll %s, irq 0x%04x\n",
+ 		    a5scsc_transport_state, a5scsc.fw_loaded ? "loaded" : "not loaded",
+ 		    a5scsc.mm_start_seen ? "seen" : "not seen", a5scsc.poll_running ? "running" : "stopped",
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index 31c1696..564e131 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -328,6 +328,11 @@ typedef void (*a5scsc_intr_fn)(int bit, void *arg);
+ int  a5scsc_intrbit_alloc_tohost(a5scsc_intr_fn fn, void *arg);
+ int  a5scsc_intrbit_alloc_fromhost(uint8_t target, bool reserved);
+ void a5scsc_irq_bit_set(int bit, uint8_t target);
++/* 0210: what a service sees when its start goes unanswered (stream indices,
++ * the firmware's log counters, PMU, mailboxes and the R4 panic record), and
++ * more firmware log records to print (a service start asks for some). */
++void a5scsc_diag(const char *when);
++void a5scsc_mxlog_more(uint32_t records);
+ 
+ /* mxmgmt channel handlers: the callback gets the 7-byte payload of an 8-byte
+  * packet, without the channel byte (mxmgmt_transport_format.h:15-23).  The
