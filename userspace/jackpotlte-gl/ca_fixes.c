@@ -1196,12 +1196,13 @@ bounds_program_plain(GLuint program)
             plain = first != NULL && strstr(first + 1, "gl_Position") == NULL &&
                     strncmp(first, "gl_Position=vertex_matrix*vertex_position;", 42) == 0;
          }
-         if (!plain && strstr(squeezed, "vertex_matrix") != NULL && bounds_odd_said < 6) {
-            const char *at = strstr(text, "gl_Position");
+         if (!plain && strstr(squeezed, "vertex_matrix") != NULL && bounds_odd_said < 3) {
+            size_t len = strlen(squeezed);
 
             bounds_odd_said++;
-            say("glca21b: program %u places its vertices its own way: %.200s", program,
-                at != NULL ? at : text);
+            say("glca21b: program %u places its vertices its own way (%zu chars):", program, len);
+            for (size_t at = 0; at < len && at < 3600; at += 160)
+               say("glca21b: %u+%zu %.160s", program, at, squeezed + at);
          }
          free(text);
          free(squeezed);
