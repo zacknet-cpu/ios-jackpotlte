@@ -122,7 +122,7 @@ diff -ru a/src/gallium/drivers/panfrost/pan_context.c b/src/gallium/drivers/panf
 diff -ru a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost/pan_job.c
 --- a/src/gallium/drivers/panfrost/pan_job.c
 +++ b/src/gallium/drivers/panfrost/pan_job.c
-@@ -252,6 +252,25 @@
+@@ -252,6 +252,27 @@
  static bool panfrost_batch_uses_resource(struct panfrost_batch *batch,
                                           struct panfrost_resource *rsrc);
  
@@ -136,19 +136,21 @@ diff -ru a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost
 +{
 +   if (likely(!(pan_device(ctx->base.screen)->debug & PAN_DBG_PERF)))
 +      return;
-+   mesa_logw("A8PASS %s of %ux%u %s (%s%s) submits %s: %ux%u, %u draws%s",
++   mesa_logw("A8PASS %s of %ux%u %s (%s%s) submits %s: %ux%u, %u draws%s, area %u,%u-%u,%u",
 +             access, (unsigned)rsrc->base.width0, (unsigned)rsrc->base.height0,
 +             util_format_short_name(rsrc->base.format),
 +             (rsrc->bo->flags & PAN_BO_SHARED) ? "shared" : "own",
 +             drm_is_afbc(rsrc->image.layout.modifier) ? ", afbc" : "", who,
 +             (unsigned)victim->key.width, (unsigned)victim->key.height,
-+             (unsigned)victim->draw_count, victim->clear ? ", cleared" : "");
++             (unsigned)victim->draw_count, victim->clear ? ", cleared" : "",
++             (unsigned)victim->minx, (unsigned)victim->miny,
++             (unsigned)victim->maxx, (unsigned)victim->maxy);
 +}
 +
  static void
  panfrost_batch_update_access(struct panfrost_batch *batch,
                               struct panfrost_resource *rsrc, bool writes)
-@@ -273,8 +292,10 @@
+@@ -273,8 +294,10 @@
     struct panfrost_batch *writer = entry ? entry->data : NULL;
  
     /* Both reads and writes flush the existing writer */
@@ -160,7 +162,7 @@ diff -ru a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost
  
     /* Writes (only) flush readers too */
     if (writes) {
-@@ -287,8 +308,10 @@
+@@ -287,8 +310,10 @@
              continue;
  
           /* Submit if it's a user */
