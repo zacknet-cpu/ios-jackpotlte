@@ -67,6 +67,24 @@
  * too far in), or the number in /private/var/mobile/Library/a8fix-sbmargin
  * (points, 2 to 60, read once when the process starts).
  *
+ * Status bar (v14, user report 11-25): a real Dynamic Island iPhone centres
+ * the clock in the left "ear" beside the island and the battery group in the
+ * right one, on the island's middle line; v10 pushed them to the screen's
+ * edges and they sat high (the clock's middle 13 pt down, the island's 30).
+ * Now the items left of the island are centred between the left edge and the
+ * island, the ones right of it between the island and the right edge (at
+ * least 6 pt from the edges, 4 pt from the island), each on the island's
+ * middle line.  The island is the status bar's avoidance frame when it has a
+ * plausible one (it follows a compact Live Activity), else the idle pill
+ * (117.5-242.5 pt, 11.3-48 pt).  a8fix-sbmargin holding a number keeps v10's
+ * edge layout; a8fix-sbvcenter "0" keeps the items' heights.
+ *
+ * Sensor curtain (v14, user report 11-25): the expanded island's X button had
+ * a pill-shaped bite: the sensor cover (_SBSystemApertureMagiciansCurtainView
+ * in the aperture window that takes no touches) is drawn above the content,
+ * and on a 360 pt screen the button reaches under it.  That curtain is hidden
+ * in SpringBoard (no camera there on this phone); a8fix-curtain "1" keeps it.
+ *
  * View dump (v6): SIGUSR1 (console "kill NAME 30") makes the process write
  * every visible window's views to stderr, one line each: depth, class, frame
  * in window points, and a label's text ("A8VIEW ..."), seen with tee. It is
@@ -646,39 +664,59 @@ own_method(Class cls, const char *selector, IMP imp, const char *types)
 	return method_setImplementation(m, imp);
 }
 
-/* ---- status bar (v10) ----------------------------------------------- */
+/* ---- status bar (v10, v14) ------------------------------------------ */
+
+#define SB_MARGIN_SWITCH  "/private/var/mobile/Library/a8fix-sbmargin"
+#define SB_VCENTER_SWITCH "/private/var/mobile/Library/a8fix-sbvcenter"
 
 static void (*sb_fg_layout_orig)(id, SEL);
-static double sb_margin = -1;
+static double sb_margin = -1;           /* v10's edge margin; 0: v14's ears */
+static int sb_vcenter = 1;              /* v14: on the island's middle line */
 static int sb_said;
+
+/* the text of a switch file (an NSString), or 0 when there is none */
+static id
+fix_switch_text(const char *path)
+{
+	Class string = objc_getClass("NSString");
+	id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+	id (*from_file)(Class, SEL, id, unsigned long, id *) =
+	    (id (*)(Class, SEL, id, unsigned long, id *))objc_msgSend;
+
+	if (string == 0)
+		return 0;
+	return from_file(string, sel_registerName("stringWithContentsOfFile:encoding:error:"),
+	    make(string, sel_registerName("stringWithUTF8String:"), path), 4 /* UTF-8 */, 0);
+}
 
 static double
 sb_margin_now(void)
 {
 	if (sb_margin < 0) {
-		Class string = objc_getClass("NSString");
-		id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
-		id (*from_file)(Class, SEL, id, unsigned long, id *) =
-		    (id (*)(Class, SEL, id, unsigned long, id *))objc_msgSend;
 		double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
-		double v = 0;
+		id text = fix_switch_text(SB_MARGIN_SWITCH);
+		double v = text != 0 ? dbl(text, sel_registerName("doubleValue")) : 0;
 
-		if (string != 0) {
-			id path = make(string, sel_registerName("stringWithUTF8String:"),
-			    "/private/var/mobile/Library/a8fix-sbmargin");
-			id text = from_file(string, sel_registerName("stringWithContentsOfFile:encoding:error:"),
-			    path, 4 /* NSUTF8StringEncoding */, 0);
-
-			if (text != 0)
-				v = dbl(text, sel_registerName("doubleValue"));
-		}
-		sb_margin = (v >= 2 && v <= 60) ? v : 5;
+		sb_margin = (v >= 2 && v <= 60) ? v : 0;
+		text = fix_switch_text(SB_VCENTER_SWITCH);
+		sb_vcenter = !(text != 0 &&
+		    ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String"))[0] == '0');
 	}
 	return sb_margin;
 }
 
+/* to the panel's pixel grid (3 pixels a point) */
+static double
+sb_px(double v)
+{
+	double t = v * 3.0;
+
+	return (double)(long long)(t + (t >= 0 ? 0.5 : -0.5)) / 3.0;
+}
+
+/* v10: the leftmost item `m` from the left edge, the rightmost `m` from the right */
 static void
-sb_fg_layout(id self, SEL cmd)
+sb_edges(id self, fix_rect b, double m)
 {
 	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
 	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
@@ -686,16 +724,10 @@ sb_fg_layout(id self, SEL cmd)
 	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
 	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
 	void (*set_rect)(id, SEL, fix_rect) = (void (*)(id, SEL, fix_rect))objc_msgSend;
-	double lmin = 1e9, rmax = -1e9, dl = 0, dr = 0, m;
+	double lmin = 1e9, rmax = -1e9, dl = 0, dr = 0;
 	unsigned long n, nl = 0, nr = 0;
-	fix_rect b;
 	id views;
 
-	sb_fg_layout_orig(self, cmd);
-	b = rect(self, sel_registerName("bounds"));
-	if (b.w < 250 || b.w > 500 || b.h > 120)
-		return;                 /* a portrait phone's bar only */
-	m = sb_margin_now();
 	views = get(self, sel_registerName("subviews"));
 	n = views ? count(views, sel_registerName("count")) : 0;
 	for (unsigned long i = 0; i < n; i++) {
@@ -751,6 +783,187 @@ sb_fg_layout(id self, SEL cmd)
 	}
 }
 
+/*
+ * v14: where the island is, in the bar's points: the status bar's own
+ * avoidance frame (-[_UIStatusBar avoidanceFrame], which SpringBoard keeps on
+ * the island and on a compact Live Activity) when it is a plausible one, else
+ * the idle pill (the sensor curtain: 125 pt wide, centred, 11.3 to 48 pt).
+ */
+static fix_rect
+sb_island(id fg, fix_rect b, const char **from)
+{
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	signed char (*responds)(id, SEL, SEL) = (signed char (*)(id, SEL, SEL))objc_msgSend;
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	fix_rect (*convert)(id, SEL, fix_rect, id) = (fix_rect (*)(id, SEL, fix_rect, id))objc_msgSend;
+	SEL avoid = sel_registerName("avoidanceFrame");
+	fix_rect f;
+	id v = fg;
+
+	for (int up = 0; up < 4 && v != 0; up++, v = get(v, sel_registerName("superview"))) {
+		if (!responds(v, sel_registerName("respondsToSelector:"), avoid))
+			continue;
+		f = convert(fg, sel_registerName("convertRect:fromView:"), rect(v, avoid), v);
+		if (f.w >= 40 && f.h >= 10 && f.h <= 60 && f.x >= 12 && f.x + f.w <= b.w - 12 &&
+		    f.y >= -2 && f.y < b.h) {
+			*from = class_getName(object_getClass(v));
+			return f;
+		}
+		*from = "default (avoidance frame empty)";
+		goto pill;
+	}
+	*from = "default (no avoidance frame)";
+pill:
+	f.w = 125;
+	f.x = (b.w - f.w) / 2;
+	f.y = 11.3;
+	f.h = 36.7;
+	return f;
+}
+
+/*
+ * v14: as a real Dynamic Island iPhone lays it out: the items left of the
+ * island centred in the left "ear" (between the screen's edge and the
+ * island), the ones right of it in the right ear, at least 6 pt from the
+ * screen's edges and 4 pt from the island, each on the island's middle line
+ * (a8fix-sbvcenter "0" leaves the heights alone).  Only the bar that spans
+ * the screen at its top (Control Center's own bar is inset and keeps its
+ * layout).
+ */
+static void
+sb_ears(id self, fix_rect b)
+{
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+	unsigned long (*count)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
+	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
+	double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	fix_rect (*convert)(id, SEL, fix_rect, id) = (fix_rect (*)(id, SEL, fix_rect, id))objc_msgSend;
+	void (*set_rect)(id, SEL, fix_rect) = (void (*)(id, SEL, fix_rect))objc_msgSend;
+	static double said_il = -1, said_ir = -1;
+	double lmin = 1e9, lmax = -1e9, rmin = 1e9, rmax = -1e9, dl = 0, dr = 0;
+	double il, ir, ic, iy, sw = screen_width();
+	unsigned long n, nl = 0, nr = 0, moved = 0;
+	const char *from = "";
+	fix_rect w, island;
+	id views;
+
+	w = convert(self, sel_registerName("convertRect:toView:"), b, 0);
+	if (w.x < -1 || w.x > 1 || w.y < -1 || w.y > 1 || (sw > 0 && (w.w < sw - 1 || w.w > sw + 1)))
+		return;
+	island = sb_island(self, b, &from);
+	il = island.x;
+	ir = island.x + island.w;
+	ic = (il + ir) / 2;
+	iy = island.y + island.h / 2;
+	views = get(self, sel_registerName("subviews"));
+	n = views ? count(views, sel_registerName("count")) : 0;
+	for (unsigned long i = 0; i < n; i++) {
+		id v = at(views, sel_registerName("objectAtIndex:"), i);
+		fix_rect f;
+
+		if (flag(v, sel_registerName("isHidden")) || dbl(v, sel_registerName("alpha")) < 0.01)
+			continue;
+		f = rect(v, sel_registerName("frame"));
+		if (f.w < 0.5 || f.w > b.w / 3 || f.y + f.h / 2 > iy + 4)
+			continue;       /* nothing bar-wide, nothing in a lower row */
+		if (f.x + f.w / 2 < ic) {
+			lmin = f.x < lmin ? f.x : lmin;
+			lmax = f.x + f.w > lmax ? f.x + f.w : lmax;
+			nl++;
+		} else {
+			rmin = f.x < rmin ? f.x : rmin;
+			rmax = f.x + f.w > rmax ? f.x + f.w : rmax;
+			nr++;
+		}
+	}
+	if (nl) {
+		dl = il / 2 - (lmin + lmax) / 2;
+		if (lmax + dl > il - 4)
+			dl = il - 4 - lmax;
+		if (lmin + dl < 6)
+			dl = 6 - lmin;
+	}
+	if (nr) {
+		dr = (ir + b.w) / 2 - (rmin + rmax) / 2;
+		if (rmin + dr < ir + 4)
+			dr = ir + 4 - rmin;
+		if (rmax + dr > b.w - 6)
+			dr = b.w - 6 - rmax;
+	}
+	for (unsigned long i = 0; i < n; i++) {
+		id v = at(views, sel_registerName("objectAtIndex:"), i);
+		fix_rect f, g;
+
+		if (flag(v, sel_registerName("isHidden")) || dbl(v, sel_registerName("alpha")) < 0.01)
+			continue;
+		f = rect(v, sel_registerName("frame"));
+		if (f.w < 0.5 || f.w > b.w / 3 || f.y + f.h / 2 > iy + 4)
+			continue;
+		g = f;
+		g.x = sb_px(f.x + ((f.x + f.w / 2 < ic) ? dl : dr));
+		if (sb_vcenter)
+			g.y = sb_px(iy - f.h / 2);
+		if (g.x - f.x > 0.1 || f.x - g.x > 0.1 || g.y - f.y > 0.1 || f.y - g.y > 0.1) {
+			set_rect(v, sel_registerName("setFrame:"), g);
+			moved++;
+		}
+	}
+	if (sb_said < 12 && (moved || il != said_il || ir != said_ir)) {
+		struct vline l;
+
+		l.n = 0;
+		vl_str(&l, "A8FIX status bar ears: island ");
+		vl_num(&l, il);
+		vl_str(&l, "-");
+		vl_num(&l, ir);
+		vl_str(&l, " pt, middle line ");
+		vl_num(&l, iy);
+		vl_str(&l, " (");
+		vl_str(&l, from);
+		vl_str(&l, "); left ");
+		vl_num(&l, nl);
+		vl_str(&l, " items ");
+		vl_num(&l, nl ? lmin : 0);
+		vl_str(&l, "-");
+		vl_num(&l, nl ? lmax : 0);
+		vl_str(&l, " moved ");
+		vl_num(&l, dl);
+		vl_str(&l, ", right ");
+		vl_num(&l, nr);
+		vl_str(&l, " items ");
+		vl_num(&l, nr ? rmin : 0);
+		vl_str(&l, "-");
+		vl_num(&l, nr ? rmax : 0);
+		vl_str(&l, " moved ");
+		vl_num(&l, dr);
+		vl_str(&l, sb_vcenter ? "; heights centred\n" : "; heights kept\n");
+		write(2, l.b, l.n);
+		said_il = il;
+		said_ir = ir;
+		sb_said++;
+	}
+}
+
+static void
+sb_fg_layout(id self, SEL cmd)
+{
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	fix_rect b;
+	double m;
+
+	sb_fg_layout_orig(self, cmd);
+	b = rect(self, sel_registerName("bounds"));
+	if (b.w < 250 || b.w > 500 || b.h > 120)
+		return;                 /* a portrait phone's bar only */
+	m = sb_margin_now();
+	if (m > 0)
+		sb_edges(self, b, m);   /* a8fix-sbmargin holds a number: v10 */
+	else
+		sb_ears(self, b);
+}
+
 static int layout_kb_done, layout_cc_done, layout_sb_done;
 
 static void
@@ -771,7 +984,8 @@ layout_apply(void)
 		layout_sb_done = 1;
 		sb_fg_layout_orig = (void (*)(id, SEL))own_method(objc_getClass("_UIStatusBarForegroundView"),
 		    "layoutSubviews", (IMP)sb_fg_layout, "v16@0:8");
-		fix_put(sb_fg_layout_orig ? "A8FIX status bar: edge layout hooked\n" : "A8FIX status bar: not hooked\n");
+		fix_put(sb_fg_layout_orig ? "A8FIX status bar: layout hooked (ears, or edges with a8fix-sbmargin)\n" :
+		    "A8FIX status bar: not hooked\n");
 	}
 	if (!layout_cc_done && objc_getClass("CCUIOverlayStatusBarPresentationProvider") != 0) {
 		layout_cc_done = 1;
@@ -784,6 +998,139 @@ layout_apply(void)
 		    "viewWillLayoutSubviews", (IMP)cc_vwls, "v16@0:8");
 		fix_put(cc_vwls_orig ? "A8FIX control center: grid centering hooked\n" : "A8FIX control center: not hooked\n");
 	}
+}
+
+/* ---- v14: the sensor curtain over the expanded island ------------------ */
+
+/*
+ * SpringBoard draws the Dynamic Island in two SBSystemApertureWindows.  The
+ * one that takes no touches holds only _SBSystemApertureMagiciansCurtainView,
+ * the black cover over the iPhone 14 Pro's camera and Face ID sensors, drawn
+ * above everything else.  This screen is 360 pt wide (no Dynamic Island
+ * iPhone is under 393), so the expanded timer puts its X button partly under
+ * that cover: a pill-shaped bite.  There is no camera there on this phone, so
+ * that curtain is hidden; the other window's curtain still draws the idle
+ * pill under the island's content.  /private/var/mobile/Library/a8fix-curtain
+ * holding "1" keeps it (read when SpringBoard starts).
+ */
+#define CURTAIN_SWITCH "/private/var/mobile/Library/a8fix-curtain"
+
+static void (*curtain_layout_orig)(id, SEL);
+static void (*curtain_moved_orig)(id, SEL);
+static void (*curtain_hidden_orig)(id, SEL, signed char);
+static struct {
+	id view;
+	signed char want;       /* what SpringBoard last asked for */
+	signed char forced;     /* hidden here */
+} curtain_seen[8];
+static unsigned curtain_next;
+static int curtain_done, curtain_said;
+
+static unsigned
+curtain_slot(id view)
+{
+	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
+	unsigned k;
+
+	for (k = 0; k < 8; k++)
+		if (curtain_seen[k].view == view)
+			return k;
+	k = curtain_next++ % 8;
+	curtain_seen[k].view = view;
+	curtain_seen[k].want = flag(view, sel_registerName("isHidden"));
+	curtain_seen[k].forced = 0;
+	return k;
+}
+
+/* in the aperture window that takes no touches (the sensor cover)? */
+static int
+curtain_cover(id view)
+{
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
+	signed char (*is_kind)(id, SEL, Class) = (signed char (*)(id, SEL, Class))objc_msgSend;
+	Class aperture = objc_getClass("SBSystemApertureWindow");
+	id w = get(view, sel_registerName("window"));
+
+	return w != 0 && aperture != 0 && is_kind(w, sel_registerName("isKindOfClass:"), aperture) &&
+	    !flag(w, sel_registerName("isUserInteractionEnabled"));
+}
+
+static void
+curtain_check(id view)
+{
+	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
+	SEL set = sel_registerName("setHidden:");
+	unsigned k = curtain_slot(view);
+
+	if (curtain_cover(view)) {
+		curtain_seen[k].forced = 1;
+		if (!flag(view, sel_registerName("isHidden"))) {
+			curtain_hidden_orig(view, set, 1);
+			if (curtain_said < 3) {
+				fix_put("A8FIX island: the sensor curtain in the touchless aperture window "
+				    "hidden (a8fix-curtain \"1\" keeps it)\n");
+				curtain_said++;
+			}
+		}
+	} else if (curtain_seen[k].forced) {
+		curtain_seen[k].forced = 0;     /* moved elsewhere: as SpringBoard wants */
+		if (flag(view, sel_registerName("isHidden")) != curtain_seen[k].want)
+			curtain_hidden_orig(view, set, curtain_seen[k].want);
+	}
+}
+
+static void
+curtain_layout(id self, SEL cmd)
+{
+	curtain_layout_orig(self, cmd);
+	curtain_check(self);
+}
+
+static void
+curtain_moved(id self, SEL cmd)
+{
+	curtain_moved_orig(self, cmd);
+	curtain_check(self);
+}
+
+static void
+curtain_hidden(id self, SEL cmd, signed char hidden)
+{
+	unsigned k = curtain_slot(self);
+
+	curtain_seen[k].want = hidden;
+	if (!hidden && curtain_cover(self)) {
+		curtain_seen[k].forced = 1;
+		hidden = 1;
+	}
+	curtain_hidden_orig(self, cmd, hidden);
+}
+
+static void
+curtain_apply(void)
+{
+	Class c;
+	id text;
+
+	if (curtain_done || (c = objc_getClass("_SBSystemApertureMagiciansCurtainView")) == 0)
+		return;
+	curtain_done = 1;
+	text = fix_switch_text(CURTAIN_SWITCH);
+	if (text != 0 && ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String"))[0] == '1') {
+		fix_put("A8FIX island: sensor curtain kept (a8fix-curtain \"1\")\n");
+		return;
+	}
+	curtain_hidden_orig = (void (*)(id, SEL, signed char))own_method(c, "setHidden:",
+	    (IMP)curtain_hidden, "v20@0:8B16");
+	if (curtain_hidden_orig == 0) {
+		fix_put("A8FIX island: curtain not hooked\n");
+		return;
+	}
+	curtain_layout_orig = (void (*)(id, SEL))own_method(c, "layoutSubviews", (IMP)curtain_layout, "v16@0:8");
+	curtain_moved_orig = (void (*)(id, SEL))own_method(c, "didMoveToWindow", (IMP)curtain_moved, "v16@0:8");
+	fix_put(curtain_layout_orig && curtain_moved_orig ? "A8FIX island: sensor curtain hooks in\n" :
+	    "A8FIX island: curtain partly hooked\n");
 }
 
 /* ---- Auto-Lock (v8) --------------------------------------------------- */
@@ -833,6 +1180,8 @@ idle_apply(void)
 	fix_put("A8FIX auto-lock: telephony retry resets dropped\n");
 }
 
+static int fix_is_springboard;           /* set in fix_init */
+
 static void
 fix_image_added(const void *mh, long slide)
 {
@@ -842,6 +1191,8 @@ fix_image_added(const void *mh, long slide)
 	bl_apply();
 	layout_apply();
 	idle_apply();
+	if (fix_is_springboard)
+		curtain_apply();
 }
 
 /* ---- what UIKit and MobileGestalt think the screen is (a8fix-screen log) ---- */
@@ -1721,6 +2072,9 @@ fix_init(void)
 	bl_apply();
 	layout_apply();
 	idle_apply();
+	fix_is_springboard = fix_streq(getprogname(), "SpringBoard");
+	if (fix_is_springboard)
+		curtain_apply();
 	/* (Control Center's module is a bundle loaded later: keep looking) */
 	_dyld_register_func_for_add_image(fix_image_added);
 	/* what the screen is, once UIKit is up (seen with the console's tee) */
