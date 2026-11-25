@@ -1520,6 +1520,54 @@ wall_try(void *context)
 		dispatch_after_f(dispatch_time(0, 2000000000LL), &_dispatch_main_q, 0, wall_try);
 }
 
+/* v13d: copies for the console, whose fget cannot name a path with a space.
+ * When /private/var/mobile/Library/a8copy holds "SOURCE|DESTINATION",
+ * SpringBoard copies SOURCE to DESTINATION once (NSFileManager; DESTINATION
+ * replaced) and writes "done" or the error into a8copy. */
+#define FIX_COPY_SWITCH "/private/var/mobile/Library/a8copy"
+
+static void
+fix_copy(void *context)
+{
+	Class string = objc_getClass("NSString"), fm_class = objc_getClass("NSFileManager");
+	id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+	id (*from_file)(Class, SEL, id, unsigned long, id *) =
+	    (id (*)(Class, SEL, id, unsigned long, id *))objc_msgSend;
+	signed char (*write_file)(id, SEL, id, signed char, unsigned long, id *) =
+	    (signed char (*)(id, SEL, id, signed char, unsigned long, id *))objc_msgSend;
+	SEL mk = sel_registerName("stringWithUTF8String:");
+	id path, text, parts, fm, err = 0, report;
+	signed char ok;
+
+	(void)context;
+	if (string == 0 || fm_class == 0)
+		return;
+	path = make(string, mk, FIX_COPY_SWITCH);
+	text = from_file(string, sel_registerName("stringWithContentsOfFile:encoding:error:"), path, 4, 0);
+	if (text == 0)
+		return;
+	text = ((id (*)(id, SEL, id))objc_msgSend)(text,
+	    sel_registerName("stringByTrimmingCharactersInSet:"),
+	    ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("NSCharacterSet"),
+	    sel_registerName("whitespaceAndNewlineCharacterSet")));
+	parts = ((id (*)(id, SEL, id))objc_msgSend)(text, sel_registerName("componentsSeparatedByString:"),
+	    make(string, mk, "|"));
+	if (parts == 0 || ((unsigned long (*)(id, SEL))objc_msgSend)(parts, sel_registerName("count")) != 2)
+		return;
+	fm = ((id (*)(Class, SEL))objc_msgSend)(fm_class, sel_registerName("defaultManager"));
+	((signed char (*)(id, SEL, id, id *))objc_msgSend)(fm, sel_registerName("removeItemAtPath:error:"),
+	    ((id (*)(id, SEL, unsigned long))objc_msgSend)(parts, sel_registerName("objectAtIndex:"), 1), 0);
+	ok = ((signed char (*)(id, SEL, id, id, id *))objc_msgSend)(fm,
+	    sel_registerName("copyItemAtPath:toPath:error:"),
+	    ((id (*)(id, SEL, unsigned long))objc_msgSend)(parts, sel_registerName("objectAtIndex:"), 0),
+	    ((id (*)(id, SEL, unsigned long))objc_msgSend)(parts, sel_registerName("objectAtIndex:"), 1), &err);
+	report = ok ? make(string, mk, "done\n") : make(string, mk, fix_utf8(err));
+	write_file(report, sel_registerName("writeToFile:atomically:encoding:error:"), path, 1, 4, 0);
+	fix_put("A8FIX copy: ");
+	fix_put(ok ? "done" : fix_utf8(err));
+	fix_put("\n");
+}
+
 static void
 wall_report(void *context)
 {
@@ -1685,5 +1733,6 @@ fix_init(void)
 	if (fix_streq(getprogname(), "SpringBoard")) {
 		dispatch_after_f(dispatch_time(0, 12000000000LL), &_dispatch_main_q, 0, wall_report);
 		dispatch_after_f(dispatch_time(0, 3000000000LL), &_dispatch_main_q, 0, wall_try);
+		dispatch_after_f(dispatch_time(0, 5000000000LL), dispatch_get_global_queue(0, 0), 0, fix_copy);
 	}
 }
