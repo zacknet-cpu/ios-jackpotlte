@@ -1191,10 +1191,26 @@ bounds_program_plain(GLuint program)
                squeezed[k++] = *c;
          squeezed[k] = '\0';
          {
-            const char *first = strstr(squeezed, "gl_Position");
+            /* writes of gl_Position: "gl_Position=" (not "=="), a swizzle then
+             * "=", or a compound assignment; CoreAnimation's shaders also read
+             * it (texcoordD, texcoordN), which is fine */
+            unsigned writes = 0;
+            bool form = false;
 
-            plain = first != NULL && strstr(first + 1, "gl_Position") == NULL &&
-                    strncmp(first, "gl_Position=vertex_matrix*vertex_position;", 42) == 0;
+            for (const char *at = strstr(squeezed, "gl_Position"); at != NULL;
+                 at = strstr(at + 11, "gl_Position")) {
+               const char *c = at + 11;
+
+               if (*c == '.')
+                  for (c++; (*c >= 'a' && *c <= 'z'); c++)
+                     ;
+               if ((c[0] == '=' && c[1] != '=') ||
+                   ((c[0] == '+' || c[0] == '-' || c[0] == '*' || c[0] == '/') && c[1] == '=')) {
+                  writes++;
+                  form = strncmp(at, "gl_Position=vertex_matrix*vertex_position;", 42) == 0;
+               }
+            }
+            plain = writes == 1 && form;
          }
          if (!plain && strstr(squeezed, "vertex_matrix") != NULL && bounds_odd_said < 3) {
             size_t len = strlen(squeezed);
@@ -1285,7 +1301,10 @@ bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struc
    }
    gl.get_uniformfv((GLuint)program, matrix, m);
    gl.get_integerv(0x0BA2 /* VIEWPORT */, vp);
-   if (vp[2] <= 0 || vp[3] <= 0)
+   /* glca21c: screen-sized targets only (the panel's buffers, CoreAnimation's
+    * full-screen offscreen); small offscreen passes are small already, and
+    * glca21 cut the Dynamic Island in one of them */
+   if (vp[2] < 1000 || vp[3] < 2000)
       goto left;
    for (GLsizei i = 0; i < count; i++) {
       GLuint index;
