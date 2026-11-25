@@ -1,0 +1,165 @@
+From d9a3b0426c877d191d815f91f10c6868a7f1c837 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 07:14:35 -0500
+Subject: [PATCH] 0219-a8-cahz120-console-noexec.patch
+
+---
+ bsd/dev/a5xelte_usb.c                 | 12 +++++++
+ bsd/dev/mem.c                         | 48 +++++++++++++++++++++++++++
+ bsd/kern/kern_exec.c                  | 10 +++---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 11 +++---
+ 4 files changed, 73 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index ea56474..adc0091 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1662,6 +1662,8 @@ extern void a8f_ls(const char *args);
+ extern void a8f_date(const char *args);
+ extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
+ extern int sweet_fb_cahz_set(int hz);          /* SweetFramebuffer.cpp, 0217 */
++extern void a8_noexec_set(const char *names);   /* mem.c, 0219 */
++extern const char *a8_noexec_get(void);
+ extern int sweet_fb_vsync_lock_set(int on);     /* SweetFramebuffer.cpp, 0204 */
+ /* 0192 */
+ extern void a8_acpm_command(const char *args);  /* a8_acpm.c */
+@@ -1991,6 +1993,16 @@ a8s_command(const char *line)
+ 		printf("A8SH: tee: %s (on top of the boot list; a program named here logs to "
+ 		    "stderr from its next start: kill it)\n",
+ 		    a8_tee_get()[0] != 0 ? a8_tee_get() : "nothing");
++	} else if (a8s_word(line, "noexec", &rest)) {
++		/* 0219: programs refused at exec until "noexec -" or a reboot */
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest != 0) {
++			a8_noexec_set(rest);
++		}
++		printf("A8SH: noexec: %s (refused at their next exec; kill a running one)\n",
++		    a8_noexec_get()[0] != 0 ? a8_noexec_get() : "nothing");
+ 	} else if (a8s_word(line, "fixinto", &rest)) {
+ 		while (*rest == ' ') {
+ 			rest++;
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index b237f1e..3ce5508 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -293,6 +293,54 @@ a8_fixinto_wants(const char *name, size_t len)
+ 
+ 	return name != NULL && list[0] != 0 && a8_tee_listed(list, name, len);
+ }
++
++/*
++ * 0219: the console's "noexec NAME,NAME|-": programs refused at exec from now
++ * on (until "noexec -" or a reboot), on top of a8noexec and the 0216 list
++ * (kern_exec.c exec_denied).  For a crash loop seen at run time -- PosterBoard
++ * restarted every ~8 s for hours on 11-25 while its extensions were missing --
++ * without a slot or a boot-arg (the line is at 598 of 607).
++ */
++static char a8_noexec_buf[2][128];
++static const char *volatile a8_noexec_names = "";
++static uint32_t a8_noexec_flip;
++
++void a8_noexec_set(const char *names);
++const char *a8_noexec_get(void);
++bool a8_noexec_wants(const char *name, size_t len);
++
++void
++a8_noexec_set(const char *names)
++{
++	char *buf = a8_noexec_buf[++a8_noexec_flip & 1u];
++	size_t n;
++
++	while (*names == ' ') {
++		names++;
++	}
++	if (names[0] == '-') {
++		names = "";
++	}
++	strlcpy(buf, names, sizeof(a8_noexec_buf[0]));
++	for (n = strlen(buf); n > 0 && buf[n - 1] == ' '; n--) {
++		buf[n - 1] = 0;
++	}
++	a8_noexec_names = buf;
++}
++
++const char *
++a8_noexec_get(void)
++{
++	return a8_noexec_names;
++}
++
++bool
++a8_noexec_wants(const char *name, size_t len)
++{
++	const char *list = a8_noexec_names;
++
++	return name != NULL && list[0] != 0 && a8_tee_listed(list, name, len);
++}
+ #endif /* JACKPOTLTE */
+ 
+ static bool
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 02a6284..d3115dd 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5776,6 +5776,7 @@ static const char exec_deny_default[] =
+  * session (Galaxy S7 port, wardevsa/ios-a5xelte 0325: 54 crashes a boot), and
+  * AegirPoster, which launchd kept retrying there (0315).
+  */
++extern bool a8_noexec_wants(const char *name, size_t len);  /* mem.c, 0219 console "noexec" */
+ static const char exec_deny_ext[] =
+     "SiriTTSSynthesizerAU,KonaSynthesizer,MacinTalkAUSP,AegirPoster";
+ 
+@@ -5804,7 +5805,7 @@ exec_denied(struct image_params *imgp)
+ 	const char *p = exec_deny_conf[0] != 0 ? exec_deny_conf : exec_deny_default;
+ 	const char *name;
+ 	size_t namelen;
+-	bool listed, ext;
++	bool listed, ext, rt;
+ 
+ 	if (p[0] == '-' || imgp->ip_ndp == NULL) {
+ 		return false;
+@@ -5816,12 +5817,13 @@ exec_denied(struct image_params *imgp)
+ 	}
+ 	listed = exec_deny_listed(p, name, namelen);
+ 	ext = !listed && exec_deny_listed(exec_deny_ext, name, namelen);
+-	if (listed || ext) {
++	rt = !listed && !ext && a8_noexec_wants(name, namelen);
++	if (listed || ext || rt) {
+ 		static uint32_t said;
+ 
+-		if (said++ < 40) {
++		if (said++ < 40 || rt) {
+ 			printf("A8 NOEXEC: %.*s refused (%s)\n", (int)namelen, name,
+-			    listed ? "a8noexec" : "0216 list");
++			    listed ? "a8noexec" : ext ? "0216 list" : "console noexec");
+ 		}
+ 		return true;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b8d01ce..6f39f17 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -346,11 +346,14 @@ AppleCLCD::start(IOService *provider)
+ 		 * with the kernel's timer coalescing on, the timer of a thread that is not
+ 		 * real-time may fire up to 100 ms late; on the S9 the frames came exactly
+ 		 * 100 ms apart. Off here (sweetfb_tcoal=1 leaves it on).
+-		 * sweetfb_cahz=N (30-240, default 0: left out as before) publishes
+-		 * IOMFBDisplayRefresh, the refresh CoreAnimation paces its frames by; the
+-		 * S7 and S9 ports tell it 120 on a 60 Hz panel.
++		 * sweetfb_cahz=N (30-240) publishes IOMFBDisplayRefresh, the refresh
++		 * CoreAnimation paces its frames by; the S7 and S9 ports tell it 120 on
++		 * a 60 Hz panel.  0219: 120 by default here (11-25: Settings scrolling
++		 * 557-560 -> 591-595 frames a 10 s, frames taking two periods ~120 ->
++		 * ~50, idle CPU and the other gestures the same); sweetfb_cahz=0 leaves
++		 * it out as before.
+ 		 */
+-		uint32_t keep = 0, told = 0;
++		uint32_t keep = 0, told = 120;
+ 		PE_parse_boot_argn("sweetfb_tcoal", &keep, sizeof(keep));
+ 		if (!keep) {
+ 			mach_timer_coalescing_enabled = FALSE;
+-- 
+2.43.0
+
