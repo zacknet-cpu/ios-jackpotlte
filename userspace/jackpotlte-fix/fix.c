@@ -72,6 +72,16 @@
  * in window points, and a label's text ("A8VIEW ..."), seen with tee. It is
  * how an off-center layout (keyboard, Control Center) is found.
  *
+ * Wallpaper extensions (v11): kernel 0216 lets lsd read the extension point
+ * table, but LaunchServices' database was made while every extension was
+ * refused, so no poster provider is in it and the wallpaper stays black.
+ * Moving the database aside for a full rebuild hung lsd on this image (11-25:
+ * the first-boot data migration never ran here).  As the Galaxy S7 port does
+ * (wardevsa/ios-a5xelte, hero-run.c tell_ls_of_posters), SpringBoard
+ * registers just the poster bundles with LSRegisterURL, once: when
+ * /private/var/mobile/Library/a8fix-posters holds "1", 30 s after SpringBoard
+ * starts, off the main thread; the results replace the file's content.
+ *
  * Plain C on the Objective-C runtime; no SDK headers.
  */
 typedef struct objc_class *Class;
@@ -1208,6 +1218,102 @@ dump_arm(void)
 	dispatch_resume(source);
 }
 
+/* ---- v11: the wallpaper extensions told to LaunchServices ------------------ */
+
+extern void *dlsym(void *handle, const char *symbol);
+extern void *dispatch_get_global_queue(long identifier, unsigned long flags);
+#define FIX_RTLD_DEFAULT ((void *)-2)
+#define FIX_POSTERS_SWITCH "/private/var/mobile/Library/a8fix-posters"
+
+static int
+fix_streq(const char *a, const char *b)
+{
+	while (*a != 0 && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+static void
+fix_itoa(long v, char *out)
+{
+	char tmp[24];
+	int n = 0, neg = v < 0;
+	unsigned long u = neg ? (unsigned long)(-v) : (unsigned long)v;
+
+	do {
+		tmp[n++] = (char)('0' + u % 10);
+		u /= 10;
+	} while (u != 0 && n < 22);
+	if (neg)
+		*out++ = '-';
+	while (n > 0)
+		*out++ = tmp[--n];
+	*out = 0;
+}
+
+static void
+posters_register(void *context)
+{
+	static const char *const appex[] = {
+		"/System/Library/PrivateFrameworks/WallpaperKit.framework/PlugIns/CollectionsPoster.appex",
+		"/System/Library/PrivateFrameworks/GradientPoster.framework/PlugIns/GradientPosterExtension.appex",
+		"/System/Library/PrivateFrameworks/PhotosUIPrivate.framework/PlugIns/PhotosPosterProvider.appex",
+		"/System/Library/PrivateFrameworks/EmojiPoster.framework/PlugIns/EmojiPosterExtension.appex",
+		"/System/Library/PrivateFrameworks/UnityPoster.framework/PlugIns/UnityPosterExtension.appex",
+		"/System/Library/PrivateFrameworks/PridePoster.framework/PlugIns/PridePosterExtension.appex",
+		"/Applications/Weather.app/PlugIns/WeatherPoster.appex",
+	};
+	Class string = objc_getClass("NSString"), nsurl = objc_getClass("NSURL");
+	id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+	id (*from_file)(Class, SEL, id, unsigned long, id *) =
+	    (id (*)(Class, SEL, id, unsigned long, id *))objc_msgSend;
+	int (*int_value)(id, SEL) = (int (*)(id, SEL))objc_msgSend;
+	id (*file_url)(Class, SEL, id) = (id (*)(Class, SEL, id))objc_msgSend;
+	id (*append)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+	signed char (*write_file)(id, SEL, id, signed char, unsigned long, id *) =
+	    (signed char (*)(id, SEL, id, signed char, unsigned long, id *))objc_msgSend;
+	int (*lsregister)(id, unsigned char);
+	SEL mk = sel_registerName("stringWithUTF8String:"), cat = sel_registerName("stringByAppendingString:");
+	id path, text, report;
+	char num[24];
+
+	(void)context;
+	if (string == 0 || nsurl == 0)
+		return;
+	path = make(string, mk, FIX_POSTERS_SWITCH);
+	text = from_file(string, sel_registerName("stringWithContentsOfFile:encoding:error:"), path, 4, 0);
+	if (text == 0 || int_value(text, sel_registerName("intValue")) != 1)
+		return;
+	lsregister = (int (*)(id, unsigned char))dlsym(FIX_RTLD_DEFAULT, "LSRegisterURL");
+	/* v11b: iOS has no LSRegisterURL in SpringBoard; LSApplicationWorkspace's
+	 * registerPlugin: (what uicache uses for plug-ins) does the same */
+	Class wsc = objc_getClass("LSApplicationWorkspace");
+	id ws = wsc != 0 ? ((id (*)(Class, SEL))objc_msgSend)(wsc, sel_registerName("defaultWorkspace")) : 0;
+	SEL reg = sel_registerName("registerPlugin:");
+	int can_reg = ws != 0 && ((signed char (*)(id, SEL, SEL))objc_msgSend)(ws,
+	    sel_registerName("respondsToSelector:"), reg);
+	report = make(string, mk, lsregister != 0 ? "v11b LSRegisterURL (status path):\n" :
+	    can_reg ? "v11b registerPlugin: (1 = yes, path):\n" : "v11b nothing to register with\n");
+	if (lsregister != 0 || can_reg) {
+		for (unsigned long i = 0; i < sizeof(appex) / sizeof(appex[0]); i++) {
+			id u = file_url(nsurl, sel_registerName("fileURLWithPath:"), make(string, mk, appex[i]));
+			int status = u == 0 ? -1 : lsregister != 0 ? lsregister(u, 1) :
+			    (int)((signed char (*)(id, SEL, id))objc_msgSend)(ws, reg, u);
+
+			fix_itoa(status, num);
+			report = append(report, cat, make(string, mk, num));
+			report = append(report, cat, make(string, mk, " "));
+			report = append(report, cat, make(string, mk, appex[i]));
+			report = append(report, cat, make(string, mk, "\n"));
+		}
+	}
+	write_file(report, sel_registerName("writeToFile:atomically:encoding:error:"), path, 1, 4, 0);
+	fix_put("A8FIX posters: ");
+	fix_put(fix_utf8(report));
+}
+
 __attribute__((constructor)) static void
 fix_init(void)
 {
@@ -1222,4 +1328,8 @@ fix_init(void)
 	_dyld_register_func_for_add_image(fix_image_added);
 	/* what the screen is, once UIKit is up (seen with the console's tee) */
 	dispatch_after_f(dispatch_time(0, 8000000000LL), &_dispatch_main_q, 0, fix_screen_report);
+	/* v11b: the poster bundles to LaunchServices, once (a8fix-posters "1") */
+	if (fix_streq(getprogname(), "SpringBoard"))
+		dispatch_after_f(dispatch_time(0, 30000000000LL), dispatch_get_global_queue(0, 0), 0,
+		    posters_register);
 }

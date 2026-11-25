@@ -9,5 +9,6 @@ exports:
                    _getprogname, _dispatch_after_f, __dispatch_main_q, _dispatch_time,
                    _getenv, _free, _os_log_set_hook, _os_log_copy_message_string,
                    __NSConcreteGlobalBlock, _dispatch_source_create, _dispatch_source_set_event_handler_f,
-                   _dispatch_resume, __dispatch_source_type_signal, _signal ]
+                   _dispatch_resume, __dispatch_source_type_signal, _signal,
+                   _dlsym, _dispatch_get_global_queue ]
 ...
