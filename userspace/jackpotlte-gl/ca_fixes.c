@@ -92,6 +92,8 @@ static struct {
    void (*get_uniformfv)(GLuint, GLint, GLfloat *);        /* glca21 */
    GLint (*get_attrib_location)(GLuint, const GLchar *);
    void (*scissor)(GLint, GLint, GLsizei, GLsizei);
+   void (*get_attached_shaders)(GLuint, GLsizei, GLsizei *, GLuint *);
+   void (*get_shader_source)(GLuint, GLsizei, GLsizei *, GLchar *);
    int loaded;
 } gl;
 
@@ -170,6 +172,8 @@ load(void)
    PROC(get_uniformfv, "glGetUniformfv");
    PROC(get_attrib_location, "glGetAttribLocation");
    PROC(scissor, "glScissor");
+   PROC(get_attached_shaders, "glGetAttachedShaders");
+   PROC(get_shader_source, "glGetShaderSource");
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -1142,6 +1146,69 @@ static struct {
    GLint matrix, position;
    GLuint known;
 } bounds_prog[BOUNDS_PROGRAMS];
+static unsigned bounds_odd_said;
+
+/*
+ * glca21b: only a program whose vertex shader sets gl_Position once, as
+ * "gl_Position = vertex_matrix * vertex_position;" (whitespace aside), has its
+ * draws scissored; the first version also cut the Dynamic Island's draw in
+ * Control Center, so some programs place their vertices another way.  The
+ * first few other vertex shaders that use vertex_matrix are logged.
+ */
+static bool
+bounds_program_plain(GLuint program)
+{
+   GLuint shaders[4];
+   GLsizei n = 0;
+   bool plain = false;
+
+   if (gl.get_attached_shaders == NULL || gl.get_shader_source == NULL || gl.get_shaderiv == NULL)
+      return false;
+   gl.get_attached_shaders(program, 4, &n, shaders);
+   for (GLsizei i = 0; i < n; i++) {
+      GLint type = 0, length = 0;
+
+      gl.get_shaderiv(shaders[i], 0x8B4F /* SHADER_TYPE */, &type);
+      if (type != 0x8B31 /* VERTEX_SHADER */)
+         continue;
+      gl.get_shaderiv(shaders[i], 0x8B88 /* SHADER_SOURCE_LENGTH */, &length);
+      if (length <= 0 || length > 65536)
+         return false;
+      {
+         char *text = malloc((size_t)length + 1), *squeezed = malloc((size_t)length + 1);
+         size_t k = 0;
+         GLsizei got = 0;
+
+         if (text == NULL || squeezed == NULL) {
+            free(text);
+            free(squeezed);
+            return false;
+         }
+         gl.get_shader_source(shaders[i], length + 1, &got, text);
+         text[got < length ? got : length] = '\0';
+         for (const char *c = text; *c != '\0'; c++)
+            if (*c != ' ' && *c != '\t' && *c != '\n' && *c != '\r')
+               squeezed[k++] = *c;
+         squeezed[k] = '\0';
+         {
+            const char *first = strstr(squeezed, "gl_Position");
+
+            plain = first != NULL && strstr(first + 1, "gl_Position") == NULL &&
+                    strncmp(first, "gl_Position=vertex_matrix*vertex_position;", 42) == 0;
+         }
+         if (!plain && strstr(squeezed, "vertex_matrix") != NULL && bounds_odd_said < 6) {
+            const char *at = strstr(text, "gl_Position");
+
+            bounds_odd_said++;
+            say("glca21b: program %u places its vertices its own way: %.200s", program,
+                at != NULL ? at : text);
+         }
+         free(text);
+         free(squeezed);
+      }
+   }
+   return plain;
+}
 
 struct bounds_state {
    GLboolean was_on;
@@ -1189,6 +1256,8 @@ bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struc
    } else {
       matrix = gl.get_uniform_location((GLuint)program, "vertex_matrix");
       position = gl.get_attrib_location((GLuint)program, "vertex_position");
+      if (matrix >= 0 && position >= 0 && !bounds_program_plain((GLuint)program))
+         matrix = -1;    /* glca21b: not the plain matrix-times-position form */
       if (program < BOUNDS_PROGRAMS) {
          bounds_prog[program].matrix = matrix;
          bounds_prog[program].position = position;
