@@ -1,0 +1,294 @@
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index b7528c0..7505698 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -47,6 +47,7 @@ bool jackpotlte_mali_ready(void);
+ uint32_t jackpotlte_mali_shader_mask(void);
+ bool jackpotlte_mali_parameter(uint32_t which, uint64_t *value);
+ uint64_t jackpotlte_mali_address(uint64_t size);
++void jackpotlte_mali_release(uint64_t gpu, uint64_t size, bool idle);
+ bool jackpotlte_mali_map(uint64_t gpu, uint64_t phys);
+ void jackpotlte_mali_unmap(uint64_t gpu, uint64_t size);
+ void jackpotlte_mali_mapped(void);
+@@ -602,6 +603,156 @@ static uint32_t jt_as0_transcfg;
+ static bool jt_engine_up;
+ static uint64_t jt_next_address = JT_GPU_ADDRESS_FIRST;
+ 
++/* 0214 */
++/*
++ * 0214 (host-tested as one piece, va_test.c in the session's notes; callers
++ * hold jt_mali_lock).   GPU addresses below 4 GB, handed out again once freed.  Linux panfrost
++ * keeps every buffer in [32 MB, 4 GB) (panfrost_mmu.c, drm_mm_init) and
++ * Mesa's Bifrost code relies on it: some descriptors keep only the low 32
++ * bits of a shader's address and take the rest from another shader's.  A
++ * bitmap of 64 KB granules from JT_VA_FIRST to 4 GB; next fit from a rolling
++ * cursor; every buffer gets one more granule than it needs, so the next
++ * buffer never starts right after it (an overrun still faults).  The last
++ * granule below 4 GB is never handed out, so no buffer ends on the boundary.
++ */
++#define JT_VA_GRANULE		0x10000ull			/* 64 KB */
++#define JT_VA_TOP		(1ull << 32)
++#define JT_VA_GRANULES		((uint32_t)(JT_VA_TOP / JT_VA_GRANULE))	/* 65536 */
++#define JT_VA_FIRST		0x01000000ull			/* 16 MB */
++
++static uint64_t jt_va_used[JT_VA_GRANULES / 64];	/* bit set: granule in use */
++static uint32_t jt_va_cursor;				/* where the next search starts */
++static uint64_t jt_va_in_use, jt_va_peak;		/* granules */
++static uint64_t jt_va_allocs, jt_va_frees, jt_va_fails, jt_va_kept;
++static bool jt_va_ready;
++
++static inline bool
++jt_va_bit(uint32_t g)
++{
++	return (jt_va_used[g >> 6] >> (g & 63)) & 1;
++}
++
++static inline void
++jt_va_set(uint32_t g, bool on)
++{
++	if (on) {
++		jt_va_used[g >> 6] |= 1ull << (g & 63);
++	} else {
++		jt_va_used[g >> 6] &= ~(1ull << (g & 63));
++	}
++}
++
++static void
++jt_va_init(void)
++{
++	uint32_t g;
++
++	for (g = 0; g < JT_VA_GRANULES / 64; g++) {
++		jt_va_used[g] = 0;
++	}
++	for (g = 0; g < (uint32_t)(JT_VA_FIRST / JT_VA_GRANULE); g++) {
++		jt_va_set(g, true);			/* below 16 MB: never */
++	}
++	jt_va_set(JT_VA_GRANULES - 1, true);		/* nothing ends on 4 GB */
++	jt_va_cursor = (uint32_t)(JT_VA_FIRST / JT_VA_GRANULE);
++	jt_va_in_use = 0;
++	jt_va_ready = true;
++}
++
++/* Granules a buffer of `size` bytes takes: its own plus one free after it. */
++static inline uint32_t
++jt_va_granules(uint64_t size)
++{
++	return (uint32_t)((size + JT_VA_GRANULE - 1) / JT_VA_GRANULE) + 1;
++}
++
++/* Look for `need` free granules in [from, to); the first one or 0xffffffffu. */
++static uint32_t
++jt_va_find(uint32_t from, uint32_t to, uint32_t need)
++{
++	uint32_t g = from, run = 0, start = from;
++
++	while (g < to) {
++		if ((g & 63) == 0 && run == 0 && jt_va_used[g >> 6] == ~0ull) {
++			g += 64;			/* a whole word in use */
++			continue;
++		}
++		if (jt_va_bit(g)) {
++			run = 0;
++			g++;
++			continue;
++		}
++		if (run == 0) {
++			start = g;
++		}
++		if (++run == need) {
++			return start;
++		}
++		g++;
++	}
++	return 0xffffffffu;
++}
++
++/* `size` bytes of GPU address below 4 GB; 0: none free. */
++static uint64_t
++jt_va_alloc(uint64_t size)
++{
++	uint32_t need = jt_va_granules(size), first = (uint32_t)(JT_VA_FIRST / JT_VA_GRANULE);
++	uint32_t start, g;
++
++	if (!jt_va_ready) {
++		jt_va_init();
++	}
++	if (size == 0 || need > JT_VA_GRANULES - first) {
++		jt_va_fails++;
++		return 0;
++	}
++	start = jt_va_find(jt_va_cursor, JT_VA_GRANULES, need);
++	if (start == 0xffffffffu) {
++		start = jt_va_find(first, jt_va_cursor, need);
++	}
++	if (start == 0xffffffffu) {
++		start = jt_va_find(first, JT_VA_GRANULES, need);	/* across the cursor */
++	}
++	if (start == 0xffffffffu) {
++		jt_va_fails++;
++		return 0;
++	}
++	for (g = start; g < start + need; g++) {
++		jt_va_set(g, true);
++	}
++	jt_va_cursor = start + need < JT_VA_GRANULES ? start + need : first;
++	jt_va_in_use += need;
++	if (jt_va_in_use > jt_va_peak) {
++		jt_va_peak = jt_va_in_use;
++	}
++	jt_va_allocs++;
++	return (uint64_t)start * JT_VA_GRANULE;
++}
++
++/* Give back what jt_va_alloc(size) handed out at `address`. */
++static void
++jt_va_free(uint64_t address, uint64_t size)
++{
++	uint32_t first = (uint32_t)(address / JT_VA_GRANULE), need = jt_va_granules(size), g;
++
++	if (!jt_va_ready || address < JT_VA_FIRST || address >= JT_VA_TOP ||
++	    (address & (JT_VA_GRANULE - 1)) != 0 || first + need > JT_VA_GRANULES - 1) {
++		return;
++	}
++	for (g = first; g < first + need; g++) {
++		if (jt_va_bit(g)) {
++			jt_va_set(g, false);
++			jt_va_in_use--;
++		}
++	}
++	jt_va_frees++;
++}
++
++/* 0214: a8gpuva=0 keeps the old bump allocator (never gives an address back,
++ * goes up to 32 GB: past 4 GB after ~40 minutes, then shader execute faults). */
++static int jt_va_mode = -1;
++
+ /* Completion of a job, without spinning for its whole length: a moment of
+  * polling for the short jobs, then asleep 200 us at a time
+  * (redwood_mali.c:598-624). */
+@@ -895,6 +1046,22 @@ jackpotlte_mali_address(uint64_t size)
+ 	uint64_t address;
+ 
+ 	lck_mtx_lock(&jt_mali_lock);
++	if (jt_va_mode < 0) {
++		int on = 1;
++
++		(void)PE_parse_boot_argn("a8gpuva", &on, sizeof(on));
++		jt_va_mode = on != 0;
++	}
++	if (jt_va_mode) {
++		address = jt_va_alloc(size);		/* 0214 */
++		lck_mtx_unlock(&jt_mali_lock);
++		if (address == 0) {
++			printf("JACKPOTLTE MALI: no %llu bytes of GPU address left below 4 GB "
++			    "(%llu MB in use)\n", (unsigned long long)size,
++			    (unsigned long long)(jt_va_in_use * JT_VA_GRANULE >> 20));
++		}
++		return address;
++	}
+ 	address = jt_next_address;
+ 	if (address + size > JT_GPU_ADDRESS_END) {
+ 		address = 0;
+@@ -905,6 +1072,24 @@ jackpotlte_mali_address(uint64_t size)
+ 	return address;
+ }
+ 
++/* 0214: the addresses of a buffer whose pages jackpotlte_mali_unmap() took out
++ * (and out of the MMU) go back to the allocator; `idle` false (its last job
++ * did not finish) keeps them, so a late GPU access faults instead of landing
++ * in another buffer. */
++void
++jackpotlte_mali_release(uint64_t gpu, uint64_t size, bool idle)
++{
++	lck_mtx_lock(&jt_mali_lock);
++	if (jt_va_mode > 0) {
++		if (idle) {
++			jt_va_free(gpu, size);
++		} else {
++			jt_va_kept++;
++		}
++	}
++	lck_mtx_unlock(&jt_mali_lock);
++}
++
+ bool
+ jackpotlte_mali_map(uint64_t gpu, uint64_t phys)
+ {
+@@ -1094,12 +1279,15 @@ jackpotlte_mali_submit(uint64_t chain, bool fragment)
+ 			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_TRANSTAB_LO)),
+ 			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_TRANSCFG_LO),
+ 			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_STATUS));
+-			/* 0211: the allocator never gives an address twice, so
+-			 * a fault below where it stands is a buffer that went
+-			 * (or was never made); and what the job held. */
+-			printf("JACKPOTLTE MALI: allocator at %#llx (addresses "
+-			    "from %#llx), %s\n", (unsigned long long)jt_next_address,
+-			    (unsigned long long)JT_GPU_ADDRESS_FIRST,
++			/* 0214: addresses are handed out again since 0214, so
++			 * the allocator's state rather than its high mark. */
++			printf("JACKPOTLTE MALI: GPU addresses %s: %llu MB in use (peak %llu MB) "
++			    "below 4 GB, next search at %#llx; %s\n",
++			    jt_va_mode > 0 ? "reused" : "never reused",
++			    (unsigned long long)(jt_va_in_use * JT_VA_GRANULE >> 20),
++			    (unsigned long long)(jt_va_peak * JT_VA_GRANULE >> 20),
++			    jt_va_mode > 0 ? (unsigned long long)jt_va_cursor * JT_VA_GRANULE :
++			    (unsigned long long)jt_next_address,
+ 			    mmu ? "stopped at the MMU fault" : "no MMU fault");
+ 			if (jt_fault_dumps < 3) {
+ 				jt_fault_dumps++;
+@@ -1346,11 +1534,16 @@ jackpotlte_mali_report(void)
+ 	jt_tune();
+ 	printf("A8 GPU: jobs fragment %llu (avg %llu us, max %llu us), other %llu (avg %llu us, "
+ 	    "max %llu us); failed %llu (%llu seen early); held for the panel %llu, not held %llu; "
+-	    "MMU range flushes %llu, full updates %llu, slow %llu; nap %u us; worker cpu %d; "
+-	    "allocator at %#llx\n",
++	    "MMU range flushes %llu, full updates %llu, slow %llu; nap %u us; worker cpu %d\n",
+ 	    jt_jobs[0], avg0, jt_job_max_ns[0] / 1000, jt_jobs[1], avg1, jt_job_max_ns[1] / 1000,
+ 	    jt_jobs_failed, jt_jobs_fast_fail, jt_jobs_gated, jt_jobs_free, jt_mmu_flushes,
+-	    jt_mmu_updates, jt_mmu_slow, jt_nap_us, jt_worker_cpu, (unsigned long long)jt_next_address);
++	    jt_mmu_updates, jt_mmu_slow, jt_nap_us, jt_worker_cpu);
++	printf("A8 GPU: addresses %s: %llu MB in use, peak %llu MB, of 4 GB; %llu given, %llu back, "
++	    "%llu kept (job unfinished), %llu refused; old high mark %#llx\n",
++	    jt_va_mode > 0 ? "reused (0214)" : "never reused (a8gpuva=0)",
++	    (unsigned long long)(jt_va_in_use * JT_VA_GRANULE >> 20),
++	    (unsigned long long)(jt_va_peak * JT_VA_GRANULE >> 20),
++	    jt_va_allocs, jt_va_frees, jt_va_kept, jt_va_fails, (unsigned long long)jt_next_address);
+ }
+ 
+ /* Leave the GPU up and hand it to the service: address space 0 on the tables,
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+index 113d8ec..60db7ec 100644
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -53,6 +53,7 @@ bool jackpotlte_mali_ready(void);
+ uint32_t jackpotlte_mali_shader_mask(void);
+ bool jackpotlte_mali_parameter(uint32_t which, uint64_t * value);
+ uint64_t jackpotlte_mali_address(uint64_t size);
++void jackpotlte_mali_release(uint64_t gpu, uint64_t size, bool idle);   /* 0214 */
+ bool jackpotlte_mali_map(uint64_t gpu, uint64_t phys);
+ void jackpotlte_mali_mapped(void);
+ void jackpotlte_mali_mapped_range(uint64_t gpu, uint64_t size);
+@@ -274,10 +275,13 @@ JackpotlteMaliUserClient::buffer(uint32_t handle)
+ void
+ JackpotlteMaliUserClient::freeBuffer(struct mali_buffer * b)
+ {
++	bool idle = true;
++
+ 	if (b->last_seq != 0) {
+-		(void)jackpotlte_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
++		idle = jackpotlte_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
+ 	}
+ 	jackpotlte_mali_unmap(b->address, b->size);
++	jackpotlte_mali_release(b->address, b->size, idle);    /* 0214 */
+ 	b->memory->release();
+ 	if (b->surface != NULL) {
+ 		b->surface->release();
+@@ -322,6 +326,7 @@ JackpotlteMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from,
+ 	if (b->address == 0 || !mapped) {
+ 		if (b->address != 0) {
+ 			jackpotlte_mali_unmap(b->address, size);
++			jackpotlte_mali_release(b->address, size, true);        /* 0214 */
+ 		}
+ 		bzero(b, sizeof(*b));
+ 		IOLog("JackpotlteMali: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
