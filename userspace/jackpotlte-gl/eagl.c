@@ -261,13 +261,13 @@ prof_on(void)
  * A helper thread waits until the first byte of a8gl-sample changes, then
  * suspends the render thread about 1000 times a second for 6 s, keeps its pc,
  * lr and frame-pointer chain (12 addresses), and writes them to
- * a8gl-samples.txt, one sample a line.  Nothing is allocated and no lock is
+ * a8gl-samples.txt, one sample a line (pc, lr and up to 30 callers, glca20).  Nothing is allocated and no lock is
  * taken while the render thread is suspended.
  */
 #include <pthread.h>
 static uint64_t ticks_us(uint64_t ticks);
 #define PS_MAX   6000
-#define PS_DEPTH 12
+#define PS_DEPTH 32          /* glca20: 12 stopped inside the submit path */
 static thread_act_t prof_rt = MACH_PORT_NULL;
 
 static int

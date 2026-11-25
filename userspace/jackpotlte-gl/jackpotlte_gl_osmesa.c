@@ -455,6 +455,28 @@ open_library(void)
       return lib.handle != NULL ? 0 : -1;
    tried = 1;
 
+   /* glca20: Mesa's own debug flags for this backboardd (switch file
+    * a8gl-mesadebug, e.g. "perf"), its log in a8gl-mesa-log.txt instead of on
+    * the console.  Read before Mesa is loaded: the screen takes them once. */
+   {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-mesadebug", "r");
+      char flags[64];
+
+      if (f != NULL) {
+         size_t n = fread(flags, 1, sizeof(flags) - 1, f);
+
+         fclose(f);
+         while (n > 0 && (flags[n - 1] == '\n' || flags[n - 1] == '\r' || flags[n - 1] == ' '))
+            n--;
+         flags[n] = '\0';
+         if (n > 0) {
+            setenv("PAN_MESA_DEBUG", flags, 1);
+            setenv("MESA_LOG_FILE", "/private/var/mobile/Library/a8gl-mesa-log.txt", 1);
+            say("glca20: PAN_MESA_DEBUG=%s, Mesa's log in a8gl-mesa-log.txt", flags);
+         }
+      }
+   }
+
    wanted = getenv("JACKPOTLTE_GL_LIBRARY");
    if (wanted != NULL && wanted[0] != '\0') {
       lib.handle = dlopen(wanted, RTLD_NOW | RTLD_LOCAL);
