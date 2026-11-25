@@ -10,7 +10,7 @@
  *                      whole state (textures, attributes, uniforms) of the
  *                      draws that touch a rectangle of the screen.
  *
- * The trace is armed by the file a8gl-trace-on, "X0 Y0 X1 Y1 FRAMES" (screen
+ * The trace is armed by the file a8gl-trace-on, "X0 Y0 X1 Y1 FRAMES [PIXELS [SKIP]]" (screen
  * pixels, top left origin), and armed again each time that file changes.
  * Nothing is traced, and the draws cost one test, while it is not armed.
  */
@@ -281,6 +281,7 @@ static size_t frame_used;
 static bool frame_hit;
 static int armed_frames;
 static int want_pixels;                 /* the trigger's sixth number: dump the rectangle's pixels */
+static int skip_frames;                 /* glca22e: the seventh: frames with a hit left out first */
 static int region[4];                   /* x0 y0 x1 y1, screen pixels, top left origin */
 static unsigned long trace_frame_number, trace_draw_number;
 static time_t trigger_time;
@@ -715,7 +716,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
       trace_draw(false, mode, first, count, 0, NULL);
    }
    next_draw_arrays(context, mode, first, count);
-   if (traced && want_pixels == 2 && draw_inside)
+   if (traced && want_pixels == 2 && draw_inside && skip_frames == 0)
       pixels_after();
 }
 
@@ -729,7 +730,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
       trace_draw(true, mode, 0, count, type, indices);
    }
    next_draw_elements(context, mode, count, type, indices);
-   if (traced && want_pixels == 2 && draw_inside)
+   if (traced && want_pixels == 2 && draw_inside && skip_frames == 0)
       pixels_after();
 }
 
@@ -823,7 +824,9 @@ trace_frame(void)
    if (armed_frames > 0 && trace != NULL) {
       out("F %lu ends after %lu draws\n", trace_frame_number, trace_draw_number);
       trace_draw_number = 0;
-      if (frame_hit && frame_text != NULL) {
+      if (frame_hit && frame_text != NULL && skip_frames > 0) {
+         skip_frames--;          /* glca22e: not written */
+      } else if (frame_hit && frame_text != NULL) {
          fwrite(frame_text, 1, frame_used, trace);
          trace_written += frame_used;
          trace_frame_number++;
@@ -868,9 +871,12 @@ trace_frame(void)
       if (f == NULL)
          return;
       want_pixels = 0;
-      if (fscanf(f, "%d %d %d %d %d %d", &region[0], &region[1], &region[2], &region[3], &frames,
-                 &want_pixels) < 5)
+      skip_frames = 0;
+      if (fscanf(f, "%d %d %d %d %d %d %d", &region[0], &region[1], &region[2], &region[3], &frames,
+                 &want_pixels, &skip_frames) < 5)
          frames = 0;
+      if (skip_frames < 0 || skip_frames > 2000)
+         skip_frames = 0;
       fclose(f);
       if (frames <= 0) {
          pixels_now = want_pixels;
@@ -888,9 +894,9 @@ trace_frame(void)
       trace_written = 0;
       trace_frame_number = 0;
       trace_draw_number = 0;
-      armed_frames = frames > 50 ? 50 : frames;
-      fprintf(trace, "== trace of %d frames with a draw in the rectangle %d,%d-%d,%d\n", armed_frames,
-              region[0], region[1], region[2], region[3]);
+      armed_frames = frames > 60 ? 60 : frames;
+      fprintf(trace, "== trace of %d frames with a draw in the rectangle %d,%d-%d,%d (%d left out first)\n",
+              armed_frames, region[0], region[1], region[2], region[3], skip_frames);
    }
 }
 
