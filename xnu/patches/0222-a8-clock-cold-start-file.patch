@@ -1,0 +1,188 @@
+From f517d5fbe457f01651643cc80b467b1c94ba55cb Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 08:31:42 -0500
+Subject: [PATCH] 0222-a8-clock-cold-start-file.patch
+
+---
+ bsd/dev/a8_files.c  | 43 ++++++++++++++++++++++++
+ bsd/dev/a8_slots.c  | 82 +++++++++++++++++++++++++++++++++++++++++++--
+ bsd/kern/bsd_init.c |  8 +++++
+ 3 files changed, 130 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index b925222..6c3d5ae 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -464,6 +464,49 @@ a8f_write(const char *path, const uint8_t *buf, uint32_t size, bool owner, uint3
+ 	return error;
+ }
+ 
++/*
++ * 0222: for the clock across cold starts (a8_slots.c): a small file stored
++ * the way fput stores one (beside it, synced, renamed over), and read back.
++ * Both refuse before the root file system exists.
++ */
++int a8_files_store(const char *path, const void *buf, uint32_t size);
++int a8_files_load(const char *path, void *buf, uint32_t max, uint32_t *got);
++
++int
++a8_files_store(const char *path, const void *buf, uint32_t size)
++{
++	const char *step = "";
++
++	if (rootvnode == NULLVP) {
++		return ENOENT;
++	}
++	return a8f_write(path, (const uint8_t *)buf, size, true, 0644, 0, 0, &step);
++}
++
++int
++a8_files_load(const char *path, void *buf, uint32_t max, uint32_t *got)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error, resid = 0;
++
++	*got = 0;
++	if (rootvnode == NULLVP) {
++		return ENOENT;
++	}
++	error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)max, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_close(vp, FREAD, ctx);
++	if (!error) {
++		*got = max - (uint32_t)resid;
++	}
++	return error;
++}
++
+ void
+ a8f_end(void)
+ {
+diff --git a/bsd/dev/a8_slots.c b/bsd/dev/a8_slots.c
+index 8a8ed5f..3dfb337 100644
+--- a/bsd/dev/a8_slots.c
++++ b/bsd/dev/a8_slots.c
+@@ -902,17 +902,93 @@ a8b_clock_restore(void)
+ 	    a8b_st.clock + 60u);
+ }
+ 
++/* 0222: and across cold starts.  Every minute the calendar second also goes
++ * into A8B_CLOCK_FILE on USERDATA (written beside, synced, renamed over, as
++ * fput does), and a start with no time (no PC "date", no warm state) takes it
++ * back: in bsd_init just before launchd (a8_clock_cold_restore), or in the
++ * first two minutes as soon as the file can be read.  The phone may have been
++ * off for any time since, so the clock comes back late by that much, which
++ * beats 1970 (aggregated, certificates).  Boot-arg a8clockfile=0 leaves the
++ * file alone. */
++#define A8B_CLOCK_FILE  "/private/var/db/a8-clock"
++extern int a8_files_store(const char *path, const void *buf, uint32_t size); /* a8_files.c */
++extern int a8_files_load(const char *path, void *buf, uint32_t max, uint32_t *got);
++static uint32_t a8b_clock_file_on = 1;
++static volatile bool a8b_clock_file_done;
++
++/* true when there is nothing more to do: the calendar is set (by anyone) or
++ * the file holds nothing usable; false while the file cannot be read yet */
++static bool
++a8b_clock_from_file(const char *when)
++{
++	char text[24];
++	uint32_t got = 0, i;
++	uint64_t v = 0;
++
++	if (a8b_clock_file_on == 0 || a8b_now() >= A8B_CLOCK_MIN) {
++		return true;
++	}
++	if (a8_files_load(A8B_CLOCK_FILE, text, sizeof(text) - 1, &got) != 0 || got == 0) {
++		return false;
++	}
++	text[got] = 0;
++	for (i = 0; text[i] >= '0' && text[i] <= '9' && v <= 0xffffffffull; i++) {
++		v = v * 10 + (uint64_t)(text[i] - '0');
++	}
++	if (v < A8B_CLOCK_MIN || v > 0xffffffffull) {
++		printf("A8 CLOCK: %s holds nothing usable\n", A8B_CLOCK_FILE);
++		return true;
++	}
++	clock_set_calendar_microtime((clock_sec_t)v, 0);
++	printf("A8 CLOCK: calendar set to %llu from %s (%s; the last second saved before the phone went off)\n",
++	    v, A8B_CLOCK_FILE, when);
++	return true;
++}
++
++void a8_clock_cold_restore(void);       /* bsd_init.c, just before launchd */
++
++void
++a8_clock_cold_restore(void)
++{
++	if (a8b_clock_from_file("cold start, before launchd")) {
++		a8b_clock_file_done = true;
++	}
++}
++
+ static void
+ a8b_clock_thread(void *arg __unused, wait_result_t wr __unused)
+ {
++	uint32_t ticks = 0, saved = 0;
++	bool told = false;
++
++	(void)PE_parse_boot_argn("a8clockfile", &a8b_clock_file_on, sizeof(a8b_clock_file_on));
+ 	for (;;) {
+-		uint32_t now = a8b_now();
++		uint32_t now;
+ 
+-		if (now >= A8B_CLOCK_MIN && now != a8b_st.clock) {
++		if (!a8b_clock_file_done && ticks < 120) {
++			a8b_clock_file_done = a8b_clock_from_file("cold start");
++		}
++		now = a8b_now();
++		if (now >= A8B_CLOCK_MIN && now != a8b_st.clock &&
++		    (now - a8b_st.clock >= 30 || now < a8b_st.clock)) {
+ 			a8b_st.clock = now;
+ 			a8b_state_save();
+ 		}
+-		a8b_sleep_ms(30000);
++		if (a8b_clock_file_on != 0 && now >= A8B_CLOCK_MIN &&
++		    (now - saved >= 60 || now < saved)) {
++			char text[16];
++			int len = snprintf(text, sizeof(text), "%u\n", now);
++			int error = a8_files_store(A8B_CLOCK_FILE, text, (uint32_t)len);
++
++			if (error == 0) {
++				saved = now;
++			} else if (!told && ticks >= 120) {
++				printf("A8 CLOCK: %s not written (error %d)\n", A8B_CLOCK_FILE, error);
++				told = true;
++			}
++		}
++		ticks++;
++		a8b_sleep_ms(ticks <= 120 ? 1000 : 30000);
+ 	}
+ }
+ 
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index d26e1ee..6cf4f20 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1048,6 +1048,14 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
+ 
++#if defined(JACKPOTLTE)
++	/* 0222: a cold start takes back the last saved second (a8_slots.c) */
++	{
++		extern void a8_clock_cold_restore(void);
++
++		a8_clock_cold_restore();
++	}
++#endif
+ 	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
+ 	bsd_utaskbootstrap();
+ 
+-- 
+2.43.0
+
