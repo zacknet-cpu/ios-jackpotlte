@@ -1,0 +1,212 @@
+From 4a70e1e7b76288c5eb41c2fde3278ad2956bb7d4 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Tue, 24 Nov 2026 23:22:02 -0500
+Subject: [PATCH] 0215-jackpotlte-gate-in-gpu-worker.patch
+
+---
+ bsd/dev/a5xelte_usb.c                 |  5 +-
+ bsd/dev/jackpotlte_mali.c             | 21 ++++++--
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 70 ++++++++++++++++++++++++++-
+ 3 files changed, 89 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 9f13ef3..290ab75 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1905,10 +1905,11 @@ a8s_command(const char *line)
+ 		}
+ 		/* 0203: "flip a" async SwapEnd, "flip s" synchronous again;
+ 		 * 0207: "flip g" / "flip n" a swap waits for the GPU or not;
+-		 * 0211: "flip o" / "flip e" the gate holds only scan-out jobs or all */
++		 * 0211: "flip o" / "flip e" the gate holds only scan-out jobs or all;
++		 * 0215: "flip k" / "flip u" the GPU worker or the submitter waits */
+ 		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : *rest == 'a' ? 2 : *rest == 's' ? 3 :
+ 		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : *rest == 'd' ? 6 : *rest == 'w' ? 7 :
+-		    *rest == 'o' ? 8 : *rest == 'e' ? 9 : -1;
++		    *rest == 'o' ? 8 : *rest == 'e' ? 9 : *rest == 'k' ? 10 : *rest == 'u' ? 11 : -1;
+ 		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
+ 	} else if (a8s_word(line, "date", &rest)) {
+ 		while (*rest == ' ') {
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index 7505698..0506486 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -1336,6 +1336,7 @@ jackpotlte_mali_submit(uint64_t chain, bool fragment)
+ static struct {
+ 	uint64_t chain, seq, queued;
+ 	bool fragment;
++	bool gate;              /* 0215: waits for the panel in the worker */
+ } jt_queue[JT_MALI_QUEUE];
+ static unsigned jt_queue_head, jt_queue_count;
+ static uint64_t jt_queued_seq, jt_done_seq;
+@@ -1343,6 +1344,8 @@ static bool jt_worker_started;
+ static LCK_MTX_DECLARE(jt_queue_lock, &jt_mali_lock_group);
+ 
+ extern void sweet_fb_gpu_done(uint64_t seq);   /* SweetFramebuffer.cpp, 0209 */
++extern bool sweet_fb_gate_in_worker(void);     /* SweetFramebuffer.cpp, 0215 */
++extern void sweet_fb_gpu_gate_worker(uint64_t seq, uint64_t done);
+ extern kern_return_t sysctl_thread_bind_cpuid(int32_t cpuid);  /* sched_prim.c */
+ 
+ /*
+@@ -1359,7 +1362,7 @@ static void
+ jt_mali_worker(void *parameter, wait_result_t result)
+ {
+ 	uint64_t chain, seq;
+-	bool fragment;
++	bool fragment, gate;
+ 
+ 	(void)parameter;
+ 	(void)result;
+@@ -1399,8 +1402,14 @@ jt_mali_worker(void *parameter, wait_result_t result)
+ 		chain = jt_queue[jt_queue_head].chain;
+ 		seq = jt_queue[jt_queue_head].seq;
+ 		fragment = jt_queue[jt_queue_head].fragment;
++		gate = jt_queue[jt_queue_head].gate;
+ 		queued = jt_queue[jt_queue_head].queued;
+ 		lck_mtx_unlock(&jt_queue_lock);
++		if (gate) {
++			/* 0215: the panel takes the last flip first (jt_done_seq is
++			 * only written by this thread) */
++			sweet_fb_gpu_gate_worker(seq, jt_done_seq);
++		}
+ 		{
+ 			uint64_t ns;
+ 
+@@ -1451,10 +1460,15 @@ jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate)
+ {
+ 	uint64_t seq;
+ 	unsigned at;
++	bool in_worker = false;
+ 
+-	/* 0207: with async SwapEnd, not into a buffer the panel still shows. */
++	/* 0207: with async SwapEnd, not into a buffer the panel still shows;
++	 * 0215: by default the worker waits for that, not this thread. */
+ 	if (gate) {
+-		sweet_fb_gpu_gate();
++		in_worker = sweet_fb_gate_in_worker();
++		if (!in_worker) {
++			sweet_fb_gpu_gate();
++		}
+ 		__atomic_fetch_add(&jt_jobs_gated, 1, __ATOMIC_RELAXED);
+ 	} else {
+ 		__atomic_fetch_add(&jt_jobs_free, 1, __ATOMIC_RELAXED);
+@@ -1483,6 +1497,7 @@ jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate)
+ 	jt_queue[at].chain = chain;
+ 	jt_queue[at].seq = seq;
+ 	jt_queue[at].fragment = fragment;
++	jt_queue[at].gate = in_worker;
+ 	jt_queue[at].queued = mach_absolute_time();
+ 	jt_queue_count++;
+ 	lck_mtx_unlock(&jt_queue_lock);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fd73f22..90dc722 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -574,6 +574,8 @@ extern "C" void sweet_fb_gpu_gate(void);
+ extern "C" void sweet_fb_gpu_done(uint64_t seq);
+ extern "C" bool sweet_fb_is_scanout(uint64_t pa);               /* 0211 */
+ extern "C" bool sweet_fb_gate_scanout_only(void);               /* 0211 */
++extern "C" bool sweet_fb_gate_in_worker(void);                 /* 0215 */
++extern "C" void sweet_fb_gpu_gate_worker(uint64_t seq, uint64_t done);
+ extern "C" void jackpotlte_mali_report(void);                   /* jackpotlte_mali.c, 0211 */
+ 
+ /* 0211: which GPU jobs wait in sweet_fb_gpu_gate().  Boot-arg a8gatescan
+@@ -599,6 +601,33 @@ sweet_fb_gate_scanout_only(void)
+ 	return a8_gate_scan_on();
+ }
+ 
++/* 0215: where a gated job waits for the panel.  Boot-arg a8gatewk (default 1)
++ * and console "flip k": in the GPU worker, right before the job starts, so
++ * the submitting thread (backboardd's render thread) goes on building the
++ * next pass; "flip u": in the submitting thread, as 0207-0214.  The worker
++ * runs jobs in order, so when it reaches a gated job every flip deferred to
++ * an earlier job has been programmed (sweet_fb_gpu_done) and only the panel
++ * is left to wait for. */
++static int           a8_gate_worker = -1;
++static uint64_t      a8_gate_worker_jobs, a8_gate_worker_heals;
++
++static bool
++a8_gate_worker_on(void)
++{
++	if (a8_gate_worker < 0) {
++		int on = 1;
++		PE_parse_boot_argn("a8gatewk", &on, sizeof(on));
++		a8_gate_worker = on != 0;
++	}
++	return a8_gate_worker > 0;
++}
++
++extern "C" bool
++sweet_fb_gate_in_worker(void)
++{
++	return a8_gate_worker_on();
++}
++
+ #define A8_FB_RESERVED          0x1400000ull    /* reserved-memory framebuffer@0xEC000000 */
+ #define A8_IDMA0                0x148b1000ul
+ #define A8_IDMA_SRC_SIZE        0x10u
+@@ -702,6 +731,36 @@ sweet_fb_gpu_gate(void)
+ 	a8_gpu_gate_us += us;
+ }
+ 
++/* 0215: the GPU worker, before it starts job `seq` that was queued gated;
++ * `done` is the last job it finished.  A flip deferred to a finished job is
++ * programmed here if nobody did (it never should be left), then the job waits,
++ * at most 20 ms, until the panel took the last update. */
++extern "C" void
++sweet_fb_gpu_gate_worker(uint64_t seq, uint64_t done)
++{
++	uint64_t defer;
++	uint32_t us;
++
++	(void)seq;
++	if (!a8_flip_async || !a8_flip_gpu_on()) {
++		return;
++	}
++	a8_gate_worker_jobs++;
++	defer = a8_defer_seq;
++	if (defer != 0 && defer <= done) {
++		sweet_fb_gpu_done(defer);
++		a8_gate_worker_heals++;
++	}
++	/* the flip's register write comes before a8_defer_seq is cleared */
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	if (!a8_scan_pending()) {
++		return;
++	}
++	us = a8_scan_settle();
++	a8_gpu_gates++;
++	a8_gpu_gate_us += us;
++}
++
+ /* Point DPP0 at a buffer and ask for the update (0191); a8_scan_lock held. */
+ static void
+ a8_scan_program(uint32_t height, uint32_t addr, uint32_t width)
+@@ -1051,6 +1110,11 @@ sweet_fb_flip_set(int on)
+ 		a8_gate_scan = on == 8;
+ 		on = -1;
+ 	}
++	if (on == 10 || on == 11) {                     /* 0215: "flip k" / "flip u" */
++		(void)a8_gate_worker_on();
++		a8_gate_worker = on == 10;
++		on = -1;
++	}
+ 	if (on >= 0) {
+ 		(void)a8_flip_on();
+ 		if (fb != NULL) {
+@@ -1073,8 +1137,10 @@ sweet_fb_flip_set(int on)
+ 	IOLog("A8 FLIP: deferred flips %s: %llu left to the GPU worker, %llu done by it; "
+ 	    "%llu jobs waited for one (%llu us)\n", a8_flip_defer_on() ? "on" : "off",
+ 	    a8_flip_deferred, a8_flip_defer_done, a8_gate_defer, a8_gate_defer_us);
+-	IOLog("A8 FLIP: the gate holds %s\n", a8_gate_scan_on() ?
+-	    "only fragment jobs naming a scan-out buffer (flip o)" : "every job (flip e)");
++	IOLog("A8 FLIP: the gate holds %s, %s; %llu waits in the worker, %llu flips it programmed late\n",
++	    a8_gate_scan_on() ? "only fragment jobs naming a scan-out buffer (flip o)" : "every job (flip e)",
++	    a8_gate_worker_on() ? "in the GPU worker (flip k)" : "in the submitting thread (flip u)",
++	    a8_gate_worker_jobs, a8_gate_worker_heals);
+ 	jackpotlte_mali_report();
+ 	return a8_flip_on();
+ }
+-- 
+2.43.0
+
