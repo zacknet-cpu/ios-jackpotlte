@@ -110,6 +110,10 @@ needs_exe_wrapper = true
 INI
 
 # ---- configure and build ----------------------------------------------------
+# 11-25: link-time optimization and scheduling for the A8's big cores
+# (Cortex-A73; the render thread is bound to one), P3 item 7.  The build dir
+# keeps old options, so a changed line here needs a fresh build dir (CI always
+# has one).
 # Speed over size since 11-24 (-O3; was -Os): the render thread spends most of
 # a heavy frame in Mesa's draw path, and the library now ships compressed to
 # /private/var/mobile/Library instead of in the iOS root.  softpipe is here so
@@ -119,7 +123,8 @@ if [ ! -f "$build/build.ninja" ]; then
 	echo "--- meson setup ---"
 	meson setup "$build" "$src" --cross-file cross.ini --wrap-mode=nofallback \
 		--prefix=/jackpotlte --libdir=lib --buildtype=release \
-		-Doptimization=3 -Db_ndebug=true \
+		-Doptimization=3 -Db_ndebug=true -Db_lto=true \
+		-Dc_args=-mtune=cortex-a73 -Dcpp_args=-mtune=cortex-a73 \
 		-Dplatforms= -Dgallium-drivers=softpipe,panfrost -Dvulkan-drivers= \
 		-Dglx=disabled -Degl=disabled -Dgbm=disabled -Dosmesa=true \
 		-Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled \
