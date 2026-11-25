@@ -63,6 +63,52 @@ static uint64_t syncfile_seq[JT_SYNCOBJS];
 static uint64_t last_seq;
 static uint32_t next_syncobj = 1;
 
+/*
+ * Which job last used each buffer, as the kernel keeps it (0154:527-540), so a
+ * WAIT_BO for a buffer whose last job is known to be done is answered here.
+ * panfrost asks with a non-blocking WAIT_BO for every cached buffer it reuses
+ * (pan_bo.c's cache fetch, mostly transient pool memory), and that round trip
+ * was 9% of backboardd's render thread while scrolling Settings (11-25
+ * profile, a8gl-prof "2").  done_seq is the highest job number a kernel wait
+ * said was finished; jobs finish in order (one queue, 0153), so every buffer
+ * whose last job is at or below it is idle.  BO_SEQ_BUSY marks a buffer while
+ * a submission naming it is on its way, so nothing says idle for it then.
+ * Only "idle" is ever answered here; anything else goes to the kernel.
+ */
+#define BO_SEQ_BUSY             UINT64_MAX
+static uint64_t bo_seq[JT_MAPS];
+static uint64_t done_seq;
+
+static void
+note_done(uint64_t seq)
+{
+	uint64_t old = __atomic_load_n(&done_seq, __ATOMIC_RELAXED);
+
+	while (seq > old && !__atomic_compare_exchange_n(&done_seq, &old, seq, false,
+	    __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+	}
+}
+
+static void
+bo_seq_set(uint32_t handle, uint64_t seq)
+{
+	if (handle < JT_MAPS) {
+		__atomic_store_n(&bo_seq[handle], seq, __ATOMIC_RELEASE);
+	}
+}
+
+/* A kernel wait for job `seq`; a success says every job up to it is done. */
+static int
+wait_seq_noted(struct jt_gpu *g, uint64_t seq, int64_t timeout_ns)
+{
+	int ret = jt_wait_seq(g, seq, timeout_ns);
+
+	if (ret == 0) {
+		note_done(seq);
+	}
+	return ret;
+}
+
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
  * The connection.
  */
@@ -112,6 +158,11 @@ jackpotlte_drm_attach(struct jt_gpu *g)
 	memset(syncfile_seq, 0, sizeof(syncfile_seq));
 	last_seq = 0;
 	next_syncobj = 1;
+	/* A new connection numbers its jobs from 1 again. */
+	for (uint32_t i = 0; i < JT_MAPS; i++) {
+		bo_seq[i] = 0;
+	}
+	__atomic_store_n(&done_seq, 0, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&sync_lock);
 }
 
@@ -203,6 +254,7 @@ buffer_close(struct jt_gpu *g, uint32_t handle)
 	if (address != NULL) {
 		(void)jt_bo_unmap(g, handle, address, size);
 	}
+	bo_seq_set(handle, 0);          /* a new buffer under this handle: no job yet */
 	return jt_bo_release(g, handle);
 }
 
@@ -233,11 +285,23 @@ submit(struct jt_gpu *g, void *arg, size_t size)
 		return -EINVAL;
 	}
 	handles = (const uint32_t *) (uintptr_t) request->bo_handles;
+	if (handles != NULL) {
+		for (uint32_t i = 0; i < request->bo_handle_count; i++) {
+			bo_seq_set(handles[i], BO_SEQ_BUSY);
+		}
+	}
 	/* The kernel copyin()s the handle array itself, so only its address
 	 * travels (0154:527-540).  It reads just the fragment bit of
 	 * `requirements`. */
 	seq = jt_submit(g, request->jc, (request->requirements & JT_JD_REQ_FS) != 0,
 	    request->bo_handle_count != 0 ? handles : NULL, request->bo_handle_count, &error);
+	if (handles != NULL) {
+		/* Not queued: the buffers keep a busy mark, and their WAIT_BOs go to
+		 * the kernel, which knows what really ran. */
+		for (uint32_t i = 0; seq != 0 && i < request->bo_handle_count; i++) {
+			bo_seq_set(handles[i], seq);
+		}
+	}
 	if (seq == 0) {
 		return error != 0 ? error : -EIO;
 	}
@@ -255,11 +319,23 @@ static int
 wait_bo(struct jt_gpu *g, void *arg, size_t size)
 {
 	struct jt_wait_bo_req *request = arg;
+	uint64_t seq = BO_SEQ_BUSY;
+	int ret;
 
 	if (arg == NULL || size < sizeof(*request)) {
 		return -EINVAL;
 	}
-	return jt_wait_bo(g, request->handle, request->timeout_ns);
+	if (request->handle < JT_MAPS) {
+		seq = __atomic_load_n(&bo_seq[request->handle], __ATOMIC_ACQUIRE);
+		if (seq != BO_SEQ_BUSY && seq <= __atomic_load_n(&done_seq, __ATOMIC_ACQUIRE)) {
+			return 0;       /* its last job is done: idle, no round trip */
+		}
+	}
+	ret = jt_wait_bo(g, request->handle, request->timeout_ns);
+	if (ret == 0 && seq != BO_SEQ_BUSY) {
+		note_done(seq);
+	}
+	return ret;
 }
 
 static int
@@ -358,7 +434,7 @@ wait_seq(struct jt_gpu *g, void *arg, size_t size)
 	if (arg == NULL || size < sizeof(*request)) {
 		return -EINVAL;
 	}
-	return jt_wait_seq(g, request->seq, request->timeout_ns);
+	return wait_seq_noted(g, request->seq, request->timeout_ns);
 }
 
 static int
@@ -623,7 +699,7 @@ jackpotlte_drm_wait_seq(uint64_t seq, int64_t relative_ns)
 	if (g == NULL) {
 		return -ENODEV;
 	}
-	return jt_wait_seq(g, seq, relative_ns);
+	return wait_seq_noted(g, seq, relative_ns);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -733,7 +809,7 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned cou
 		if (g == NULL) {
 			return -ENODEV;
 		}
-		int ret = jt_wait_seq(g, seq, timeout_nsec);
+		int ret = wait_seq_noted(g, seq, timeout_nsec);
 
 		if (ret != 0) {
 			return ret;

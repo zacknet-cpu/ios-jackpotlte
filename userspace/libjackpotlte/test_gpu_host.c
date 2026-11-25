@@ -503,6 +503,38 @@ test_drm_ioctl(void)
 	CHECK(f->selector == JT_WAIT, "selector %#x", f->selector);
 	CHECK(waited.seq == 42, "waited for job %llu", (unsigned long long)waited.seq);
 
+	/* A WAIT_BO for a buffer whose last job is known done (job 42, just
+	 * waited for) or that no job used is answered without the kernel; one
+	 * for a buffer a later job names goes to the kernel. */
+	{
+		struct jt_wait_bo_req bo;
+		uint32_t again[1] = { 7 };
+
+		memset(&bo, 0, sizeof(bo));
+		bo.handle = 7;
+		f->selector = 0;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+		    &bo, sizeof(bo)) == 0, "wait_bo for a done buffer failed");
+		CHECK(f->selector == 0, "a done buffer's wait_bo went to the kernel (%#x)", f->selector);
+		bo.handle = 9;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+		    &bo, sizeof(bo)) == 0, "wait_bo for an unused buffer failed");
+		CHECK(f->selector == 0, "an unused buffer's wait_bo went to the kernel (%#x)", f->selector);
+
+		memset(&submit, 0, sizeof(submit));
+		submit.jc = 0x01000000;
+		submit.bo_handles = (uint64_t)(uintptr_t)again;
+		submit.bo_handle_count = 1;
+		f->job_seq = 43;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_SUBMIT, sizeof(submit)),
+		    &submit, sizeof(submit)) == 0, "second submit failed");
+		bo.handle = 7;
+		f->selector = 0;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+		    &bo, sizeof(bo)) == 0, "wait_bo for a busy buffer failed");
+		CHECK(f->selector == JT_PANFROST_WAIT_BO, "a busy buffer's wait_bo did not reach the kernel");
+	}
+
 	/* A surface: described, and then made.  The field names differ from the
 	 * kernel's; the structure that travels is the kernel's. */
 	{
