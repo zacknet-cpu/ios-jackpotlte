@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index fa8a1ef..13a6057 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -1138,6 +1138,17 @@ static bool jt_worker_started;
+ static LCK_MTX_DECLARE(jt_queue_lock, &jt_mali_lock_group);
+ 
+ extern void sweet_fb_gpu_done(uint64_t seq);   /* SweetFramebuffer.cpp, 0209 */
++extern kern_return_t sysctl_thread_bind_cpuid(int32_t cpuid);  /* sched_prim.c */
++
++/*
++ * 0212: the worker on a core of its own.  It is a kernel thread, above every
++ * user thread, and it polls each job for its first 300 us; woken from a
++ * submit by backboardd's render thread, which glca14 binds to cpu 7, it
++ * could take that core from the very thread that feeds it (0211 on 11-25:
++ * GPU wait -1.4 ms a frame, yet build +0.6 ms and between frames +0.8 ms).
++ * Boot-arg a8gpucpu: the cpu (default 5, an A53; -1 leaves it unbound).
++ */
++static int jt_worker_cpu = -1;
+ 
+ static void
+ jt_mali_worker(void *parameter, wait_result_t result)
+@@ -1147,6 +1158,15 @@ jt_mali_worker(void *parameter, wait_result_t result)
+ 
+ 	(void)parameter;
+ 	(void)result;
++	{
++		int cpu = 5;
++
++		(void)PE_parse_boot_argn("a8gpucpu", &cpu, sizeof(cpu));
++		if (cpu >= 0 && cpu < 8 && sysctl_thread_bind_cpuid(cpu) == KERN_SUCCESS) {
++			jt_worker_cpu = cpu;
++		}
++		printf("JACKPOTLTE MALI: job worker on cpu %d\n", jt_worker_cpu);
++	}
+ 	for (;;) {
+ 		lck_mtx_lock(&jt_queue_lock);
+ 		while (jt_queue_count == 0) {
+@@ -1273,10 +1293,11 @@ jackpotlte_mali_report(void)
+ 	jt_tune();
+ 	printf("A8 GPU: jobs fragment %llu (avg %llu us, max %llu us), other %llu (avg %llu us, "
+ 	    "max %llu us); failed %llu (%llu seen early); held for the panel %llu, not held %llu; "
+-	    "MMU range flushes %llu, full updates %llu, slow %llu; nap %u us; allocator at %#llx\n",
++	    "MMU range flushes %llu, full updates %llu, slow %llu; nap %u us; worker cpu %d; "
++	    "allocator at %#llx\n",
+ 	    jt_jobs[0], avg0, jt_job_max_ns[0] / 1000, jt_jobs[1], avg1, jt_job_max_ns[1] / 1000,
+ 	    jt_jobs_failed, jt_jobs_fast_fail, jt_jobs_gated, jt_jobs_free, jt_mmu_flushes,
+-	    jt_mmu_updates, jt_mmu_slow, jt_nap_us, (unsigned long long)jt_next_address);
++	    jt_mmu_updates, jt_mmu_slow, jt_nap_us, jt_worker_cpu, (unsigned long long)jt_next_address);
+ }
+ 
+ /* Leave the GPU up and hand it to the service: address space 0 on the tables,
