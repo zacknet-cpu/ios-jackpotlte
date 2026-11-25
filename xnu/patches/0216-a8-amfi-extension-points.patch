@@ -1,0 +1,231 @@
+From 39916bd7a2bb5d6c9b176291dac2aa6328336165 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 00:15:26 -0500
+Subject: [PATCH] 0216-a8-amfi-extension-points.patch
+
+---
+ bsd/dev/a5xelte_usb.c | 38 ++++++++++++++++++++++++++++
+ bsd/kern/kern_exec.c  | 52 +++++++++++++++++++++++++++-----------
+ bsd/kern/sweet_amfi.c | 58 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 133 insertions(+), 15 deletions(-)
+
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 290ab75..5053ae7 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -267,6 +267,43 @@ static LCK_GRP_DECLARE(a8_top_grp, "a8top");
+ static LCK_MTX_DECLARE(a8_top_lock, &a8_top_grp);
+ extern task_t proc_task(proc_t);
+ 
++/*
++ * 0216: WidgetKit extensions get a CPU limit of their own once app extensions
++ * run (sweet_amfi.c, 0x60).  On the Galaxy S7 port CalendarWidgetExtension
++ * re-evaluated its SwiftUI graph without end, two cores at 100% for minutes
++ * after every boot; refusing it was worse (SpringBoard kept asking), and
++ * XNU's task-wide limit (proc_set_task_ruse_cpu, THROTTLE: the task's threads
++ * block once their share of each second is spent) let it run and draw at a
++ * fixed cost (wardevsa/ios-a5xelte 0324).  Applied the first time a pass sees
++ * the process.  Boot-arg a8widgetcap=N percent of one core (default 30, 0 off).
++ */
++extern int proc_set_task_ruse_cpu(task_t task, uint16_t policy, uint8_t percentage,
++    uint64_t interval, uint64_t deadline, int cpumon_entitled);
++#define A8_RUSE_THROTTLE        0x01    /* TASK_POLICY_RESOURCE_ATTRIBUTE_THROTTLE */
++
++static void
++a8_top_cap(task_t task, const char *name)
++{
++	static int percent = -1;
++	static unsigned told;
++	bool widget = false;
++
++	if (percent < 0) {
++		percent = 30;
++		(void)PE_parse_boot_argn("a8widgetcap", &percent, sizeof(percent));
++	}
++	for (const char *c = name; *c != '\0' && !widget; c++) {
++		widget = strncmp(c, "Widge", 5) == 0;
++	}
++	if (percent <= 0 || percent > 100 || !widget) {
++		return;
++	}
++	int err = proc_set_task_ruse_cpu(task, A8_RUSE_THROTTLE, (uint8_t)percent, 0, 0, 1);
++	if (told++ < 24) {
++		printf("A8 CAP: %s limited to %d%% of a core (%d)\n", name, percent, err);
++	}
++}
++
+ static int
+ a8_top_proc(proc_t p, void *arg __unused)
+ {
+@@ -291,6 +328,7 @@ a8_top_proc(proc_t p, void *arg __unused)
+ 		a8_top[i].pid = pid;
+ 		a8_top[i].abs = abs;            /* first sight: its time before now is not counted */
+ 		proc_name(pid, a8_top[i].name, sizeof(a8_top[i].name));
++		a8_top_cap(task, a8_top[i].name);
+ 	}
+ 	a8_top[i].delta = abs > a8_top[i].abs ? abs - a8_top[i].abs : 0;
+ 	a8_top[i].abs = abs;
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 7226400..02a6284 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5769,6 +5769,34 @@ extern bool a8_tee_wants(const char *name, size_t len);        /* bsd/dev/mem.c,
+ static TUNABLE_STR(exec_deny_conf, 256, "a8noexec", "");
+ static const char exec_deny_default[] =
+     "vmd,searchd,ReportCrash,aggregated,analyticsd,cloudd,homed,driverkitd,fairplayd.H2,bluetoothd";
++/*
++ * 0216: refused whatever a8noexec says (only a8noexec=- lets them run), once
++ * app extensions are allowed (sweet_amfi.c, 0x60): the speech synthesizers'
++ * audio units abort as PlugInKit starts them and are started again all
++ * session (Galaxy S7 port, wardevsa/ios-a5xelte 0325: 54 crashes a boot), and
++ * AegirPoster, which launchd kept retrying there (0315).
++ */
++static const char exec_deny_ext[] =
++    "SiriTTSSynthesizerAU,KonaSynthesizer,MacinTalkAUSP,AegirPoster";
++
++static bool
++exec_deny_listed(const char *p, const char *name, size_t namelen)
++{
++	while (*p != 0) {
++		const char *word = p;
++
++		while (*p != 0 && *p != ',') {
++			p++;
++		}
++		if ((size_t)(p - word) == namelen && strncmp(word, name, namelen) == 0) {
++			return true;
++		}
++		while (*p == ',') {
++			p++;
++		}
++	}
++	return false;
++}
+ 
+ static bool
+ exec_denied(struct image_params *imgp)
+@@ -5776,6 +5804,7 @@ exec_denied(struct image_params *imgp)
+ 	const char *p = exec_deny_conf[0] != 0 ? exec_deny_conf : exec_deny_default;
+ 	const char *name;
+ 	size_t namelen;
++	bool listed, ext;
+ 
+ 	if (p[0] == '-' || imgp->ip_ndp == NULL) {
+ 		return false;
+@@ -5785,23 +5814,16 @@ exec_denied(struct image_params *imgp)
+ 	if (name == NULL || namelen == 0) {
+ 		return false;
+ 	}
+-	while (*p != 0) {
+-		const char *word = p;
+-
+-		while (*p != 0 && *p != ',') {
+-			p++;
+-		}
+-		if ((size_t)(p - word) == namelen && strncmp(word, name, namelen) == 0) {
+-			static uint32_t said;
++	listed = exec_deny_listed(p, name, namelen);
++	ext = !listed && exec_deny_listed(exec_deny_ext, name, namelen);
++	if (listed || ext) {
++		static uint32_t said;
+ 
+-			if (said++ < 40) {
+-				printf("A8 NOEXEC: %.*s refused (a8noexec)\n", (int)namelen, name);
+-			}
+-			return true;
+-		}
+-		while (*p == ',') {
+-			p++;
++		if (said++ < 40) {
++			printf("A8 NOEXEC: %.*s refused (%s)\n", (int)namelen, name,
++			    listed ? "a8noexec" : "0216 list");
+ 		}
++		return true;
+ 	}
+ 	return false;
+ }
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 87e41d4..e452bdb 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -44,6 +44,7 @@
+ #include <sys/param.h>
+ #include <kern/kalloc.h>
+ #include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -506,6 +507,57 @@ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * A8 (0216): the policy named "AMFI" that user space asks with
++ * __mac_syscall("AMFI", call, arg).  Request 0x60 (libamfi's
++ * amfi_interface_query_bootarg_state) reads 64 bits of flags, one per boot-arg
++ * that switches part of AMFI off.  ExtensionKit asks it, and unless one of the
++ * bits 0x86 is set it wants the signature of the system's table of extension
++ * points (/System/Library/xpc/extensions.plist.sig) checked by AMFI's IOKit
++ * service, which this phone does not have: the table is then not read,
++ * LaunchServices knows no extension point, every application extension is
++ * refused, and PosterBoard asserts with no poster provider (11-24: "ExtensionKit
++ * has updated extensions with zero results", error -2220 for CollectionsPoster
++ * and LegacyPoster, PBFPosterExtensionDataStore.m:3431).  Found by the FiiO
++ * JM21 kernel (kern_minimac.c), used by Jesvi-iOS (jesvi-eulah/Jesvi-iOS,
++ * APSL 2.0) and the Galaxy S7 port (wardevsa/ios-a5xelte 0306), where iOS went
++ * from 1 to 516 plug-ins.  Every other request gets ENOPOLICY, what user space
++ * got before (no policy of that name).  Boot-arg a8amfi60=0: not answered.
++ */
++static uint32_t a8_amfi_query = 1;
++static uint32_t a8_amfi_query_told;
++
++static int
++a8_amfi_query_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	uint64_t state = 0x86;
++
++	if (call != 0x60 || a8_amfi_query == 0) {
++		return ENOPOLICY;
++	}
++	if (a8_amfi_query_told++ < 6) {
++		char name[32];
++
++		proc_selfname(name, sizeof(name));
++		printf(PORT_NAME " AMFI: %s asked for the boot-arg state: 0x86 (extension points allowed)\n", name);
++	}
++	return copyout(&state, arg, sizeof(state));
++}
++
++static const struct mac_policy_ops a8_amfi_query_ops = {
++	.mpo_policy_syscall = a8_amfi_query_syscall,
++};
++
++static struct mac_policy_conf a8_amfi_query_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = PORT_NAME " answers to AMFI's user-space queries",
++	.mpc_ops = &a8_amfi_query_ops,
++};
++
++static mac_policy_handle_t a8_amfi_query_handle;
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -518,5 +570,11 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf(PORT_NAME " Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	(void)PE_parse_boot_argn("a8amfi60", &a8_amfi_query, sizeof(a8_amfi_query));
++	error = mac_policy_register(&a8_amfi_query_conf, &a8_amfi_query_handle, NULL);
++	printf(PORT_NAME " AMFI: answers to user-space queries (0x60 %s) %s (%d)\n",
++	    a8_amfi_query ? "on" : "off, a8amfi60=0", error ? "NOT registered" : "registered", error);
++#endif
+ }
+ #endif /* SWEET || A5XELTE */
+-- 
+2.43.0
+
