@@ -94,6 +94,10 @@ static struct {
    void (*scissor)(GLint, GLint, GLsizei, GLsizei);
    void (*get_attached_shaders)(GLuint, GLsizei, GLsizei *, GLuint *);
    void (*get_shader_source)(GLuint, GLsizei, GLsizei *, GLchar *);
+   void (*get_floatv)(GLenum, GLfloat *);                  /* glca22d */
+   void (*get_booleanv)(GLenum, GLboolean *);
+   void (*clear_color)(GLfloat, GLfloat, GLfloat, GLfloat);
+   void (*color_mask)(GLboolean, GLboolean, GLboolean, GLboolean);
    int loaded;
 } gl;
 
@@ -174,6 +178,10 @@ load(void)
    PROC(scissor, "glScissor");
    PROC(get_attached_shaders, "glGetAttachedShaders");
    PROC(get_shader_source, "glGetShaderSource");
+   PROC(get_floatv, "glGetFloatv");
+   PROC(get_booleanv, "glGetBooleanv");
+   PROC(clear_color, "glClearColor");
+   PROC(color_mask, "glColorMask");
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -983,6 +991,178 @@ static int alt_on;                       /* a8gl-alt "1": the alpha threshold st
 static int skipnp_on = 1;
 static bool plain_skip;                  /* plain_begin: leave this draw out */
 static unsigned long skipped_np;         /* how many were left out */
+
+/*
+ * glca22d: a clear that Apple's tile-based GPU never writes. Before each of
+ * the variable blur's "vrd" passes CoreAnimation binds the target again,
+ * clears it (to 0,0,0,0) and draws reading the same texture: on Apple's GPU the
+ * clear only sets the tile memory, and the pass reads the texture's memory,
+ * which still holds the backdrop copied there by the pass before (trace 11-25:
+ * "C bind fb 103, clear 0x4000 fb 103" between the copy and the vrd draw; the
+ * copy read back 1087c7ff, after the clear 00000000). Mesa writes the clear,
+ * so the backdrop was gone before the blur read it: the Dynamic Island's black
+ * block. Here a colour clear of a target whose texture was drawn into earlier
+ * and that nothing has drawn into since it was bound again is held back; a
+ * no-program draw that reads that texture drops it (and is left out itself),
+ * anything else makes it happen first: the next draw, another framebuffer or
+ * attachment, a read, a flush, finish or fence. Switch a8gl-deferclear "0".
+ */
+#define FB_NAMES        8192
+#define TEX_NAMES       65536
+static int deferclear_on = 1;
+static GLuint cur_fb, cur_tex;                 /* the bound framebuffer and its colour texture */
+static GLuint fb_tex[FB_NAMES];               /* colour texture of each framebuffer (0: not known) */
+static uint8_t tex_drawn[TEX_NAMES];          /* drawn into since it was last attached */
+static unsigned draws_since_bind;
+static unsigned long clears_held, clears_dropped;
+static struct {
+   bool active;
+   void *context;
+   GLbitfield mask;
+   GLfloat colour[4];
+   GLboolean scissor_on, colour_mask[4];
+   GLint box[4];
+} held;
+static bool plain_reads_target;               /* plain_begin: a skipped draw read its own target */
+static void (*next_clear)(void *, GLbitfield);
+static void (*next_bind_framebuffer)(void *, GLenum, GLuint);
+static void (*next_framebuffer_texture_2d)(void *, GLenum, GLenum, GLenum, GLuint, GLint);
+static void (*next_read_pixels)(void *, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+static void (*next_flush)(void *);
+static void (*next_finish)(void *);
+static GLsync (*next_fence_sync)(void *, GLenum, GLbitfield);
+
+/* the held clear, now (with the state it was asked with) */
+static void
+held_clear_now(void)
+{
+   GLfloat colour[4];
+   GLboolean scissor_on, mask[4];
+   GLint box[4];
+
+   if (!held.active)
+      return;
+   held.active = false;
+   gl.get_floatv(0x0C22 /* COLOR_CLEAR_VALUE */, colour);
+   gl.get_booleanv(0x0C23 /* COLOR_WRITEMASK */, mask);
+   gl.get_integerv(0x0C10 /* SCISSOR_BOX */, box);
+   scissor_on = gl.is_enabled(0x0C11 /* SCISSOR_TEST */);
+   gl.clear_color(held.colour[0], held.colour[1], held.colour[2], held.colour[3]);
+   gl.color_mask(held.colour_mask[0], held.colour_mask[1], held.colour_mask[2], held.colour_mask[3]);
+   gl.scissor(held.box[0], held.box[1], held.box[2], held.box[3]);
+   if (held.scissor_on)
+      gl.enable(0x0C11);
+   else
+      gl.disable(0x0C11);
+   next_clear(held.context, held.mask);
+   gl.clear_color(colour[0], colour[1], colour[2], colour[3]);
+   gl.color_mask(mask[0], mask[1], mask[2], mask[3]);
+   gl.scissor(box[0], box[1], box[2], box[3]);
+   if (scissor_on)
+      gl.enable(0x0C11);
+   else
+      gl.disable(0x0C11);
+}
+
+static bool
+held_procs(void)
+{
+   return gl.get_floatv && gl.get_booleanv && gl.clear_color && gl.color_mask && gl.scissor && gl.is_enabled &&
+          gl.enable && gl.disable && gl.get_integerv;
+}
+
+static void
+my_glClear(void *context, GLbitfield mask)
+{
+   jackpotlte_gl_use(context);
+   load();
+   if (held.active)
+      held_clear_now();
+   if (deferclear_on && held_procs() && mask == 0x4000 /* COLOR_BUFFER_BIT */ && cur_fb != 0 && cur_tex != 0 &&
+       cur_tex < TEX_NAMES && tex_drawn[cur_tex] && draws_since_bind == 0) {
+      held.active = true;
+      held.context = context;
+      held.mask = mask;
+      gl.get_floatv(0x0C22, held.colour);
+      gl.get_booleanv(0x0C23, held.colour_mask);
+      gl.get_integerv(0x0C10, held.box);
+      held.scissor_on = gl.is_enabled(0x0C11);
+      clears_held++;
+      return;
+   }
+   next_clear(context, mask);
+}
+
+static void
+my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
+{
+   jackpotlte_gl_use(context);
+   if (held.active)
+      held_clear_now();
+   next_bind_framebuffer(context, target, framebuffer);
+   if (target == 0x8D40 /* FRAMEBUFFER */ || target == 0x8CA9 /* DRAW_FRAMEBUFFER */) {
+      cur_fb = framebuffer;
+      cur_tex = framebuffer < FB_NAMES ? fb_tex[framebuffer] : 0;
+      draws_since_bind = 0;
+   }
+}
+
+static void
+my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
+                          GLint level)
+{
+   jackpotlte_gl_use(context);
+   if (held.active)
+      held_clear_now();
+   next_framebuffer_texture_2d(context, target, attachment, textarget, texture, level);
+   if (attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */) {
+      if (cur_fb < FB_NAMES)
+         fb_tex[cur_fb] = level == 0 ? texture : 0;
+      cur_tex = level == 0 ? texture : 0;
+      if (texture < TEX_NAMES)
+         tex_drawn[texture] = 0;
+   }
+}
+
+static void
+my_glReadPixels(void *context, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
+                void *pixels)
+{
+   jackpotlte_gl_use(context);
+   if (held.active)
+      held_clear_now();
+   next_read_pixels(context, x, y, width, height, format, type, pixels);
+}
+
+static void
+my_glFlush(void *context)
+{
+   if (held.active) {
+      jackpotlte_gl_use(context);
+      held_clear_now();
+   }
+   next_flush(context);
+}
+
+static void
+my_glFinish(void *context)
+{
+   if (held.active) {
+      jackpotlte_gl_use(context);
+      held_clear_now();
+   }
+   next_finish(context);
+}
+
+static GLsync
+my_glFenceSync(void *context, GLenum condition, GLbitfield flags)
+{
+   if (held.active) {
+      jackpotlte_gl_use(context);
+      held_clear_now();
+   }
+   return next_fence_sync(context, condition, flags);
+}
 static GLint wide_reach = -1;          /* its "reach" uniform */
 static int wide_on = 1;                /* a8gl-wide "0": the 16-sample stand-in instead */
 
@@ -1142,6 +1322,7 @@ plain_begin(void *context, struct plain_state *state)
    float reach = 0;
 
    plain_skip = false;
+   plain_reads_target = false;
    if (!plain_on)
       return false;
    jackpotlte_gl_use(context);
@@ -1167,6 +1348,7 @@ plain_begin(void *context, struct plain_state *state)
       gl.active_texture((GLenum)state->active);
       census(function, texture0 == 0 ? "no texture, not drawn" : "reads what it writes, not drawn");
       plain_skip = true;
+      plain_reads_target = texture0 != 0;
       return false;
    }
 
@@ -1523,8 +1705,9 @@ bounds_end(struct bounds_state *state)
    if (!state->was_on)
       gl.disable(0x0C11);
    if ((bounds_draws & 16383) == 0)
-      say("glca21: %lu draws, %lu scissored to their vertices, %lu left alone; %lu no-program draws left out",
-          bounds_draws, bounds_cut, bounds_left, skipped_np);
+      say("glca21: %lu draws, %lu scissored to their vertices, %lu left alone; %lu no-program draws left out; "
+          "%lu clears held, %lu dropped",
+          bounds_draws, bounds_cut, bounds_left, skipped_np, clears_held, clears_dropped);
 }
 
 static void
@@ -1537,10 +1720,19 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 
    if (!ours && plain_skip && skipnp_on) {
       skipped_np++;
+      if (held.active && plain_reads_target) {
+         held.active = false;   /* glca22d: Apple's GPU never writes this clear */
+         clears_dropped++;
+      }
       return;           /* glca22b: a no-program draw we cannot draw is left out */
    }
+   if (held.active)
+      held_clear_now();
    cut = bounds_begin(first, count, 0, NULL, &bounds);
    next_draw_arrays(context, mode, first, count);
+   draws_since_bind++;
+   if (cur_tex != 0 && cur_tex < TEX_NAMES)
+      tex_drawn[cur_tex] = 1;
    if (cut)
       bounds_end(&bounds);
    if (ours)
@@ -1557,10 +1749,19 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 
    if (!ours && plain_skip && skipnp_on) {
       skipped_np++;
+      if (held.active && plain_reads_target) {
+         held.active = false;   /* glca22d: as in my_glDrawArrays */
+         clears_dropped++;
+      }
       return;           /* glca22b: as in my_glDrawArrays */
    }
+   if (held.active)
+      held_clear_now();
    cut = bounds_begin(0, count, type, indices, &bounds);
    next_draw_elements(context, mode, count, type, indices);
+   draws_since_bind++;
+   if (cur_tex != 0 && cur_tex < TEX_NAMES)
+      tex_drawn[cur_tex] = 1;
    if (cut)
       bounds_end(&bounds);
    if (ours)
@@ -1620,6 +1821,10 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
          skipnp_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
             fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-deferclear", "r");     /* glca22d */
+         deferclear_on = !(f != NULL && fgetc(f) == '0');
+         if (f != NULL)
+            fclose(f);
          f = fopen("/private/var/mobile/Library/a8gl-alt", "r");            /* glca22 */
          alt_on = f != NULL && fgetc(f) == '1';
          if (f != NULL)
@@ -1627,9 +1832,10 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
       }
       say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s, wide downsample %s, "
           "draws scissored to their vertices %s, variable blur %d px, alpha threshold %s, "
-          "no-program draws we cannot draw %s%s",
+          "no-program draws we cannot draw %s, clears before a pass that reads its own target %s%s",
           glsl_on ? "on" : "off", plain_on ? "on" : "off", shapes_on ? "on" : "off", wide_on ? "on" : "off",
           bounds_on ? "on" : "off", vblur_px, alt_on ? "on" : "off", skipnp_on ? "left out" : "handed on",
+          deferclear_on ? "held back" : "handed on",
           debug_shape ? ", SHAPE DEBUG (a8gl-dbg-shape)" : "");
       if (access("/private/var/mobile/Library/a8gl-nohooks", F_OK) != 0)
          hook_coreanimation();
@@ -1646,4 +1852,25 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
    table_entries[0x255] = (void *)my_glCompileShader;     /* 0x12a8 */
    table_entries[0x258] = (void *)my_glLinkProgram;       /* 0x12c0 */
    table_entries[0x26d] = (void *)my_glUniformMatrix4fv;  /* 0x1368 */
+
+   /* glca22d: clears held back (see held_clear_now) */
+   memcpy(&next_clear, &table_entries[0x00b], sizeof(next_clear));
+   memcpy(&next_bind_framebuffer, &table_entries[0x2a1], sizeof(next_bind_framebuffer));
+   memcpy(&next_framebuffer_texture_2d, &table_entries[0x2a6], sizeof(next_framebuffer_texture_2d));
+   memcpy(&next_read_pixels, &table_entries[0x0ee], sizeof(next_read_pixels));
+   memcpy(&next_flush, &table_entries[0x05b], sizeof(next_flush));
+   memcpy(&next_finish, &table_entries[0x05a], sizeof(next_finish));
+   memcpy(&next_fence_sync, &table_entries[0x30c], sizeof(next_fence_sync));
+   if (next_clear != NULL && next_bind_framebuffer != NULL && next_framebuffer_texture_2d != NULL &&
+       next_read_pixels != NULL && next_flush != NULL && next_finish != NULL && next_fence_sync != NULL) {
+      table_entries[0x00b] = (void *)my_glClear;                 /* 0x0058 */
+      table_entries[0x2a1] = (void *)my_glBindFramebuffer;       /* 0x1508 */
+      table_entries[0x2a6] = (void *)my_glFramebufferTexture2D;  /* 0x1530 */
+      table_entries[0x0ee] = (void *)my_glReadPixels;            /* 0x0770 */
+      table_entries[0x05b] = (void *)my_glFlush;                 /* 0x02d8 */
+      table_entries[0x05a] = (void *)my_glFinish;                /* 0x02d0 */
+      table_entries[0x30c] = (void *)my_glFenceSync;             /* 0x1860 */
+   } else {
+      deferclear_on = 0;
+   }
 }
