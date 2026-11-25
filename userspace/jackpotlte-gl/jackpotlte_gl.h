@@ -71,4 +71,13 @@ void jackpotlte_gl_log(const char *line);
  */
 int jackpotlte_gl_surface_texture(struct jackpotlte_gl *gl, uint32_t surface);
 
+/*
+ * glca23 (eagl.c, for ca_fixes.c): the surface whose memory TEXTURE of the
+ * context CONTEXT (a dispatch table's first argument) is drawn into, with its
+ * size, or 0; and the texture bound to GL_TEXTURE_2D made a second texture of
+ * SURFACE's memory (1: done).
+ */
+uint32_t jackpotlte_eagl_target_surface(void *context, unsigned texture, int *width, int *height);
+int jackpotlte_eagl_alias_texture(void *context, uint32_t surface);
+
 #endif

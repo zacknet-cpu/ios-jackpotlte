@@ -882,6 +882,35 @@ shared_note(void *owner, int texture, IOSurfaceRef surface, int target)
 }
 
 /* The texture is deleted: let its surface go (backboardd must not keep them). */
+/*
+ * glca23 (ca_fixes.c): the surface whose memory TEXTURE of CONTEXT is drawn
+ * into (made by -attachImage:: the panel's buffers), and its size; 0 when
+ * TEXTURE is not one.
+ */
+uint32_t
+jackpotlte_eagl_target_surface(void *context, unsigned texture, int *width, int *height)
+{
+   for (unsigned i = 0; i < SHARED_MAX; i++) {
+      if (shared[i].surface != NULL && shared[i].owner == context &&
+          shared[i].texture == (int)texture && shared[i].target) {
+         *width = (int)IOSurfaceGetWidth(shared[i].surface);
+         *height = (int)IOSurfaceGetHeight(shared[i].surface);
+         return shared[i].id;
+      }
+   }
+   return 0;
+}
+
+/* glca23: the texture bound to GL_TEXTURE_2D shows SURFACE's memory as well
+ * (a second texture of the same memory, which Mesa tracks apart) */
+int
+jackpotlte_eagl_alias_texture(void *context, uint32_t surface)
+{
+   struct jackpotlte_eagl *e = context;
+
+   return e != NULL && jackpotlte_gl_surface_texture(e->gl, surface);
+}
+
 static void
 shared_forget(void *owner, int texture)
 {

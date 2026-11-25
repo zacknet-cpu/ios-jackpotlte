@@ -98,6 +98,13 @@ static struct {
    void (*get_booleanv)(GLenum, GLboolean *);
    void (*clear_color)(GLfloat, GLfloat, GLfloat, GLfloat);
    void (*color_mask)(GLboolean, GLboolean, GLboolean, GLboolean);
+   void (*bind_texture)(GLenum, GLuint);                   /* glca23 */
+   void (*gen_textures)(GLsizei, GLuint *);
+   void (*delete_textures)(GLsizei, const GLuint *);
+   void (*tex_parameteri)(GLenum, GLenum, GLint);
+   void (*get_tex_parameteriv)(GLenum, GLenum, GLint *);
+   void (*get_uniformiv)(GLuint, GLint, GLint *);
+   void (*real_flush)(void);
    int loaded;
 } gl;
 
@@ -182,6 +189,13 @@ load(void)
    PROC(get_booleanv, "glGetBooleanv");
    PROC(clear_color, "glClearColor");
    PROC(color_mask, "glColorMask");
+   PROC(bind_texture, "glBindTexture");
+   PROC(gen_textures, "glGenTextures");
+   PROC(delete_textures, "glDeleteTextures");
+   PROC(tex_parameteri, "glTexParameteri");
+   PROC(get_tex_parameteriv, "glGetTexParameteriv");
+   PROC(get_uniformiv, "glGetUniformiv");
+   PROC(real_flush, "glFlush");
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -1024,6 +1038,12 @@ static struct {
    GLint box[4];
 } held;
 static bool plain_reads_target;               /* plain_begin: a skipped draw read its own target */
+/* glca23 (below) */
+static void *alias_ctx;
+static int cur_scr = -1;
+static void alias_drawn(int k, const GLint *box);
+static void alias_target(void *context);
+static void alias_reset(void);
 static void (*next_clear)(void *, GLbitfield);
 static void (*next_bind_framebuffer)(void *, GLenum, GLuint);
 static void (*next_framebuffer_texture_2d)(void *, GLenum, GLenum, GLenum, GLuint, GLint);
@@ -1055,6 +1075,8 @@ held_clear_now(void)
    else
       gl.disable(0x0C11);
    next_clear(held.context, held.mask);
+   if (held.context == alias_ctx)
+      alias_drawn(cur_scr, NULL);              /* glca23 */
    gl.clear_color(colour[0], colour[1], colour[2], colour[3]);
    gl.color_mask(mask[0], mask[1], mask[2], mask[3]);
    gl.scissor(box[0], box[1], box[2], box[3]);
@@ -1090,6 +1112,8 @@ my_glClear(void *context, GLbitfield mask)
       clears_held++;
       return;
    }
+   if (context == alias_ctx && (mask & 0x4000))
+      alias_drawn(cur_scr, NULL);              /* glca23 */
    next_clear(context, mask);
 }
 
@@ -1104,6 +1128,8 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
       cur_fb = framebuffer;
       cur_tex = framebuffer < FB_NAMES ? fb_tex[framebuffer] : 0;
       draws_since_bind = 0;
+      load();
+      alias_target(context);                   /* glca23 */
    }
 }
 
@@ -1121,6 +1147,8 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
       cur_tex = level == 0 ? texture : 0;
       if (texture < TEX_NAMES)
          tex_drawn[texture] = 0;
+      load();
+      alias_target(context);                   /* glca23 */
    }
 }
 
@@ -1142,6 +1170,7 @@ my_glFlush(void *context)
       held_clear_now();
    }
    next_flush(context);
+   alias_reset();                              /* glca23 */
 }
 
 static void
@@ -1152,6 +1181,7 @@ my_glFinish(void *context)
       held_clear_now();
    }
    next_finish(context);
+   alias_reset();                              /* glca23 */
 }
 
 static GLsync
@@ -1161,7 +1191,12 @@ my_glFenceSync(void *context, GLenum condition, GLbitfield flags)
       jackpotlte_gl_use(context);
       held_clear_now();
    }
-   return next_fence_sync(context, condition, flags);
+   {
+      GLsync fence = next_fence_sync(context, condition, flags);
+
+      alias_reset();                           /* glca23 */
+      return fence;
+   }
 }
 static GLint wide_reach = -1;          /* its "reach" uniform */
 static int wide_on = 1;                /* a8gl-wide "0": the 16-sample stand-in instead */
@@ -1566,6 +1601,9 @@ struct bounds_state {
    GLboolean was_on;
    GLint box[4];
    bool active;
+   GLint program;          /* glca23: the program, -1 when not asked */
+   bool known;             /* glca23: drawn is the draw's box on a screen-sized target */
+   GLint drawn[4];         /* x0, y0, x1, y1 */
 };
 
 static bool
@@ -1595,11 +1633,14 @@ bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struc
    float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
 
    state->active = false;
+   state->program = -1;
+   state->known = false;
    if (!bounds_on || count <= 0 || count > 4096 || gl.get_uniformfv == NULL ||
        gl.get_attrib_location == NULL || gl.scissor == NULL)
       return false;
    bounds_draws++;
    gl.get_integerv(0x8B8D /* CURRENT_PROGRAM */, &program);
+   state->program = program;
    if (program <= 0)
       goto left;
    if (program < BOUNDS_PROGRAMS && bounds_prog[program].known == (GLuint)program) {
@@ -1682,6 +1723,11 @@ bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struc
          x1 = x0;
       if (y1 < y0)
          y1 = y0;
+      state->known = true;    /* glca23 */
+      state->drawn[0] = x0;
+      state->drawn[1] = y0;
+      state->drawn[2] = x1;
+      state->drawn[3] = y1;
       if ((float)(x1 - x0) * (float)(y1 - y0) > .85f * (float)vp[2] * (float)vp[3])
          goto left;
       if (!state->was_on)
@@ -1710,11 +1756,646 @@ bounds_end(struct bounds_state *state)
           bounds_draws, bounds_cut, bounds_left, skipped_np, clears_held, clears_dropped);
 }
 
+/*
+ * glca23: a backdrop read that does not end the screen's pass.  Each Control
+ * Center module (and each widget, the dock, a folder) is a backdrop layer:
+ * CoreAnimation copies the screen under it into a texture (function 1 from
+ * the panel buffer's texture), tints that, and draws it back.  The copy
+ * reads the screen, so Mesa submits the screen's open batch first: 13 more
+ * screen passes a frame in Control Center (trace 11-25 18:20: "r" runs in
+ * "S82 r7 o11 S r2 S2 r2 S2 ..."), each a submit and a fragment job, and
+ * the reason Control Center is the slowest screen (P3a).  The modules never
+ * overlap, so the part of the screen a copy reads was finished by the last
+ * pass already, and nothing in the open batch touches it.
+ *
+ * Here the screen is drawn with the boxes glca21 computes, kept per panel
+ * buffer (up to 16 boxes) since its batch was last submitted.  A draw into
+ * another target that samples a panel buffer, through texture coordinates
+ * that the program makes as vertex_texcoordN * texmatN.xy + texmatN.zw (client
+ * arrays), reads a box; when that box is clear of the open batch's boxes, the
+ * draw samples a second texture of the same surface memory (made once, with
+ * glEGLImageTargetTexture2DOES like the first) instead, which Mesa tracks as a
+ * different resource, so it does not submit the screen's batch.  What the
+ * copy read must not be drawn over before the copy runs: the target the copy
+ * went into is remembered, a draw that samples it (Mesa submits it then)
+ * forgets it, and a screen draw over a remembered box before that submits
+ * everything first (glFlush).  A screen draw whose box is not known counts
+ * as the whole screen; clears, blits, copies and uploads into a panel buffer
+ * too; a flush, finish or fence starts again.  Switch a8gl-alias "0".
+ */
+static int alias_on = 1;
+#define ALIAS_SCREENS  4
+#define ALIAS_BOXES    16
+#define ALIAS_PENDING  16
+#define ALIAS_UNITS    8
+/* alias_ctx: CoreAnimation's context (the one that draws a panel buffer), declared above */
+static struct {
+   GLuint texture, alias;               /* the panel buffer's texture and the second one */
+   uint32_t surface;
+   int width, height;
+   bool failed;                         /* the second texture could not be made */
+   unsigned boxes;                      /* drawn since the last submit we know of */
+   bool full;                           /* ... or the whole buffer */
+   GLint box[ALIAS_BOXES][4];
+   GLint set[4];                        /* the second texture's filters and wraps */
+} scr[ALIAS_SCREENS];
+/* cur_scr (declared above): the panel buffer drawn into, or -1 */
+static struct {
+   GLuint reader;                       /* the target a copy went into */
+   int screen;
+   GLint box[4];
+} pend[ALIAS_PENDING];
+static unsigned npend;
+static GLint unit_tex[ALIAS_UNITS];     /* GL_TEXTURE_2D of each unit (alias_ctx's) */
+static GLint active_unit;
+static unsigned long alias_draws, alias_reads, alias_kept, alias_flushes, alias_unknown;
+#define ALIAS_PROGRAMS 2048
+static struct {
+   GLuint known;
+   int8_t sampler[2];                   /* unit of texture0/texture1, -1 when unused */
+   int8_t form[2];                      /* 1: texcoordN = vertex_texcoordN * texmatN.xy + texmatN.zw */
+   GLint texcoord[2], texmat[2];
+} alias_prog[ALIAS_PROGRAMS];
+static unsigned alias_shader_said;
+static void (*next_bind_texture)(void *, GLenum, GLuint);
+static void (*next_active_texture)(void *, GLenum);
+static void (*next_delete_textures)(void *, GLsizei, const GLuint *);
+static void (*next_blit_framebuffer)(void *, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+static void (*next_copy_tex_sub_image_2d)(void *, GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei);
+static void (*next_copy_tex_image_2d)(void *, GLenum, GLint, GLenum, GLint, GLint, GLsizei, GLsizei, GLint);
+static void (*next_tex_sub_image_2d)(void *, GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
+static void (*next_draw_range_elements)(void *, GLenum, GLuint, GLuint, GLsizei, GLenum, const void *);
+static void (*next_draw_arrays_instanced)(void *, GLenum, GLint, GLsizei, GLsizei);
+static void (*next_draw_elements_instanced)(void *, GLenum, GLsizei, GLenum, const void *, GLsizei);
+
+static bool
+alias_procs(void)
+{
+   return gl.bind_texture && gl.gen_textures && gl.delete_textures && gl.tex_parameteri &&
+          gl.get_tex_parameteriv && gl.get_uniformiv && gl.real_flush && gl.get_integerv &&
+          gl.active_texture && gl.get_uniformfv && gl.get_attrib_location && gl.get_uniform_location &&
+          gl.get_vertex_attribiv && gl.get_vertex_attrib_pointerv;
+}
+
+static int
+alias_screen_of(GLuint texture)
+{
+   if (texture == 0)
+      return -1;
+   for (int k = 0; k < ALIAS_SCREENS; k++)
+      if (scr[k].texture == texture)
+         return k;
+   return -1;
+}
+
+static bool
+alias_overlap(const GLint a[4], const GLint b[4])
+{
+   return a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+}
+
+/* every open batch went to the GPU (a flush, finish or fence) */
+static void
+alias_reset(void)
+{
+   for (int k = 0; k < ALIAS_SCREENS; k++) {
+      scr[k].boxes = 0;
+      scr[k].full = false;
+   }
+   npend = 0;
+}
+
+/* glFlush now: a screen draw is about to cover what a copy has yet to read */
+static void
+alias_flush_now(void)
+{
+   alias_flushes++;
+   gl.real_flush();
+   alias_reset();
+}
+
+/* the screen K is drawn into, over BOX (NULL: everywhere) */
+static void
+alias_drawn(int k, const GLint *box)
+{
+   if (k < 0)
+      return;
+   for (unsigned i = 0; i < npend; i++) {
+      if (pend[i].screen == k && (box == NULL || alias_overlap(box, pend[i].box))) {
+         alias_flush_now();
+         break;
+      }
+   }
+   if (scr[k].full)
+      return;
+   if (box == NULL) {
+      scr[k].full = true;
+      return;
+   }
+   if (scr[k].boxes == ALIAS_BOXES) {
+      /* full: the boxes become their union */
+      GLint *u = scr[k].box[0];
+
+      for (unsigned i = 1; i < ALIAS_BOXES; i++) {
+         u[0] = scr[k].box[i][0] < u[0] ? scr[k].box[i][0] : u[0];
+         u[1] = scr[k].box[i][1] < u[1] ? scr[k].box[i][1] : u[1];
+         u[2] = scr[k].box[i][2] > u[2] ? scr[k].box[i][2] : u[2];
+         u[3] = scr[k].box[i][3] > u[3] ? scr[k].box[i][3] : u[3];
+      }
+      scr[k].boxes = 1;
+   }
+   memcpy(scr[k].box[scr[k].boxes++], box, sizeof(scr[k].box[0]));
+}
+
+/* the framebuffer drawn into changed: is it a panel buffer? (cur_tex is its texture) */
+static void
+alias_target(void *context)
+{
+   int width = 0, height = 0;
+   uint32_t surface;
+   int k;
+
+   cur_scr = -1;
+   if (!alias_on || cur_tex == 0)
+      return;
+   if (!alias_procs()) {
+      alias_on = 0;
+      say("glca23: the library lacks a function it needs: off");
+      return;
+   }
+   if (alias_ctx != NULL && context != alias_ctx)
+      return;
+   surface = jackpotlte_eagl_target_surface(context, cur_tex, &width, &height);
+   k = alias_screen_of(cur_tex);
+   if (k >= 0 && scr[k].surface != surface) {
+      /* the texture shows another surface now: its second texture goes */
+      if (scr[k].alias != 0 && gl.delete_textures != NULL)
+         gl.delete_textures(1, &scr[k].alias);
+      memset(&scr[k], 0, sizeof(scr[k]));
+      k = -1;
+   }
+   if (surface == 0 || width < 1000 || height < 2000)
+      return;
+   if (k < 0) {
+      for (k = 0; k < ALIAS_SCREENS && scr[k].texture != 0; k++)
+         ;
+      if (k == ALIAS_SCREENS)
+         return;
+      memset(&scr[k], 0, sizeof(scr[k]));
+      scr[k].texture = cur_tex;
+      scr[k].surface = surface;
+      scr[k].width = width;
+      scr[k].height = height;
+      scr[k].full = true;          /* not known yet */
+      if (alias_ctx == NULL) {
+         alias_ctx = context;
+         say("glca23: panel buffer texture %u (surface %u, %dx%d): backdrop copies that read "
+             "what this pass has not drawn over read a second texture of it", cur_tex, surface,
+             width, height);
+      }
+   }
+   cur_scr = k;
+}
+
+/* which units a program samples, and how its texture coordinates are made */
+static void
+alias_program(GLuint program)
+{
+   if (program >= ALIAS_PROGRAMS || alias_prog[program].known == program)
+      return;
+   alias_prog[program].known = program;
+   for (int n = 0; n < 2; n++) {
+      char name[24];
+      GLint where, unit = -1;
+
+      snprintf(name, sizeof(name), "texture%d", n);
+      where = gl.get_uniform_location(program, name);
+      if (where >= 0)
+         gl.get_uniformiv(program, where, &unit);
+      alias_prog[program].sampler[n] = (int8_t)(where >= 0 && unit >= 0 && unit < ALIAS_UNITS ? unit : -1);
+      snprintf(name, sizeof(name), "vertex_texcoord%d", n);
+      alias_prog[program].texcoord[n] = gl.get_attrib_location(program, name);
+      snprintf(name, sizeof(name), "texmat%d", n);
+      alias_prog[program].texmat[n] = gl.get_uniform_location(program, name);
+      alias_prog[program].form[n] = 0;
+   }
+   /* the vertex shader's own words for the texture coordinates */
+   if (gl.get_attached_shaders != NULL && gl.get_shader_source != NULL && gl.get_shaderiv != NULL) {
+      GLuint shaders[4];
+      GLsizei count = 0;
+
+      gl.get_attached_shaders(program, 4, &count, shaders);
+      for (GLsizei i = 0; i < count; i++) {
+         GLint type = 0, length = 0;
+         char *text, *squeezed;
+         GLsizei got = 0;
+         size_t k = 0;
+
+         gl.get_shaderiv(shaders[i], 0x8B4F /* SHADER_TYPE */, &type);
+         if (type != 0x8B31 /* VERTEX_SHADER */)
+            continue;
+         gl.get_shaderiv(shaders[i], 0x8B88 /* SHADER_SOURCE_LENGTH */, &length);
+         if (length <= 0 || length > 65536)
+            continue;
+         text = malloc((size_t)length + 1);
+         squeezed = malloc((size_t)length + 1);
+         if (text != NULL && squeezed != NULL) {
+            gl.get_shader_source(shaders[i], length + 1, &got, text);
+            text[got < length ? got : length] = '\0';
+            for (const char *c = text; *c != '\0'; c++)
+               if (*c != ' ' && *c != '\t' && *c != '\n' && *c != '\r')
+                  squeezed[k++] = *c;
+            squeezed[k] = '\0';
+            for (int n = 0; n < 2; n++) {
+               char a[96], b[96];
+
+               snprintf(a, sizeof(a), "=vertex_texcoord%d.xy*texmat%d.xy+texmat%d.zw;", n, n, n);
+               snprintf(b, sizeof(b), "=vertex_texcoord%d*texmat%d.xy+texmat%d.zw;", n, n, n);
+               if (strstr(squeezed, a) != NULL || strstr(squeezed, b) != NULL)
+                  alias_prog[program].form[n] = 1;
+            }
+            if (alias_prog[program].sampler[0] >= 0 && alias_prog[program].texcoord[0] >= 0 &&
+                !alias_prog[program].form[0] && alias_shader_said < 4) {
+               size_t len = strlen(squeezed);
+
+               alias_shader_said++;
+               say("glca23: program %u: texture coordinates made another way (%zu chars):", program, len);
+               for (size_t at = 0; at < len && at < 2400; at += 160)
+                  say("glca23: %u+%zu %.160s", program, at, squeezed + at);
+            }
+         }
+         free(text);
+         free(squeezed);
+      }
+   }
+}
+
+/* the box (texels of a W x H texture) a draw's unit texture coordinates N reach */
+static bool
+alias_read_box(GLuint program, int n, GLint first, GLsizei count, GLenum type, const void *indices,
+               int width, int height, GLint box[4])
+{
+   GLint on = 0, size = 0, kind = 0, stride = 0, buffer = 0, elements = 0;
+   GLint attribute = alias_prog[program].texcoord[n];
+   GLfloat m[4];
+   void *pointer = NULL;
+   float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
+
+   if (!alias_prog[program].form[n] || attribute < 0 || alias_prog[program].texmat[n] < 0 ||
+       count <= 0 || count > 4096)
+      return false;
+   gl.get_vertex_attribiv((GLuint)attribute, 0x8622 /* ENABLED */, &on);
+   gl.get_vertex_attribiv((GLuint)attribute, 0x8623 /* SIZE */, &size);
+   gl.get_vertex_attribiv((GLuint)attribute, 0x8625 /* TYPE */, &kind);
+   gl.get_vertex_attribiv((GLuint)attribute, 0x8624 /* STRIDE */, &stride);
+   gl.get_vertex_attribiv((GLuint)attribute, 0x889f /* BUFFER_BINDING */, &buffer);
+   gl.get_vertex_attrib_pointerv((GLuint)attribute, 0x8645 /* POINTER */, &pointer);
+   if (!on || buffer != 0 || pointer == NULL || kind != 0x1406 /* FLOAT */ || size < 2)
+      return false;
+   if (stride == 0)
+      stride = size * 4;
+   if (indices != NULL || type != 0) {
+      gl.get_integerv(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &elements);
+      if (elements != 0 || indices == NULL || (type != 0x1401 && type != 0x1403 && type != 0x1405))
+         return false;
+   }
+   gl.get_uniformfv(program, alias_prog[program].texmat[n], m);
+   for (GLsizei i = 0; i < count; i++) {
+      GLuint index;
+      const float *p;
+      float u, v;
+
+      if (indices == NULL)
+         index = (GLuint)(first + i);
+      else if (type == 0x1403)
+         index = ((const GLushort *)indices)[i];
+      else if (type == 0x1401)
+         index = ((const GLubyte *)indices)[i];
+      else
+         index = ((const GLuint *)indices)[i];
+      p = (const float *)(const void *)((const char *)pointer + (size_t)stride * index);
+      u = p[0] * m[0] + m[2];
+      v = p[1] * m[1] + m[3];
+      u0 = u < u0 ? u : u0;
+      u1 = u > u1 ? u : u1;
+      v0 = v < v0 ? v : v0;
+      v1 = v > v1 ? v : v1;
+   }
+   if (!(u0 > -1e3f && v0 > -1e3f && u1 < 1e3f && v1 < 1e3f))
+      return false;
+   /* two texels more each way: filtering, rounding */
+   box[0] = (GLint)__builtin_floorf(u0 * (float)width) - 2;
+   box[1] = (GLint)__builtin_floorf(v0 * (float)height) - 2;
+   box[2] = (GLint)__builtin_ceilf(u1 * (float)width) + 2;
+   box[3] = (GLint)__builtin_ceilf(v1 * (float)height) + 2;
+   return true;
+}
+
+/* the second texture of screen K, made once */
+static bool
+alias_make(void *context, int k)
+{
+   GLint was = 0;
+
+   if (scr[k].alias != 0)
+      return true;
+   if (scr[k].failed)
+      return false;
+   gl.get_integerv(GL_TEXTURE_BINDING_2D, &was);
+   gl.gen_textures(1, &scr[k].alias);
+   gl.bind_texture(GL_TEXTURE_2D, scr[k].alias);
+   if (scr[k].alias == 0 || !jackpotlte_eagl_alias_texture(context, scr[k].surface)) {
+      scr[k].failed = true;
+      say("glca23: no second texture of surface %u: backdrop copies end the screen's pass as before",
+          scr[k].surface);
+      if (scr[k].alias != 0)
+         gl.delete_textures(1, &scr[k].alias);
+      scr[k].alias = 0;
+      gl.bind_texture(GL_TEXTURE_2D, (GLuint)was);
+      return false;
+   }
+   scr[k].set[0] = scr[k].set[1] = scr[k].set[2] = scr[k].set[3] = -1;
+   gl.bind_texture(GL_TEXTURE_2D, (GLuint)was);
+   say("glca23: texture %u is a second texture of surface %u (panel buffer texture %u)",
+       scr[k].alias, scr[k].surface, scr[k].texture);
+   return true;
+}
+
+struct alias_state {
+   int unit;               /* the unit whose texture was swapped, or -1 */
+   GLuint put_back;        /* what was bound there */
+   int flushed;            /* a screen whose batch Mesa submits for this draw, or -1 */
+};
+
+static void
+alias_begin(void *context, GLint first, GLsizei count, GLenum type, const void *indices,
+            const struct bounds_state *bounds, struct alias_state *as)
+{
+   GLint program;
+   int sampled[2];
+
+   as->unit = -1;
+   as->flushed = -1;
+   if (!alias_on || alias_ctx == NULL || context != alias_ctx)
+      return;
+   alias_draws++;
+   program = bounds->program;
+   if (program < 0)
+      gl.get_integerv(GL_CURRENT_PROGRAM, &program);
+   if (program <= 0 || program >= ALIAS_PROGRAMS) {
+      /* not a program of CoreAnimation's we know: it may sample anything */
+      sampled[0] = 0;
+      sampled[1] = 1;
+   } else {
+      alias_program((GLuint)program);
+      sampled[0] = alias_prog[program].sampler[0];
+      sampled[1] = alias_prog[program].sampler[1];
+   }
+   /* a target a copy went into, sampled now: Mesa submits it first */
+   for (int n = 0; n < 2 && npend > 0; n++) {
+      GLint bound = 0;
+
+      if (sampled[n] < 0)
+         continue;
+      if (unit_tex[sampled[n]] == 0 && program > 0)
+         continue;
+      gl.active_texture(GL_TEXTURE0 + (GLenum)sampled[n]);
+      gl.get_integerv(GL_TEXTURE_BINDING_2D, &bound);
+      gl.active_texture(GL_TEXTURE0 + (GLenum)active_unit);
+      for (unsigned i = 0; i < npend; i++) {
+         if (pend[i].reader == (GLuint)bound) {
+            pend[i] = pend[--npend];
+            i--;
+         }
+      }
+   }
+   if (cur_scr >= 0) {
+      /* a draw into a panel buffer */
+      alias_drawn(cur_scr, bounds->known ? bounds->drawn : NULL);
+      if (!bounds->known)
+         alias_unknown++;
+      return;
+   }
+   if (program <= 0 || program >= ALIAS_PROGRAMS || cur_tex == 0)
+      return;
+   for (int n = 0; n < 2; n++) {
+      int unit = sampled[n], k;
+      GLint box[4], bound = 0, value[4];
+      bool clear = true;
+      static const GLenum names[4] = { 0x2801 /* MIN_FILTER */, 0x2800 /* MAG_FILTER */,
+                                       0x2802 /* WRAP_S */, 0x2803 /* WRAP_T */ };
+
+      if (unit < 0 || (k = alias_screen_of((GLuint)unit_tex[unit])) < 0)
+         continue;
+      if (!scr[k].full && scr[k].boxes == 0)
+         continue;              /* nothing open on it: Mesa submits nothing */
+      alias_reads++;
+      if (scr[k].full || as->unit >= 0 || npend == ALIAS_PENDING ||
+          !alias_read_box((GLuint)program, n, first, count, type, indices, scr[k].width,
+                          scr[k].height, box)) {
+         as->flushed = k;
+         continue;
+      }
+      for (unsigned i = 0; i < scr[k].boxes && clear; i++)
+         clear = !alias_overlap(box, scr[k].box[i]);
+      if (!clear || !alias_make(context, k)) {
+         as->flushed = k;
+         continue;
+      }
+      /* what is really bound there (the shim's own calls bind without the table) */
+      gl.active_texture(GL_TEXTURE0 + (GLenum)unit);
+      gl.get_integerv(GL_TEXTURE_BINDING_2D, &bound);
+      if (bound != (GLint)scr[k].texture) {
+         gl.active_texture(GL_TEXTURE0 + (GLenum)active_unit);
+         unit_tex[unit] = bound;
+         as->flushed = alias_screen_of((GLuint)bound);
+         continue;
+      }
+      for (int i = 0; i < 4; i++)
+         gl.get_tex_parameteriv(GL_TEXTURE_2D, names[i], &value[i]);
+      gl.bind_texture(GL_TEXTURE_2D, scr[k].alias);
+      for (int i = 0; i < 4; i++) {
+         if (scr[k].set[i] != value[i]) {
+            gl.tex_parameteri(GL_TEXTURE_2D, names[i], value[i]);
+            scr[k].set[i] = value[i];
+         }
+      }
+      gl.active_texture(GL_TEXTURE0 + (GLenum)active_unit);
+      as->unit = unit;
+      as->put_back = scr[k].texture;
+      pend[npend].reader = cur_tex;
+      pend[npend].screen = k;
+      memcpy(pend[npend].box, box, sizeof(box));
+      npend++;
+      alias_kept++;
+   }
+}
+
+static void
+alias_end(struct alias_state *as)
+{
+   if (as->unit >= 0) {
+      gl.active_texture(GL_TEXTURE0 + (GLenum)as->unit);
+      gl.bind_texture(GL_TEXTURE_2D, as->put_back);
+      gl.active_texture(GL_TEXTURE0 + (GLenum)active_unit);
+   }
+   if (as->flushed >= 0) {
+      /* the copy read the screen as it is: Mesa submitted its batch */
+      scr[as->flushed].boxes = 0;
+      scr[as->flushed].full = false;
+   }
+   if ((alias_draws & 16383) == 0 && alias_draws != 0)
+      say("glca23: %lu draws, %lu read an open panel buffer, %lu of them through the second texture; "
+          "%lu flushes to keep a copy's box, %lu screen draws of unknown size",
+          alias_draws, alias_reads, alias_kept, alias_flushes, alias_unknown);
+}
+
+/* ---- glca23's view of the state: texture units, and writes it cannot box ---- */
+
+static void
+my_glActiveTexture(void *context, GLenum unit)
+{
+   next_active_texture(context, unit);
+   if (context == alias_ctx || alias_ctx == NULL)
+      active_unit = (GLint)(unit - GL_TEXTURE0) < ALIAS_UNITS ? (GLint)(unit - GL_TEXTURE0) : 0;
+}
+
+static void
+my_glBindTexture(void *context, GLenum target, GLuint texture)
+{
+   next_bind_texture(context, target, texture);
+   if (target == GL_TEXTURE_2D && (context == alias_ctx || alias_ctx == NULL) && active_unit >= 0 &&
+       active_unit < ALIAS_UNITS)
+      unit_tex[active_unit] = (GLint)texture;
+}
+
+static void
+my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
+{
+   if (context == alias_ctx && textures != NULL) {
+      jackpotlte_gl_use(context);
+      load();
+      for (GLsizei i = 0; i < n; i++) {
+         int k = alias_screen_of(textures[i]);
+
+         for (unsigned j = 0; j < npend; j++)
+            if (pend[j].reader == textures[i]) {
+               alias_flush_now();      /* its copy must not wait on a name used again */
+               break;
+            }
+         if (k >= 0) {
+            if (scr[k].alias != 0)
+               gl.delete_textures(1, &scr[k].alias);
+            memset(&scr[k], 0, sizeof(scr[k]));
+            if (cur_scr == k)
+               cur_scr = -1;
+         }
+      }
+   }
+   next_delete_textures(context, n, textures);
+}
+
+/* the texture bound on the active unit, as a panel buffer index */
+static int
+alias_bound_screen(void)
+{
+   GLint bound = 0;
+
+   gl.get_integerv(GL_TEXTURE_BINDING_2D, &bound);
+   return alias_screen_of((GLuint)bound);
+}
+
+static void
+my_glBlitFramebuffer(void *context, GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0,
+                     GLint dx1, GLint dy1, GLbitfield mask, GLenum filter)
+{
+   if (context == alias_ctx) {
+      jackpotlte_gl_use(context);
+      alias_drawn(cur_scr, NULL);
+   }
+   next_blit_framebuffer(context, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+}
+
+static void
+my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x,
+                       GLint y, GLsizei width, GLsizei height)
+{
+   if (context == alias_ctx) {
+      jackpotlte_gl_use(context);
+      load();
+      alias_drawn(alias_bound_screen(), NULL);
+   }
+   next_copy_tex_sub_image_2d(context, target, level, xoffset, yoffset, x, y, width, height);
+}
+
+static void
+my_glCopyTexImage2D(void *context, GLenum target, GLint level, GLenum internal, GLint x, GLint y,
+                    GLsizei width, GLsizei height, GLint border)
+{
+   if (context == alias_ctx) {
+      jackpotlte_gl_use(context);
+      load();
+      alias_drawn(alias_bound_screen(), NULL);
+   }
+   next_copy_tex_image_2d(context, target, level, internal, x, y, width, height, border);
+}
+
+static void
+my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
+                   GLsizei height, GLenum format, GLenum type, const void *pixels)
+{
+   if (context == alias_ctx) {
+      jackpotlte_gl_use(context);
+      load();
+      alias_drawn(alias_bound_screen(), NULL);
+   }
+   next_tex_sub_image_2d(context, target, level, xoffset, yoffset, width, height, format, type, pixels);
+}
+
+static void
+my_glDrawRangeElements(void *context, GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
+                       const void *indices)
+{
+   if (context == alias_ctx) {
+      jackpotlte_gl_use(context);
+      if (npend > 0)
+         alias_flush_now();     /* what it samples is not looked at */
+      alias_drawn(cur_scr, NULL);
+   }
+   next_draw_range_elements(context, mode, start, end, count, type, indices);
+}
+
+static void
+my_glDrawArraysInstanced(void *context, GLenum mode, GLint first, GLsizei count, GLsizei instances)
+{
+   if (context == alias_ctx) {
+      jackpotlte_gl_use(context);
+      if (npend > 0)
+         alias_flush_now();
+      alias_drawn(cur_scr, NULL);
+   }
+   next_draw_arrays_instanced(context, mode, first, count, instances);
+}
+
+static void
+my_glDrawElementsInstanced(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices,
+                           GLsizei instances)
+{
+   if (context == alias_ctx) {
+      jackpotlte_gl_use(context);
+      if (npend > 0)
+         alias_flush_now();
+      alias_drawn(cur_scr, NULL);
+   }
+   next_draw_elements_instanced(context, mode, count, type, indices, instances);
+}
+
 static void
 my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 {
    struct plain_state state;
    struct bounds_state bounds;
+   struct alias_state as;
    bool ours = plain_begin(context, &state);
    bool cut;
 
@@ -1729,7 +2410,9 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
    if (held.active)
       held_clear_now();
    cut = bounds_begin(first, count, 0, NULL, &bounds);
+   alias_begin(context, first, count, 0, NULL, &bounds, &as);   /* glca23 */
    next_draw_arrays(context, mode, first, count);
+   alias_end(&as);
    draws_since_bind++;
    if (cur_tex != 0 && cur_tex < TEX_NAMES)
       tex_drawn[cur_tex] = 1;
@@ -1744,6 +2427,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 {
    struct plain_state state;
    struct bounds_state bounds;
+   struct alias_state as;
    bool ours = plain_begin(context, &state);
    bool cut;
 
@@ -1758,7 +2442,9 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
    if (held.active)
       held_clear_now();
    cut = bounds_begin(0, count, type, indices, &bounds);
+   alias_begin(context, 0, count, type, indices, &bounds, &as);  /* glca23 */
    next_draw_elements(context, mode, count, type, indices);
+   alias_end(&as);
    draws_since_bind++;
    if (cur_tex != 0 && cur_tex < TEX_NAMES)
       tex_drawn[cur_tex] = 1;
@@ -1825,6 +2511,10 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
          deferclear_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
             fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-alias", "r");         /* glca23 */
+         alias_on = !(f != NULL && fgetc(f) == '0');
+         if (f != NULL)
+            fclose(f);
          f = fopen("/private/var/mobile/Library/a8gl-alt", "r");            /* glca22 */
          alt_on = f != NULL && fgetc(f) == '1';
          if (f != NULL)
@@ -1872,5 +2562,35 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
       table_entries[0x30c] = (void *)my_glFenceSync;             /* 0x1860 */
    } else {
       deferclear_on = 0;
+   }
+
+   /* glca23: texture units, and the writes into a panel buffer it cannot box */
+   memcpy(&next_active_texture, &table_entries[0x157], sizeof(next_active_texture));
+   memcpy(&next_bind_texture, &table_entries[0x006], sizeof(next_bind_texture));
+   memcpy(&next_delete_textures, &table_entries[0x03c], sizeof(next_delete_textures));
+   memcpy(&next_blit_framebuffer, &table_entries[0x2f4], sizeof(next_blit_framebuffer));
+   memcpy(&next_copy_tex_sub_image_2d, &table_entries[0x039], sizeof(next_copy_tex_sub_image_2d));
+   memcpy(&next_copy_tex_image_2d, &table_entries[0x037], sizeof(next_copy_tex_image_2d));
+   memcpy(&next_tex_sub_image_2d, &table_entries[0x134], sizeof(next_tex_sub_image_2d));
+   memcpy(&next_draw_range_elements, &table_entries[0x196], sizeof(next_draw_range_elements));
+   memcpy(&next_draw_arrays_instanced, &table_entries[0x2fb], sizeof(next_draw_arrays_instanced));
+   memcpy(&next_draw_elements_instanced, &table_entries[0x2fc], sizeof(next_draw_elements_instanced));
+   if (alias_on && deferclear_on && next_active_texture && next_bind_texture &&
+       next_delete_textures && next_blit_framebuffer && next_copy_tex_sub_image_2d && next_copy_tex_image_2d &&
+       next_tex_sub_image_2d && next_draw_range_elements && next_draw_arrays_instanced &&
+       next_draw_elements_instanced) {
+      table_entries[0x157] = (void *)my_glActiveTexture;          /* 0x0ab8 */
+      table_entries[0x006] = (void *)my_glBindTexture;            /* 0x0030 */
+      table_entries[0x03c] = (void *)my_glDeleteTextures;         /* 0x01e0 */
+      table_entries[0x2f4] = (void *)my_glBlitFramebuffer;        /* 0x17a0 */
+      table_entries[0x039] = (void *)my_glCopyTexSubImage2D;      /* 0x01c8 */
+      table_entries[0x037] = (void *)my_glCopyTexImage2D;         /* 0x01b8 */
+      table_entries[0x134] = (void *)my_glTexSubImage2D;          /* 0x09a0 */
+      table_entries[0x196] = (void *)my_glDrawRangeElements;      /* 0x0cb0 */
+      table_entries[0x2fb] = (void *)my_glDrawArraysInstanced;    /* 0x17d8 */
+      table_entries[0x2fc] = (void *)my_glDrawElementsInstanced;  /* 0x17e0 */
+      say("glca23: backdrop copies may read a second texture of a panel buffer (a8gl-alias \"0\" off)");
+   } else {
+      alias_on = 0;
    }
 }
