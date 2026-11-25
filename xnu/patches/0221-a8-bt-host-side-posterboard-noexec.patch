@@ -1,0 +1,1328 @@
+From 3c6c607c9d84f5c46f3bf84321fef872b580ea8a Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 08:08:10 -0500
+Subject: [PATCH] 0221-a8-bt-host-side-posterboard-noexec.patch
+
+---
+ bsd/dev/a5xelte_bt.c             | 891 ++++++++++++++++++++++++++++++-
+ bsd/dev/a5xelte_bt.h             |  17 +-
+ bsd/dev/a5xelte_scsc.c           |  15 +
+ bsd/dev/a5xelte_scsc.h           |   5 +
+ bsd/dev/mem.c                    |  29 +-
+ bsd/kern/kern_exec.c             |  45 +-
+ iokit/Kernel/arm/A8Bluetooth.cpp |  69 +++
+ iokit/conf/files.arm64           |   1 +
+ 8 files changed, 1039 insertions(+), 33 deletions(-)
+ create mode 100644 iokit/Kernel/arm/A8Bluetooth.cpp
+
+diff --git a/bsd/dev/a5xelte_bt.c b/bsd/dev/a5xelte_bt.c
+index bb45ff0..f8196b6 100644
+--- a/bsd/dev/a5xelte_bt.c
++++ b/bsd/dev/a5xelte_bt.c
+@@ -21,23 +21,19 @@
+  *     params...] and events are [event code, plen, params...].  The boot-time
+  *     proof is an HCI Reset (opcode 0x0c03, no parameters) followed by its
+  *     Command Complete (event 0x0e);
+- *   - has a single-packet ACL TX path (one buffer, no fragmentation) that no
+- *     caller uses yet, because there is no HCI device node.
++ *   - 0221: once HCI Reset is answered, hands the rings to iOS's bluetoothd
++ *     through a kernel control and an IOService ("host side" below).
+  *
+  * Everything runs in thread context: the mailbox is polled by the SCSC
+  * transport thread, which calls this file's interrupt-bit handler
+  * (a5scsc_bt_evt) for the bg_to_ap bit.  Nothing here runs in an ISR.
+  *
+  * NOT implemented, on purpose, and listed as stubs in PORT-START.md:
+- *   - no HCI character device or Bluetooth stack interface, so there is no
+- *     path for a host stack to open the controller yet, and therefore no user
+- *     of a5scsc_bt_acl_send();
+- *   - ACL RX, AVDTP detection, timing packets, IQ reports, the BT log rings and
++ *   - SCO, AVDTP detection, timing packets, IQ reports, the BT log rings and
+  *     the A-box audio window (the jackpotlte DT's btabox node carries no reg,
+  *     so the vendor driver maps that window as zero too);
+- *   - the Bluetooth device address is left 0 (vendor default: it comes from
+- *     the SoC unique id or a stack-supplied value, neither available here);
+- *   - the BSMHCP configuration blob (mx140 *.hcf) is not loaded;
++ *   - /efs/bluetooth/bt_addr (the device address is the vendor's default,
++ *     made from the SoC unique id, 0210);
+  *   - no stop/restart path.
+  *
+  * Gate: the whole endpoint runs only with the "a8bt" boot argument set to 1,
+@@ -48,7 +44,12 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+@@ -57,6 +58,8 @@
+ #include "a5xelte_bt.h"
+ 
+ void a5xelte_bt_probe(void);
++static void a5h4_pump(void);            /* 0221, the host side */
++static volatile bool a5h4_open;         /* 0221: the rings belong to the host side */
+ 
+ /* ---- device state --------------------------------------------------------- */
+ 
+@@ -88,6 +91,13 @@ struct a5bt_softc {
+ 	uint32_t          acl_last;
+ 	uint32_t          acl_count;    /* buffers currently owned by a packet */
+ 	uint32_t          acl_free_seen;
++
++	/* 0221: the device address as written into BHCS, most significant
++	 * byte first (NAP, UAP, LAP), for the IOService; the configuration
++	 * blob's MIF offset and length (0: none). */
++	uint8_t           address[6];
++	uint32_t          conf_ref;
++	uint32_t          conf_len;
+ };
+ 
+ static struct a5bt_softc a5bt;
+@@ -198,12 +208,27 @@ a5bt_acl_reap(void)
+ 	}
+ }
+ 
++/* The foreground side's doorbell (ACL out, and ACL in or credits taken): on
++ * the M4 when the firmware says BSMHCP_FEATURE_M4_INTERRUPTS (0221, as
++ * scsc_shm.c does), on the R4 otherwise. */
++#define A5BT_FEATURE_M4_INTERRUPTS      0x00000002u
++
++static void
++a5bt_fg_doorbell(void)
++{
++	if (a5bt_rd32(a5bt.proto, A5BT_H_FW_FEATURES) & A5BT_FEATURE_M4_INTERRUPTS) {
++		a5scsc_irq_bit_set(a5bt.bit_from_fg_m4, A5SCSC_MIF_TARGET_M4);
++	} else {
++		a5scsc_irq_bit_set(a5bt.bit_from_fg, A5SCSC_MIF_TARGET_R4);
++	}
++}
++
+ /* Hands one ACL packet (L2CAP payload, no H4 header) to the firmware.
+- * `flags` are the HCI PB/BC bits already shifted into place, and
+- * `l2cap_cid`/`handle` come from the caller's packet header.  Fragmentation
+- * (PB = continuation) is not supported: one call is one whole packet, which
+- * is what BSMHCP_TD_ACL_TX_DATA describes.  No caller exists yet; see the file
+- * comment.
++ * `flags` are the HCI PB/BC bits already shifted into place, plus
++ * BSMHCP_ACL_L2CAP_FLAG_END, and `l2cap_cid`/`handle` come from the caller's
++ * packet header.  One call is one HCI packet, which is what
++ * BSMHCP_TD_ACL_TX_DATA describes; the L2CAP state across fragments is the
++ * caller's (0221: a5h4_tx_acl).
+  */
+ int
+ a5scsc_bt_acl_send(uint16_t handle, uint8_t flags, uint16_t l2cap_cid,
+@@ -253,7 +278,7 @@ a5scsc_bt_acl_send(uint16_t handle, uint8_t flags, uint16_t l2cap_cid,
+ 	a5bt_mb();
+ 	/* ACL data wakes the foreground bit; commands use ap_to_bg
+ 	 * (scsc_shm.c:258 vs scsc_shm.c:429). */
+-	a5scsc_irq_bit_set(a5bt.bit_from_fg, A5SCSC_MIF_TARGET_R4);
++	a5bt_fg_doorbell();
+ 	return 0;
+ }
+ 
+@@ -263,8 +288,9 @@ a5scsc_bt_acl_send(uint16_t handle, uint8_t flags, uint16_t l2cap_cid,
+  * HCI event code (the firmware strips the H4 type, scsc_shm.c:579-600), so
+  * data[0] == 0x0e is a Command Complete, data[1] is the parameter length and
+  * `length` is that parameter length + 2.
+- * The vendor consumer advances read index without waking the firmware
+- * (scsc_shm.c:914-985), which is what this does.
++ * Until the host side opens (0221) this only watches for the bring-up's
++ * HCI Reset completion and advances the read index without waking the
++ * firmware; after that a5h4_pump() owns every ring.
+  */
+ static void
+ a5bt_evt(int bit __unused, void *arg __unused)
+@@ -276,6 +302,10 @@ a5bt_evt(int bit __unused, void *arg __unused)
+ 	if (!a5bt.proto) {
+ 		return;
+ 	}
++	if (a5h4_open) {
++		a5h4_pump();
++		return;
++	}
+ 	a5bt_acl_reap();
+ 	r = a5bt_rd32(a5bt.proto, A5BT_H_EVT_READ);
+ 	w = a5bt_rd32(a5bt.proto, A5BT_H_EVT_WRITE);
+@@ -363,25 +393,80 @@ a5bt_soc_unique_id(void)
+ 	return id & 0xffffffffffffull;
+ }
+ 
+-/* Fills BHCS (bhcs.h:39-50, setup_bhcs() in scsc_bt_module.c:556-575).  The
+- * configuration blob stays empty: the vendor looks for
+- * mx140/conf/bluetooth/bt.hcf, which the A8's ROM does not have.  0210: the
+- * device address is the vendor's default, made from the SoC unique id
+- * (CONFIG_ARCH_EXYNOS branch of setup_bhcs(); /efs/bluetooth/bt_addr, which
+- * would override it, is not read). */
++/* 0221: the configuration blob.  The A8's ROM carries the driver's older flat
++ * names, mx140_<file> in /system/etc/wifi (mx140_wlan.hcf, mx140_bt.hcf), not
++ * the mx140/conf/bluetooth/bt.hcf this kernel tree's driver asks for, so the
++ * phone's own mx140_bt.hcf (104 bytes), copied to /private/var/mobile/Library,
++ * is the one; the firmware said "BT_PSCONF: Loading 0 bytes of config"
++ * without it (0210).  Copied whole into MIF memory, as setup_bhcs() does
++ * (scsc_bt_module.c).  a8btconf=0 leaves it out. */
++#define A5BT_CONF_PATH          "/private/var/mobile/Library/mx140_bt.hcf"
++#define A5BT_CONF_MAX           4096u
++static uint8_t a5bt_conf_buf[A5BT_CONF_MAX];
++
++static void
++a5bt_load_conf(void)
++{
++	size_t size = 0;
++	int use = 1, err;
++	uint8_t *dst;
++
++	(void)PE_parse_boot_argn("a8btconf", &use, sizeof(use));
++	if (!use) {
++		printf("A5XELTE BT: configuration left out (a8btconf=0)\n");
++		return;
++	}
++	err = a5scsc_read_file(A5BT_CONF_PATH, a5bt_conf_buf,
++	    sizeof(a5bt_conf_buf), &size);
++	if (err != 0 || size == 0) {
++		printf("A5XELTE BT: no configuration (%s: error %d)\n",
++		    A5BT_CONF_PATH, err);
++		return;
++	}
++	if (!a5scsc_mifram_alloc((uint32_t)size, A5BT_ALIGN, &a5bt.conf_ref) ||
++	    (dst = a5scsc_mifram_ptr(a5bt.conf_ref)) == NULL) {
++		printf("A5XELTE BT: no MIF room for the configuration\n");
++		a5bt.conf_ref = 0;
++		return;
++	}
++	memcpy(dst, a5bt_conf_buf, size);
++	a5bt.conf_len = (uint32_t)size;
++	printf("A5XELTE BT: configuration %s, %u bytes at 0x%x\n",
++	    A5BT_CONF_PATH, a5bt.conf_len, a5bt.conf_ref);
++}
++
++/* Fills BHCS (bhcs.h:39-50, setup_bhcs() in scsc_bt_module.c:556-575).
++ * 0210: the device address is the vendor's default, made from the SoC
++ * unique id (CONFIG_ARCH_EXYNOS branch of setup_bhcs(); /efs/bluetooth/
++ * bt_addr, which would override it, is not read).  0221: the configuration
++ * blob (a5bt_load_conf), and the address kept for the IOService. */
+ static void
+ a5bt_fill_bhcs(uint8_t *bhcs)
+ {
+ 	uint64_t id = a5bt_soc_unique_id();
++	uint32_t lap = (uint32_t)((id & 0xffffff000000ull) >> 24);
++	uint16_t nap = (uint16_t)((id & 0x000000ffff00ull) >> 8);
++	uint8_t uap = (uint8_t)(id & 0xffu);
+ 
+ 	bzero(bhcs, A5BT_BHCS_SIZE);
+ 	a5bt_wr32(bhcs, A5BT_BHCS_VERSION, A5BT_BHCS_VERSION_EXPECT);
+ 	a5bt_wr32(bhcs, A5BT_BHCS_PROTO_OFF, a5bt.proto_ref);
+ 	a5bt_wr32(bhcs, A5BT_BHCS_PROTO_LEN, A5BT_BSMHCP_SIZE);
++	a5bt_load_conf();
++	if (a5bt.conf_len != 0) {
++		a5bt_wr32(bhcs, A5BT_BHCS_CONF_OFF, a5bt.conf_ref);
++		a5bt_wr32(bhcs, A5BT_BHCS_CONF_LEN, a5bt.conf_len);
++	}
+ 	if (id != 0) {
+-		a5bt_wr32(bhcs, A5BT_BHCS_LAP, (uint32_t)((id & 0xffffff000000ull) >> 24));
+-		bhcs[A5BT_BHCS_UAP] = (uint8_t)(id & 0xffu);
+-		a5bt_wr16(bhcs, A5BT_BHCS_NAP, (uint16_t)((id & 0x000000ffff00ull) >> 8));
++		a5bt_wr32(bhcs, A5BT_BHCS_LAP, lap);
++		bhcs[A5BT_BHCS_UAP] = uap;
++		a5bt_wr16(bhcs, A5BT_BHCS_NAP, nap);
++		a5bt.address[0] = (uint8_t)(nap >> 8);
++		a5bt.address[1] = (uint8_t)nap;
++		a5bt.address[2] = uap;
++		a5bt.address[3] = (uint8_t)(lap >> 16);
++		a5bt.address[4] = (uint8_t)(lap >> 8);
++		a5bt.address[5] = (uint8_t)lap;
+ 	}
+ 	printf("A5XELTE BT: device address %s\n",
+ 	    id != 0 ? "from the SoC unique id" : "left 0 (no SoC unique id)");
+@@ -499,6 +584,759 @@ a5bt_report(const char *when)
+ 	    a5bt.events, a5bt.unknown_sm);
+ }
+ 
++/* ---- 0221: the host side, for iOS's bluetoothd -----------------------------
++ *
++ * What iOS wants (the Galaxy S20 port's findings, jesvi-eulah/Jesvi-iOS
++ * xnu/files/bsd/dev/redwood_exynos_bt.c and userland/src/bluetool_stub.c,
++ * checked against this phone's iOS 16.7 bluetoothd):
++ *   - an IOService named "bluetooth" with local-mac-address,
++ *     transport-encoding 1 (H4) and transport-speed (A8Bluetooth.cpp);
++ *   - a kernel control: with BT_HCI_TRANSPORT=H4:POSIX:com.apple.uart.
++ *     bluetooth in its environment (kern_exec.c adds it with a8bt=1)
++ *     bluetoothd's "POSIX" UART driver is a PF_SYSTEM socket to the control
++ *     of that name, termios through SYSPROTO_CONTROL get/setsockopt, H4 both
++ *     ways, one client at a time;
++ *   - com.apple.BlueTool answering "boot"/"init" with success: the fix
++ *     library's BlueTool mode (kern_exec.c puts it into BlueTool with
++ *     a8bt=1), because Apple's would load an iPhone's firmware.
++ * Between the socket and the BSMHCP rings this follows the A8's own vendor
++ * driver (Kitaez71/android_kernel_samsung_jackpotlte bt/scsc_shm.c and
++ * scsc_bt_priv.h):
++ *   - commands: the H4 type byte off, into the command ring, ap_to_bg;
++ *   - ACL out: the HCI header becomes the descriptor (handle, PB/BC flags,
++ *     length); a frame's first fragment gives its L2CAP CID, which its
++ *     continuations get too; BSMHCP_ACL_L2CAP_FLAG_END marks the fragment
++ *     that completes the frame; the payload goes into one of 30 1 KiB
++ *     buffers; ap_to_fg (a5bt_fg_doorbell);
++ *   - events: the H4 type put back.  The firmware marks the events that
++ *     connect and disconnect, and those marks order ACL data against the
++ *     events: an ACL packet waits for its connection's Connection Complete,
++ *     a Disconnection Complete waits for the connection's last ACL packet
++ *     (the "disconnected" mark in the ACL ring);
++ *   - ACL in: the HCI header rebuilt from the descriptor;
++ *   - the buffers the firmware frees (acl_tx_free ring) become Number Of
++ *     Completed Packets events, as the vendor driver makes them;
++ *   - the read indices back, then ap_to_bg (events taken) and ap_to_fg (ACL
++ *     in or credits taken);
++ *   - a firmware panic: one Hardware Error event.
++ * Vendor commands (OGF 0x3f) are Broadcom's and Apple's, for the chips
++ * bluetoothd knows: answered here with success and never sent to this chip
++ * (Jesvi's bt.block, made the default), or passed on with a8btvendor=1.  The
++ * first 64 of them and of the other commands and events are logged.  SCO is
++ * dropped: this chip's voice goes through the A-Box, which this port lacks.
++ *
++ * Threads: bluetoothd's writes arrive in its own thread (ctl_send runs with
++ * the socket unlocked, one send at a time); everything from the firmware is
++ * moved by the SCSC poll thread (a5bt_evt and the 10 ms tick).  a5h4_lock
++ * covers the rings, the buffer table and the connection table; nobody holds
++ * a socket lock while waiting for it.
++ */
++#define A5H4_CTL_NAME           "com.apple.uart.bluetooth"
++#define A5H4_SPEED              3000000u        /* transport-speed; no UART here */
++#define A5H4_ACL_MAX            1021u           /* BSMHCP_ACL_PACKET_SIZE */
++#define A5H4_TX_MAX             (5u + A5H4_ACL_MAX)
++#define A5H4_HANDLES            0x1000u         /* SCSC_BT_CONNECTION_INFO_MAX */
++#define A5H4_CREDIT_HANDLES     36u             /* BSMHCP_TRANSFER_RING_ACL_COUNT */
++#define A5H4_PB_MASK            0x30u
++#define A5H4_PB_CONT            0x10u
++#define A5H4_PB_RESERVED        0x30u
++#define A5H4_BC_ACTIVE          0x40u
++#define A5H4_BC_ALL             0x80u
++#define A5H4_L2CAP_END          0x01u           /* BSMHCP_ACL_L2CAP_FLAG_END */
++#define A5H4_EVT_CONNECTED      0x01u           /* BSMHCP_EVENT_TYPE_CONNECTED */
++#define A5H4_EVT_DISCONNECTED   0x02u
++#define A5H4_LOG_MAX            64u
++
++enum { A5H4_NONE = 0, A5H4_ACTIVE, A5H4_GONE };
++
++static struct a5h4_conn {
++	uint8_t  state;
++	uint16_t missing;       /* L2CAP octets still to come in continuations */
++	uint16_t cid;
++} a5h4_conn[A5H4_HANDLES];
++
++static struct {
++	kern_ctl_ref      ctl;
++	volatile uint32_t unit;         /* the connected client, 0: none */
++	bool              vendor_on;    /* a8btvendor=1 */
++	uint8_t           tx[A5H4_TX_MAX];      /* bluetoothd's bytes, not yet a packet */
++	uint32_t          tx_len;
++	uint8_t           rx[5 + A5BT_ACL_BUF_STRIDE];  /* one packet up (poll thread) */
++	bool              evt_paused, acl_paused, hw_error_sent;
++	bool              processed[A5BT_HCI_EVT_SLOTS];
++	uint32_t          free_scan;    /* next acl_tx_free entry whose buffer is released */
++	uint32_t          logged_cmds, logged_vendor, logged_evts, logged_errors;
++	uint64_t          cmds, vendor, events, acl_out, acl_in, credits, sco, full,
++	    dropped, errors;
++} a5h4;
++
++static LCK_GRP_DECLARE(a5h4_grp, "a5xelte-bt");
++static LCK_MTX_DECLARE(a5h4_lock, &a5h4_grp);
++
++extern int a8_bluetooth_publish(const uint8_t *address, uint32_t speed); /* A8Bluetooth.cpp */
++
++static void
++a5h4_error(const char *what, uint32_t a, uint32_t b)
++{
++	a5h4.errors++;
++	if (a5h4.logged_errors++ < A5H4_LOG_MAX) {
++		printf("A5XELTE BT: host side: %s (0x%x 0x%x)\n", what, a, b);
++	}
++}
++
++/* One H4 packet to bluetoothd.  ENOBUFS: its socket is full and the caller
++ * keeps what it has for later; anything else counts as delivered (with no
++ * client, or one that went, it is dropped). */
++static errno_t
++a5h4_up(const uint8_t *pkt, size_t len)
++{
++	uint32_t unit = a5h4.unit;
++	errno_t e;
++
++	if (unit == 0 || a5h4.ctl == NULL) {
++		a5h4.dropped++;
++		return 0;
++	}
++	e = ctl_enqueuedata(a5h4.ctl, unit, __DECONST(void *, pkt), len, 0);
++	if (e == ENOBUFS) {
++		a5h4.full++;
++		return ENOBUFS;
++	}
++	if (e != 0) {
++		a5h4.dropped++;
++	}
++	return 0;
++}
++
++static void
++a5h4_log_event(const uint8_t *e, uint32_t len)
++{
++	/* Read Local Version Information's answer, always: which controller
++	 * bluetoothd sees (HCI/LMP versions, manufacturer, subversion). */
++	if (len >= 15 && e[1] == 0x0e && e[4] == 0x01 && e[5] == 0x10) {
++		printf("A5XELTE BT: < local version: status 0x%02x, HCI %u rev 0x%04x, "
++		    "LMP %u sub 0x%04x, manufacturer %u\n", e[6], e[7],
++		    e[8] | (e[9] << 8), e[10], e[13] | (e[14] << 8), e[11] | (e[12] << 8));
++	}
++	if (a5h4.logged_evts >= A5H4_LOG_MAX) {
++		return;
++	}
++	a5h4.logged_evts++;
++	if (len >= 7 && e[1] == 0x0e) {
++		printf("A5XELTE BT: < command complete 0x%04x status 0x%02x (%u bytes)\n",
++		    e[4] | (e[5] << 8), e[6], len);
++	} else if (len >= 7 && e[1] == 0x0f) {
++		printf("A5XELTE BT: < command status 0x%04x status 0x%02x\n",
++		    e[5] | (e[6] << 8), e[3]);
++	} else {
++		printf("A5XELTE BT: < event 0x%02x (%u bytes)\n", len > 1 ? e[1] : 0, len);
++	}
++}
++
++/* An HCI event ring entry to bluetoothd. */
++static errno_t
++a5h4_event_up(volatile uint8_t *td)
++{
++	uint16_t len = a5bt_rd16(td, 0);
++	volatile uint8_t *d = td + A5BT_HCI_EVT_DATA_OFF;
++	uint32_t i;
++	errno_t e;
++
++	if (len < 2 || len > A5BT_HCI_DATA_MAX || (uint32_t)d[1] + 2u != len) {
++		/* "Firmware sent invalid HCI event" (scsc_shm.c): left out */
++		a5h4_error("invalid event from the firmware", len, len >= 2 ? d[0] : 0);
++		return 0;
++	}
++	a5h4.rx[0] = 0x04;
++	for (i = 0; i < len; i++) {
++		a5h4.rx[1 + i] = d[i];
++	}
++	e = a5h4_up(a5h4.rx, len + 1u);
++	if (e == 0) {
++		a5h4.events++;
++		a5h4_log_event(a5h4.rx, len + 1u);
++	}
++	return e;
++}
++
++/* An ACL RX ring entry to bluetoothd, its HCI header rebuilt (scsc_acl_read). */
++static errno_t
++a5h4_acl_up(volatile uint8_t *td, uint16_t handle)
++{
++	uint16_t len = a5bt_rd16(td, A5BT_ACL_RX_LENGTH);
++	uint8_t bc = td[A5BT_ACL_RX_BC], pb = td[A5BT_ACL_RX_PB];
++	uint32_t i;
++	errno_t e;
++
++	if (len > A5BT_ACL_BUF_STRIDE) {
++		a5h4_error("ACL packet from the firmware too long", handle, len);
++		return 0;
++	}
++	a5h4.rx[0] = 0x02;
++	a5h4.rx[1] = (uint8_t)handle;
++	a5h4.rx[2] = (uint8_t)(((handle >> 8) & 0x0f) | ((pb & 0x03) << 4) | ((bc & 0x03) << 6));
++	a5h4.rx[3] = (uint8_t)len;
++	a5h4.rx[4] = (uint8_t)(len >> 8);
++	for (i = 0; i < len; i++) {
++		a5h4.rx[5 + i] = td[A5BT_ACL_RX_DATA + i];
++	}
++	e = a5h4_up(a5h4.rx, 5u + len);
++	if (e == 0) {
++		a5h4.acl_in++;
++	}
++	return e;
++}
++
++/* The buffers the firmware is done with, up to the free ring's write index
++ * (scsc_shm.c: mailbox_acl_free_read_scan).  The free ring's read index
++ * moves separately, with the credits. */
++static void
++a5h4_release_locked(uint32_t fw)
++{
++	volatile uint8_t *p = a5bt.proto;
++
++	while (a5h4.free_scan != fw) {
++		uint8_t idx = p[A5BT_ACL_FREE_RING + a5h4.free_scan * A5BT_ACL_FREE_ENTRY];
++
++		if (idx < A5BT_ACL_BUFFERS && a5bt.acl_busy[idx]) {
++			a5bt.acl_busy[idx] = 0;
++			a5bt.acl_count--;
++			a5bt.acl_free_seen++;
++		}
++		a5h4.free_scan = (a5h4.free_scan + 1) % A5BT_ACL_FREE_SLOTS;
++	}
++}
++
++/* A new client: what the last one left is not for it.  Done at connect, under
++ * the lock, so that nothing the new client causes (its HCI Reset's answer) is
++ * thrown away with it. */
++static void
++a5h4_flush_locked(void)
++{
++	volatile uint8_t *p = a5bt.proto;
++	uint32_t ew, rw, fw;
++
++	if (p == NULL) {
++		return;
++	}
++	ew = a5bt_rd32(p, A5BT_H_EVT_WRITE);
++	rw = a5bt_rd32(p, A5BT_H_ACL_RX_WRITE);
++	fw = a5bt_rd32(p, A5BT_H_ACL_FREE_WRITE);
++	if (ew < A5BT_HCI_EVT_SLOTS && rw < A5BT_ACL_RX_SLOTS && fw < A5BT_ACL_FREE_SLOTS) {
++		a5h4_release_locked(fw);
++		a5bt_mb();
++		a5bt_wr32(p, A5BT_H_EVT_READ, ew);
++		a5bt_wr32(p, A5BT_H_ACL_RX_READ, rw);
++		a5bt_wr32(p, A5BT_H_ACL_FREE_READ, fw);
++		a5bt_mb();
++		a5scsc_irq_bit_set(a5bt.bit_from_bg, A5SCSC_MIF_TARGET_R4);
++		a5bt_fg_doorbell();
++	}
++	bzero(a5h4_conn, sizeof(a5h4_conn));
++	bzero(a5h4.processed, sizeof(a5h4.processed));
++	a5h4.evt_paused = a5h4.acl_paused = false;
++	a5h4.hw_error_sent = false;
++	a5h4.tx_len = 0;
++}
++
++/* The firmware's side of the rings to bluetoothd, in the vendor driver's
++ * order (scsc_bt_shm_h4_read): buffers released, then the events, the ACL
++ * data and the credits; the read indices back and the doorbells last.  Runs
++ * in the poll thread only. */
++static void
++a5h4_pump(void)
++{
++	volatile uint8_t *p = a5bt.proto;
++	uint32_t er, ew, rr, rw, fr, fw, er0, rr0, fr0, pass;
++	bool blocked = false;
++
++	if (p == NULL || !a5h4_open) {
++		return;
++	}
++	lck_mtx_lock(&a5h4_lock);
++	er0 = er = a5bt_rd32(p, A5BT_H_EVT_READ);
++	ew = a5bt_rd32(p, A5BT_H_EVT_WRITE);
++	rr0 = rr = a5bt_rd32(p, A5BT_H_ACL_RX_READ);
++	rw = a5bt_rd32(p, A5BT_H_ACL_RX_WRITE);
++	fr0 = fr = a5bt_rd32(p, A5BT_H_ACL_FREE_READ);
++	fw = a5bt_rd32(p, A5BT_H_ACL_FREE_WRITE);
++	if (er >= A5BT_HCI_EVT_SLOTS || ew >= A5BT_HCI_EVT_SLOTS ||
++	    rr >= A5BT_ACL_RX_SLOTS || rw >= A5BT_ACL_RX_SLOTS ||
++	    fr >= A5BT_ACL_FREE_SLOTS || fw >= A5BT_ACL_FREE_SLOTS) {
++		a5h4_error("ring index out of range", (ew << 16) | er, (rw << 16) | rr);
++		lck_mtx_unlock(&a5h4_lock);
++		return;
++	}
++
++	a5h4_release_locked(fw);
++
++	if (!a5h4.hw_error_sent && a5bt_rd16(p, A5BT_H_PANIC) != 0) {
++		static const uint8_t hw_error[4] = { 0x04, 0x10, 0x01, 0x00 };
++
++		if (a5h4_up(hw_error, sizeof(hw_error)) == 0) {
++			a5h4.hw_error_sent = true;
++			printf("A5XELTE BT: firmware panic 0x%04x: Hardware Error to bluetoothd\n",
++			    a5bt_rd16(p, A5BT_H_PANIC));
++		}
++	}
++
++	for (pass = 0; pass < 4 && !blocked; pass++) {
++		uint32_t er1 = er, rr1 = rr;
++		bool ep = a5h4.evt_paused, ap = a5h4.acl_paused;
++
++		/* Both stopped: the ACL head waits for a Connection Complete that
++		 * sits behind a paused Disconnection Complete.  Send that one
++		 * first (scsc_bt_shm_h4_queue_sync_helper). */
++		if (a5h4.evt_paused && a5h4.acl_paused && rr != rw) {
++			uint16_t h = a5bt_rd16(p + A5BT_ACL_RX_RING + rr * A5BT_ACL_RX_ENTRY,
++			    A5BT_ACL_RX_HANDLE);
++			uint32_t i;
++
++			for (i = er; i != ew; i = (i + 1) % A5BT_HCI_EVT_SLOTS) {
++				volatile uint8_t *td = p + A5BT_HCI_EVT_RING + i * A5BT_HCI_EVT_ENTRY;
++
++				if (!a5h4.processed[i] && (a5bt_rd16(td, 4) & A5H4_EVT_CONNECTED) &&
++				    a5bt_rd16(td, 2) == h && h < A5H4_HANDLES) {
++					if (a5h4_event_up(td) == ENOBUFS) {
++						blocked = true;
++						break;
++					}
++					a5h4_conn[h].state = A5H4_ACTIVE;
++					a5h4_conn[h].missing = 0;
++					a5h4.acl_paused = false;
++					a5h4.processed[i] = true;
++					break;
++				}
++			}
++		}
++
++		while (!blocked && !a5h4.evt_paused && er != ew) {
++			volatile uint8_t *td = p + A5BT_HCI_EVT_RING + er * A5BT_HCI_EVT_ENTRY;
++			uint16_t h = a5bt_rd16(td, 2), type = a5bt_rd16(td, 4);
++
++			if (a5h4.processed[er]) {
++				a5h4.processed[er] = false;
++				er = (er + 1) % A5BT_HCI_EVT_SLOTS;
++				continue;
++			}
++			if ((type & A5H4_EVT_CONNECTED) && h < A5H4_HANDLES) {
++				a5h4_conn[h].state = A5H4_ACTIVE;
++				a5h4_conn[h].missing = 0;
++				a5h4.acl_paused = false;
++			} else if ((type & A5H4_EVT_DISCONNECTED) && h < A5H4_HANDLES) {
++				if (a5h4_conn[h].state == A5H4_ACTIVE) {
++					/* its last ACL data first */
++					a5h4.evt_paused = true;
++					break;
++				}
++				a5h4_conn[h].state = A5H4_NONE;
++			}
++			if (a5h4_event_up(td) == ENOBUFS) {
++				blocked = true;
++				break;
++			}
++			er = (er + 1) % A5BT_HCI_EVT_SLOTS;
++		}
++
++		while (!blocked && !a5h4.acl_paused && rr != rw) {
++			volatile uint8_t *td = p + A5BT_ACL_RX_RING + rr * A5BT_ACL_RX_ENTRY;
++			uint16_t h = a5bt_rd16(td, A5BT_ACL_RX_HANDLE);
++
++			if (h >= A5H4_HANDLES) {
++				a5h4_error("ACL handle from the firmware out of range", h, rr);
++			} else if (a5h4_conn[h].state == A5H4_ACTIVE) {
++				if (td[A5BT_ACL_RX_GONE]) {
++					/* the connection's last: its Disconnection
++					 * Complete may go now */
++					a5h4_conn[h].state = A5H4_GONE;
++					a5h4.evt_paused = false;
++				} else if (a5h4_acl_up(td, h) == ENOBUFS) {
++					blocked = true;
++					break;
++				}
++			} else if (a5h4_conn[h].state == A5H4_NONE) {
++				/* before its Connection Complete: wait for it */
++				a5h4.acl_paused = true;
++				break;
++			} else {
++				/* after the disconnected mark: a firmware error
++				 * (scsc_shm.c), left out */
++				a5h4_error("ACL data after the disconnected mark", h, rr);
++			}
++			rr = (rr + 1) % A5BT_ACL_RX_SLOTS;
++		}
++
++		if (er == er1 && rr == rr1 && ep == a5h4.evt_paused && ap == a5h4.acl_paused) {
++			break;
++		}
++	}
++
++	/* credits: the buffers freed since the last ones, a Number Of
++	 * Completed Packets event for the connections still up
++	 * (scsc_bt_shm_h4_read_acl_credit) */
++	if (!blocked && fr != fw) {
++		uint8_t ev[4 + 4 * A5H4_CREDIT_HANDLES];
++		uint16_t hs[A5H4_CREDIT_HANDLES], cs[A5H4_CREDIT_HANDLES];
++		uint32_t n = 0, i = fr, k, total = 0;
++
++		while (i != fw) {
++			uint16_t h = a5bt_rd16(p + A5BT_ACL_FREE_RING + i * A5BT_ACL_FREE_ENTRY, 2);
++
++			if (h < A5H4_HANDLES && a5h4_conn[h].state == A5H4_ACTIVE) {
++				for (k = 0; k < n && hs[k] != h; k++) {
++				}
++				if (k == n) {
++					if (n == A5H4_CREDIT_HANDLES) {
++						break;  /* the rest in the next event */
++					}
++					hs[n] = h;
++					cs[n] = 0;
++					n++;
++				}
++				cs[k]++;
++				total++;
++			}
++			/* (one for a connection gone: dropped, as scsc_shm.c does) */
++			i = (i + 1) % A5BT_ACL_FREE_SLOTS;
++		}
++		if (n == 0) {
++			fr = i;
++		} else {
++			ev[0] = 0x04;
++			ev[1] = 0x13;
++			ev[2] = (uint8_t)(1 + 4 * n);
++			ev[3] = (uint8_t)n;
++			for (k = 0; k < n; k++) {
++				ev[4 + 4 * k] = (uint8_t)hs[k];
++				ev[5 + 4 * k] = (uint8_t)(hs[k] >> 8);
++				ev[6 + 4 * k] = (uint8_t)cs[k];
++				ev[7 + 4 * k] = (uint8_t)(cs[k] >> 8);
++			}
++			if (a5h4_up(ev, 4 + 4 * n) == 0) {
++				fr = i;
++				a5h4.credits += total;
++			}
++		}
++	}
++
++	if (er != er0) {
++		a5bt_mb();
++		a5bt_wr32(p, A5BT_H_EVT_READ, er);
++	}
++	if (rr != rr0) {
++		a5bt_mb();
++		a5bt_wr32(p, A5BT_H_ACL_RX_READ, rr);
++	}
++	if (fr != fr0) {
++		a5bt_mb();
++		a5bt_wr32(p, A5BT_H_ACL_FREE_READ, fr);
++	}
++	a5bt_mb();
++	if (er != er0) {
++		a5scsc_irq_bit_set(a5bt.bit_from_bg, A5SCSC_MIF_TARGET_R4);
++	}
++	if (rr != rr0 || fr != fr0) {
++		a5bt_fg_doorbell();
++	}
++	lck_mtx_unlock(&a5h4_lock);
++}
++
++/* ---- from bluetoothd (its thread; no lock held while waiting) ---- */
++
++static bool
++a5h4_tx_cmd(const uint8_t *cmd, uint32_t len)
++{
++	uint32_t waited;
++
++	for (waited = 0; waited < 1000; waited += 2) {
++		bool ok;
++
++		lck_mtx_lock(&a5h4_lock);
++		ok = a5bt_hci_cmd(cmd, len);
++		lck_mtx_unlock(&a5h4_lock);
++		if (ok) {
++			return true;
++		}
++		a5bt_sleep_ms(2);
++	}
++	return false;
++}
++
++/* `a` is the ACL packet after its H4 type byte: the HCI header, then the
++ * payload (scsc_bt_shm_h4_acl_write). */
++static void
++a5h4_tx_acl(const uint8_t *a, uint32_t len)
++{
++	uint16_t h = (uint16_t)(a[0] | ((a[1] & 0x0f) << 8));
++	uint8_t flags = a[1] & 0xf0;
++	uint32_t plen = len - 4, waited;
++	uint16_t cid = 0;
++	int err = EINVAL;
++
++	lck_mtx_lock(&a5h4_lock);
++	if (flags & (A5H4_BC_ACTIVE | A5H4_BC_ALL)) {
++		a5h4_conn[h].state = A5H4_ACTIVE;       /* a broadcast handle */
++	}
++	if ((flags & A5H4_PB_MASK) == A5H4_PB_RESERVED) {
++		lck_mtx_unlock(&a5h4_lock);
++		a5h4_error("ACL packet boundary flag reserved", h, flags);
++		return;
++	}
++	if ((flags & A5H4_PB_MASK) == A5H4_PB_CONT) {
++		cid = a5h4_conn[h].cid;
++		if (a5h4_conn[h].missing <= plen) {
++			/* completes the frame (or more than it, allowed as the
++			 * vendor allows it for its tester) */
++			flags |= A5H4_L2CAP_END;
++			a5h4_conn[h].missing = 0;
++		} else {
++			a5h4_conn[h].missing -= (uint16_t)plen;
++		}
++	} else {
++		uint16_t l2;
++
++		if (plen < 4) {
++			lck_mtx_unlock(&a5h4_lock);
++			a5h4_error("ACL start fragment without an L2CAP header", h, plen);
++			return;
++		}
++		l2 = (uint16_t)(a[4] | (a[5] << 8));
++		cid = (uint16_t)(a[6] | (a[7] << 8));
++		if ((uint32_t)l2 <= plen - 4) {
++			flags |= A5H4_L2CAP_END;
++			a5h4_conn[h].missing = 0;
++		} else {
++			a5h4_conn[h].missing = (uint16_t)(l2 - (plen - 4));
++			a5h4_conn[h].cid = cid;
++		}
++	}
++	lck_mtx_unlock(&a5h4_lock);
++
++	/* a buffer and a ring slot: the poll thread frees them (2 s at most) */
++	for (waited = 0; ; waited += 2) {
++		lck_mtx_lock(&a5h4_lock);
++		err = a5scsc_bt_acl_send(h, flags, cid, a + 4, plen);
++		lck_mtx_unlock(&a5h4_lock);
++		if (err != EAGAIN || waited >= 2000) {
++			break;
++		}
++		a5bt_sleep_ms(2);
++	}
++	if (err == 0) {
++		a5h4.acl_out++;
++	} else {
++		a5h4_error("ACL packet not taken by the firmware", h, (uint32_t)err);
++	}
++}
++
++static void
++a5h4_tx_packet(const uint8_t *b, uint32_t n)
++{
++	if (b[0] == 0x01) {
++		uint16_t op = (uint16_t)(b[1] | (b[2] << 8));
++
++		a5h4.cmds++;
++		if ((op >> 10) == 0x3f) {
++			a5h4.vendor++;
++			if (a5h4.logged_vendor++ < A5H4_LOG_MAX) {
++				printf("A5XELTE BT: > vendor command 0x%04x, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x (%s)\n",
++				    op, b[3], n > 4 ? b[4] : 0, n > 5 ? b[5] : 0, n > 6 ? b[6] : 0,
++				    n > 7 ? b[7] : 0, n > 8 ? b[8] : 0, n > 9 ? b[9] : 0,
++				    n > 10 ? b[10] : 0, n > 11 ? b[11] : 0,
++				    a5h4.vendor_on ? "to the chip" : "answered here");
++			}
++			if (!a5h4.vendor_on) {
++				uint8_t cc[7] = { 0x04, 0x0e, 0x04, 0x01, (uint8_t)op, (uint8_t)(op >> 8), 0x00 };
++				uint32_t tries;
++
++				for (tries = 0; a5h4_up(cc, sizeof(cc)) == ENOBUFS && tries < 500; tries++) {
++					a5bt_sleep_ms(2);
++				}
++				return;
++			}
++		} else if (a5h4.logged_cmds++ < A5H4_LOG_MAX) {
++			printf("A5XELTE BT: > command 0x%04x, %u bytes\n", op, b[3]);
++		}
++		if (!a5h4_tx_cmd(b + 1, n - 1)) {
++			a5h4_error("command ring full for 1 s, command dropped", op, 0);
++		}
++	} else if (b[0] == 0x02) {
++		a5h4_tx_acl(b + 1, n - 1);
++	} else {
++		a5h4.sco++;
++	}
++}
++
++/* Splits bluetoothd's byte stream into H4 packets (scsc_bt_shm_h4_write). */
++static void
++a5h4_tx_parse(void)
++{
++	for (;;) {
++		uint8_t *b = a5h4.tx;
++		uint32_t have = a5h4.tx_len, need;
++
++		if (have == 0) {
++			return;
++		}
++		if (b[0] == 0x01 || b[0] == 0x03) {
++			if (have < 4) {
++				return;
++			}
++			need = 4u + b[3];
++		} else if (b[0] == 0x02) {
++			if (have < 5) {
++				return;
++			}
++			need = 5u + (uint32_t)(b[3] | (b[4] << 8));
++			if (need - 5u > A5H4_ACL_MAX) {
++				a5h4_error("ACL packet from bluetoothd too long: stream dropped", need - 5u, 0);
++				a5h4.tx_len = 0;
++				return;
++			}
++		} else {
++			a5h4_error("H4 type from bluetoothd unknown: stream dropped", b[0], have);
++			a5h4.tx_len = 0;
++			return;
++		}
++		if (have < need) {
++			return;
++		}
++		a5h4_tx_packet(b, need);
++		memmove(b, b + need, have - need);
++		a5h4.tx_len = have - need;
++	}
++}
++
++/* ---- the kernel control ---- */
++
++static errno_t
++a5h4_connect(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	lck_mtx_lock(&a5h4_lock);
++	if (a5h4.unit != 0) {
++		lck_mtx_unlock(&a5h4_lock);
++		return EBUSY;
++	}
++	*unitinfo = NULL;
++	a5h4_flush_locked();
++	a5h4.unit = sac->sc_unit;
++	lck_mtx_unlock(&a5h4_lock);
++	printf("A5XELTE BT: %s: a client connected (unit %u)\n", A5H4_CTL_NAME, sac->sc_unit);
++	return 0;
++}
++
++static errno_t
++a5h4_disconnect(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused)
++{
++	lck_mtx_lock(&a5h4_lock);
++	if (a5h4.unit == unit) {
++		a5h4.unit = 0;
++	}
++	lck_mtx_unlock(&a5h4_lock);
++	printf("A5XELTE BT: %s: the client went (unit %u): commands %llu (vendor %llu), "
++	    "events %llu, ACL out %llu in %llu, credits %llu, SCO dropped %llu, socket full %llu, "
++	    "dropped %llu, errors %llu\n", A5H4_CTL_NAME, unit, a5h4.cmds, a5h4.vendor,
++	    a5h4.events, a5h4.acl_out, a5h4.acl_in, a5h4.credits, a5h4.sco, a5h4.full,
++	    a5h4.dropped, a5h4.errors);
++	return 0;
++}
++
++static errno_t
++a5h4_send(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused,
++    mbuf_t m, int flags __unused)
++{
++	mbuf_t n;
++
++	for (n = m; n != NULL; n = mbuf_next(n)) {
++		const uint8_t *d = (const uint8_t *)mbuf_data(n);
++		size_t len = mbuf_len(n);
++
++		while (len > 0) {
++			size_t take = MIN(len, sizeof(a5h4.tx) - a5h4.tx_len);
++
++			memcpy(a5h4.tx + a5h4.tx_len, d, take);
++			a5h4.tx_len += (uint32_t)take;
++			d += take;
++			len -= take;
++			a5h4_tx_parse();
++		}
++	}
++	mbuf_freem(m);
++	return 0;
++}
++
++/* termios: the speed is nobody's here, so any setting is taken and the
++ * answer is an 8N1 line with flow control at A5H4_SPEED (Jesvi's). */
++static errno_t
++a5h4_setopt(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused,
++    int opt, void *data __unused, size_t len __unused)
++{
++	uint32_t o = (uint32_t)opt;
++
++	return o == (uint32_t)TIOCSETA_64 || o == (uint32_t)TIOCSETAW_64 ||
++	       o == (uint32_t)TIOCSETAF_64 ? 0 : EINVAL;
++}
++
++static errno_t
++a5h4_getopt(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused,
++    int opt, void *data, size_t *len)
++{
++	struct user_termios t;
++
++	if ((uint32_t)opt != (uint32_t)TIOCGETA_64 || data == NULL || *len < sizeof(t)) {
++		return EINVAL;
++	}
++	bzero(&t, sizeof(t));
++	t.c_iflag = IGNPAR;
++	t.c_cflag = CS8 | CREAD | CLOCAL | CCTS_OFLOW | CRTS_IFLOW;
++	t.c_ispeed = A5H4_SPEED;
++	t.c_ospeed = A5H4_SPEED;
++	memcpy(data, &t, sizeof(t));
++	*len = sizeof(t);
++	return 0;
++}
++
++/* After HCI Reset was answered: the rings to the pump, then the control and
++ * the IOService for bluetoothd. */
++static void
++a5h4_start(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t e;
++	int v = 0;
++
++	(void)PE_parse_boot_argn("a8btvendor", &v, sizeof(v));
++	a5h4.vendor_on = v != 0;
++	lck_mtx_lock(&a5h4_lock);
++	a5h4.free_scan = a5bt_rd32(a5bt.proto, A5BT_H_ACL_FREE_READ) % A5BT_ACL_FREE_SLOTS;
++	lck_mtx_unlock(&a5h4_lock);
++	a5h4_open = true;
++	a5scsc_tick_set(a5h4_pump);
++
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, A5H4_CTL_NAME, sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
++	reg.ctl_sendsize = 64 << 10;
++	reg.ctl_recvsize = 256 << 10;
++	reg.ctl_connect = a5h4_connect;
++	reg.ctl_disconnect = a5h4_disconnect;
++	reg.ctl_send = a5h4_send;
++	reg.ctl_setopt = a5h4_setopt;
++	reg.ctl_getopt = a5h4_getopt;
++	e = ctl_register(&reg, &a5h4.ctl);
++	if (e != 0) {
++		printf("A5XELTE BT: host side: kernel control %s not registered (%d)\n",
++		    A5H4_CTL_NAME, e);
++		return;
++	}
++	if (a8_bluetooth_publish(a5bt.address, A5H4_SPEED) != 0) {
++		printf("A5XELTE BT: host side: the IOService \"bluetooth\" was not published\n");
++	}
++	printf("A5XELTE BT: host side ready: kernel control %s (H4), IOService \"bluetooth\"; "
++	    "vendor commands %s\n", A5H4_CTL_NAME,
++	    a5h4.vendor_on ? "go to the chip (a8btvendor=1)" : "answered here");
++}
++
+ /* 0220: true once BT's bring-up has finished, or when it does not run, so
+  * that the WLAN service (a5xelte_wlan.c) starts after it: the transport's
+  * streams take no lock. */
+@@ -584,6 +1422,7 @@ a5bt_bringup_run(void)
+ 	printf("A5XELTE BT: hci: reset complete after %u ms (events %u)\n",
+ 	    waited, a5bt.events);
+ 	printf("A5XELTE BT: up: controller answered HCI Reset\n");
++	a5h4_start();           /* 0221: bluetoothd's side */
+ }
+ 
+ static void
+diff --git a/bsd/dev/a5xelte_bt.h b/bsd/dev/a5xelte_bt.h
+index d79dd07..204f14e 100644
+--- a/bsd/dev/a5xelte_bt.h
++++ b/bsd/dev/a5xelte_bt.h
+@@ -67,6 +67,7 @@
+ #define A5BT_H_SERVICE_STATE    0x56u   /* u8   service_state              */
+ #define A5BT_H_ACL_TX_READ      0x60u   /* u32  mailbox_acl_tx_read        */
+ #define A5BT_H_ACL_FREE_WRITE   0x64u   /* u32  mailbox_acl_free_write     */
++#define A5BT_H_ACL_RX_WRITE     0x68u   /* u32  mailbox_acl_rx_write (0221) */
+ #define A5BT_H_INFO_AP_TO_BG    0xbcu   /* u16  info_ap_to_bg_int_src (0210) */
+ #define A5BT_H_INFO_BG_TO_AP    0xbeu   /* u16  info_bg_to_ap_int_src (0210) */
+ #define A5BT_H_MXLOG_FILTER     0xc0u   /* u32  mxlog_filter   (left 0)    */
+@@ -77,7 +78,7 @@
+ #define A5BT_ABOX_LENGTH        0x4100u
+ 
+ /* Transfer rings (bsmhcp.h:278-321).  An entry is a length word followed by an
+- * inline data buffer; the data starts with the H4 packet type. */
++ * inline data buffer; the data is the HCI packet without its H4 type byte. */
+ #define A5BT_HCI_CMD_RING       0x00100u
+ #define A5BT_HCI_CMD_SLOTS      8u      /* BSMHCP_TRANSFER_RING_CMD_SIZE   */
+ #define A5BT_HCI_CMD_ENTRY      260u    /* u16 length + u8 data[258]       */
+@@ -104,6 +105,14 @@
+ #define A5BT_ACL_BUFFERS        30u     /* BSMHCP_DATA_BUFFER_TX_ACL_SIZE  */
+ #define A5BT_ACL_BUF_STRIDE     1024u   /* BSMHCP_ACL_BUFFER_SIZE          */
+ #define A5BT_ACL_RX_RING        0x0e440u        /* 32 x 1032 bytes         */
++#define A5BT_ACL_RX_SLOTS       32u     /* BSMHCP_TRANSFER_RING_ACL_SIZE   */
++#define A5BT_ACL_RX_ENTRY       1032u   /* struct BSMHCP_TD_ACL_RX (0221): */
++#define A5BT_ACL_RX_HANDLE      0u      /* u16 hci_connection_handle       */
++#define A5BT_ACL_RX_LENGTH      2u      /* u16 length                      */
++#define A5BT_ACL_RX_BC          4u      /* u8  broadcast_flag              */
++#define A5BT_ACL_RX_PB          5u      /* u8  packet_boundary             */
++#define A5BT_ACL_RX_GONE        6u      /* u8  disconnected                */
++#define A5BT_ACL_RX_DATA        8u      /* u8  data[1024]                  */
+ #define A5BT_ACL_FREE_RING      0x16540u        /* 32 x 4 bytes            */
+ #define A5BT_ACL_FREE_SLOTS     32u
+ #define A5BT_ACL_FREE_ENTRY     4u
+@@ -115,9 +124,9 @@
+  * `len` is its length, which is what the descriptor's `length` field wants
+  * (scsc_shm.c:314, 419).  `flags` carries the PB/BC bits from the
+  * caller's HCI header (0x30/0xC0 masks) and BSMHCP_ACL_L2CAP_FLAG_END (0x01)
+- * when the payload completes an L2CAP frame.  Single packet only: no
+- * fragmentation, so PB = continuation is not handled.  No caller yet (no HCI
+- * device node); see the file comment in a5xelte_bt.c. */
++ * when the payload completes an L2CAP frame.  One HCI packet a call; the
++ * caller (0221, the host side in a5xelte_bt.c) keeps the L2CAP state that
++ * fragments need.  EAGAIN: no buffer or ring slot free yet. */
+ int a5scsc_bt_acl_send(uint16_t handle, uint8_t flags, uint16_t l2cap_cid,
+     const void *payload, uint32_t len);
+ 
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index 2e72e41..b8e57e2 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -1365,11 +1365,26 @@ a5scsc_sleep_ms(uint32_t ms)
+ 	(void)thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* 0221: see a5scsc_tick_set() in the header. */
++static void (*volatile a5scsc_tick_fn)(void);
++
++void
++a5scsc_tick_set(void (*fn)(void))
++{
++	a5scsc_tick_fn = fn;
++}
++
+ static void
+ a5scsc_poll_thread(void *param __unused, wait_result_t wr __unused)
+ {
+ 	while (a5scsc.poll_running) {
++		void (*tick)(void);
++
+ 		a5scsc_intr_dispatch();
++		tick = a5scsc_tick_fn;
++		if (tick != NULL) {
++			tick();
++		}
+ 		a5scsc_mxlog_drain(0, NULL);
+ 		a5scsc_sleep_ms(A5SCSC_POLL_INTERVAL_MS);
+ 	}
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index f2c9f7d..6a7fc43 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -345,4 +345,9 @@ void a5scsc_mxmgmt_register(uint8_t channel, a5scsc_mxmgmt_fn fn, void *arg);
+  * that the BT and WLAN services can both listen. */
+ void a5scsc_sm_register(uint8_t service, a5scsc_mxmgmt_fn fn, void *arg);
+ 
++/* 0221: one function the poll thread also runs every pass, for work that has
++ * to come back without an interrupt (a5xelte_bt.c's host side, when
++ * bluetoothd's socket was full).  NULL: none. */
++void a5scsc_tick_set(void (*fn)(void));
++
+ #endif /* _A5XELTE_SCSC_H_ */
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 3ce5508..6deb63c 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -304,17 +304,41 @@ a8_fixinto_wants(const char *name, size_t len)
+ static char a8_noexec_buf[2][128];
+ static const char *volatile a8_noexec_names = "";
+ static uint32_t a8_noexec_flip;
++static volatile bool a8_noexec_seeded;
+ 
+ void a8_noexec_set(const char *names);
+ const char *a8_noexec_get(void);
+ bool a8_noexec_wants(const char *name, size_t len);
+ 
++/*
++ * 0221: the list starts as "PosterBoard": with its poster extensions not in
++ * LaunchServices (P2) it crashed every ~8 s, ~2200 times in 5 h, and the idle
++ * load was ~30% instead of ~15% (11-25).  Refused, launchd tries it again
++ * only now and then.  Boot-arg a8pb=1 lets it run; console "noexec -" too,
++ * until the reboot.
++ */
++static void
++a8_noexec_seed(void)
++{
++	uint32_t pb = 0;
++
++	if (a8_noexec_seeded) {
++		return;
++	}
++	a8_noexec_seeded = true;
++	if ((!PE_parse_boot_argn("a8pb", &pb, sizeof(pb)) || pb == 0) &&
++	    a8_noexec_names[0] == 0) {
++		a8_noexec_names = "PosterBoard";
++	}
++}
++
+ void
+ a8_noexec_set(const char *names)
+ {
+ 	char *buf = a8_noexec_buf[++a8_noexec_flip & 1u];
+ 	size_t n;
+ 
++	a8_noexec_seed();
+ 	while (*names == ' ') {
+ 		names++;
+ 	}
+@@ -331,14 +355,17 @@ a8_noexec_set(const char *names)
+ const char *
+ a8_noexec_get(void)
+ {
++	a8_noexec_seed();
+ 	return a8_noexec_names;
+ }
+ 
+ bool
+ a8_noexec_wants(const char *name, size_t len)
+ {
+-	const char *list = a8_noexec_names;
++	const char *list;
+ 
++	a8_noexec_seed();
++	list = a8_noexec_names;
+ 	return name != NULL && list[0] != 0 && a8_tee_listed(list, name, len);
+ }
+ #endif /* JACKPOTLTE */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index d3115dd..ac771be 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5627,6 +5627,21 @@ extern bool a8_fixinto_wants(const char *name, size_t len); /* mem.c, console "f
+ #define A8_FIX_LIBRARY  "/private/var/mobile/Library/libjackpotlte-fix.dylib"
+ static TUNABLE(uint32_t, exec_inject_fix, "a8fix", 0);
+ 
++/*
++ * 0221: a8bt=1 (bsd/dev/a5xelte_bt.c) also puts the fix library into Apple's
++ * BlueTool, where it answers com.apple.BlueTool itself (its BlueTool mode):
++ * the kernel has booted the chip, and Apple's would load an iPhone's
++ * firmware into it.  And bluetoothd gets its transport (below).
++ */
++static TUNABLE(uint32_t, exec_a8bt, "a8bt", 0);
++
++static bool
++exec_a8bt_wants_fix(const char *name, size_t namelen)
++{
++	return exec_a8bt != 0 && name != NULL && namelen == 8 &&
++	       strncmp(name, "BlueTool", 8) == 0;
++}
++
+ static bool
+ exec_inject_is_app(struct image_params *imgp)
+ {
+@@ -5732,8 +5747,8 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 		    name != NULL ? name : "(?)", any ? env : "(no match)");
+ 	}
+ #if defined(JACKPOTLTE)
+-	if (exec_inject_fix != 0 && (exec_inject_is_app(imgp) || a8_fixinto_wants(name, namelen)) &&
+-	    a8_fix_library_ok()) {
++	if (exec_inject_fix != 0 && (exec_inject_is_app(imgp) || a8_fixinto_wants(name, namelen) ||
++	    exec_a8bt_wants_fix(name, namelen)) && a8_fix_library_ok()) {
+ 		size_t fixlen = strlen(A8_FIX_LIBRARY);
+ 
+ 		if (used + 1 + fixlen < size) {
+@@ -6089,6 +6104,32 @@ exec_extract_strings(struct image_params *imgp)
+ 			imgp->ip_envc++;
+ 		}
+ 	}
++
++	/*
++	 * 0221: with a8bt=1, bluetoothd's HCI transport: H4 over the kernel
++	 * control bsd/dev/a5xelte_bt.c registers (its "POSIX" driver is a
++	 * PF_SYSTEM socket to the control named here; without the variable
++	 * bluetoothd reads its transport from a plist).
++	 */
++	if (exec_a8bt != 0 && imgp->ip_ndp != NULL &&
++	    imgp->ip_ndp->ni_cnd.cn_nameptr != NULL &&
++	    imgp->ip_ndp->ni_cnd.cn_namelen == 10 &&
++	    strncmp(imgp->ip_ndp->ni_cnd.cn_nameptr, "bluetoothd", 10) == 0) {
++		char var[64];
++
++		strlcpy(var, "BT_HCI_TRANSPORT=H4:POSIX:com.apple.uart.bluetooth", sizeof(var));
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++		printf("A8 BT: bluetoothd += %s\n", var);
++	}
+ #endif /* JACKPOTLTE */
+ 
+ 	/* Save space for envv[] NULL terminator */
+diff --git a/iokit/Kernel/arm/A8Bluetooth.cpp b/iokit/Kernel/arm/A8Bluetooth.cpp
+new file mode 100644
+index 0000000..df01e8a
+--- /dev/null
++++ b/iokit/Kernel/arm/A8Bluetooth.cpp
+@@ -0,0 +1,69 @@
++/*
++ * 0221: the Galaxy A8's Bluetooth for iOS's bluetoothd: an IOService named
++ * "bluetooth", which bluetoothd looks for first, with what it reads of it:
++ * local-mac-address (the device address), transport-encoding (1: H4) and
++ * transport-speed.  The HCI itself goes through the kernel control that
++ * bsd/dev/a5xelte_bt.c registers.  As the Galaxy S20 port's RedwoodBluetooth
++ * (jesvi-eulah/Jesvi-iOS, xnu/files/iokit/Kernel/RedwoodWLAN.cpp).
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSData.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++class A8Bluetooth : public IOService
++{
++	OSDeclareDefaultStructors(A8Bluetooth);
++};
++
++OSDefineMetaClassAndStructors(A8Bluetooth, IOService);
++
++extern "C" int a8_bluetooth_publish(const uint8_t *address, uint32_t speed);
++
++int
++a8_bluetooth_publish(const uint8_t *address, uint32_t speed)
++{
++	IOService *platform = IOService::getPlatform();
++	A8Bluetooth *bt;
++	OSData *data;
++	uint32_t encoding = 1;
++
++	if (platform == NULL || address == NULL) {
++		return -1;
++	}
++	bt = OSTypeAlloc(A8Bluetooth);
++	if (bt == NULL || !bt->init()) {
++		OSSafeReleaseNULL(bt);
++		return -1;
++	}
++	if ((data = OSData::withBytes(address, 6)) != NULL) {
++		bt->setProperty("local-mac-address", data);
++		data->release();
++	}
++	if ((data = OSData::withBytes(&encoding, sizeof(encoding))) != NULL) {
++		bt->setProperty("transport-encoding", data);
++		data->release();
++	}
++	if ((data = OSData::withBytes(&speed, sizeof(speed))) != NULL) {
++		bt->setProperty("transport-speed", data);
++		data->release();
++	}
++	bt->setProperty("IOBuiltin", true);
++	if (!bt->attach(platform)) {
++		bt->release();
++		return -1;
++	}
++	bt->setName("bluetooth");
++	if (!bt->start(platform)) {
++		bt->detach(platform);
++		bt->release();
++		return -1;
++	}
++	bt->registerService();
++	bt->release();
++	IOLog("A8Bluetooth: \"bluetooth\" published (H4, %u)\n", speed);
++	return 0;
++}
++
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 67ed933..365ff13 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/JackpotlteMali.cpp                              optional iokitcpp
++iokit/Kernel/arm/A8Bluetooth.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+-- 
+2.43.0
+
