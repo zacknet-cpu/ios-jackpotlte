@@ -129,6 +129,9 @@ typedef struct { double x, y, w, h; } fix_rect;
 extern char *getenv(const char *name);
 extern const char *class_getName(Class cls);
 extern Class class_getSuperclass(Class cls);
+extern Method *class_copyMethodList(Class cls, unsigned int *count);
+extern SEL method_getName(Method m);
+extern const char *sel_getName(SEL sel);
 extern IMP class_getMethodImplementation(Class cls, SEL sel);
 extern signed char class_addMethod(Class cls, SEL sel, IMP imp, const char *types);
 extern Class object_getClass(id obj);
@@ -1000,51 +1003,88 @@ layout_apply(void)
 	}
 }
 
-/* ---- v14: the sensor curtain over the expanded island ------------------ */
+/* ---- v14: views of the island hidden in SpringBoard ---------------------- */
 
 /*
- * SpringBoard draws the Dynamic Island in two SBSystemApertureWindows.  The
- * one that takes no touches holds only _SBSystemApertureMagiciansCurtainView,
- * the black cover over the iPhone 14 Pro's camera and Face ID sensors, drawn
- * above everything else.  This screen is 360 pt wide (no Dynamic Island
- * iPhone is under 393), so the expanded timer puts its X button partly under
- * that cover: a pill-shaped bite.  There is no camera there on this phone, so
- * that curtain is hidden; the other window's curtain still draws the idle
- * pill under the island's content.  /private/var/mobile/Library/a8fix-curtain
- * holding "1" keeps it (read when SpringBoard starts).
+ * SpringBoard draws the Dynamic Island in two SBSystemApertureWindows.
+ *
+ * The sensor curtain (user report 11-25): the window that takes no touches
+ * holds only _SBSystemApertureMagiciansCurtainView, the black cover over the
+ * iPhone 14 Pro's camera and Face ID sensors, drawn above everything else.
+ * This screen is 360 pt wide (no Dynamic Island iPhone is under 393), so the
+ * expanded timer puts its X button partly under that cover: a pill-shaped
+ * bite.  There is no camera there on this phone, so that curtain is hidden;
+ * the other window's curtain still draws the idle pill under the island's
+ * content.  /private/var/mobile/Library/a8fix-curtain "1" keeps it.
+ *
+ * The adaptive key line (v14g, P3): _SBAdaptiveKeyLineBackdropView draws a
+ * faint ring around the island over dark content, fed by a
+ * _UILumaTrackingBackdropView that copies and filters what is behind the
+ * island.  Together they are 11 of the island's ~40 draws and two of its
+ * render-target switches on every frame the island is redrawn (a running
+ * Live Activity, or anything moving under the status bar).  Both are hidden
+ * in the aperture windows; /private/var/mobile/Library/a8fix-keyline "1"
+ * keeps them.  (Switches are read when SpringBoard starts.)
  */
 #define CURTAIN_SWITCH "/private/var/mobile/Library/a8fix-curtain"
+#define KEYLINE_SWITCH "/private/var/mobile/Library/a8fix-keyline"
 
-static void (*curtain_layout_orig)(id, SEL);
-static void (*curtain_moved_orig)(id, SEL);
-static void (*curtain_hidden_orig)(id, SEL, signed char);
+enum { HIDE_CURTAIN, HIDE_KEYLINE, HIDE_LUMA, HIDE_N };
+static const char *const hide_class[HIDE_N] = {
+	"_SBSystemApertureMagiciansCurtainView",
+	"_SBAdaptiveKeyLineBackdropView",
+	"_UILumaTrackingBackdropView",
+};
+static const char *const hide_what[HIDE_N] = {
+	"the sensor curtain in the touchless aperture window",
+	"the adaptive key line",
+	"the key line's luma tracking backdrop",
+};
+static void (*hide_layout_orig[HIDE_N])(id, SEL);
+static void (*hide_moved_orig[HIDE_N])(id, SEL);
+static void (*hide_hidden_orig[HIDE_N])(id, SEL, signed char);
+static int hide_done[HIDE_N], hide_said[HIDE_N];
 static struct {
 	id view;
 	signed char want;       /* what SpringBoard last asked for */
 	signed char forced;     /* hidden here */
-} curtain_seen[8];
-static unsigned curtain_next;
-static int curtain_done, curtain_said;
+} hide_seen[16];
+static unsigned hide_next;
+
+/* one console line from three pieces (pieces written apart arrive as
+ * separate lines) */
+static void
+fix_line3(const char *a, const char *b, const char *c)
+{
+	struct vline l;
+
+	l.n = 0;
+	vl_str(&l, a);
+	vl_str(&l, b);
+	vl_str(&l, c);
+	l.b[l.n++] = '\n';
+	write(2, l.b, l.n);
+}
 
 static unsigned
-curtain_slot(id view)
+hide_slot(id view)
 {
 	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
 	unsigned k;
 
-	for (k = 0; k < 8; k++)
-		if (curtain_seen[k].view == view)
+	for (k = 0; k < 16; k++)
+		if (hide_seen[k].view == view)
 			return k;
-	k = curtain_next++ % 8;
-	curtain_seen[k].view = view;
-	curtain_seen[k].want = flag(view, sel_registerName("isHidden"));
-	curtain_seen[k].forced = 0;
+	k = hide_next++ % 16;
+	hide_seen[k].view = view;
+	hide_seen[k].want = flag(view, sel_registerName("isHidden"));
+	hide_seen[k].forced = 0;
 	return k;
 }
 
-/* in the aperture window that takes no touches (the sensor cover)? */
+/* in an aperture window (for the curtain: the one that takes no touches)? */
 static int
-curtain_cover(id view)
+hide_wanted(int which, id view)
 {
 	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
 	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
@@ -1052,85 +1092,440 @@ curtain_cover(id view)
 	Class aperture = objc_getClass("SBSystemApertureWindow");
 	id w = get(view, sel_registerName("window"));
 
-	return w != 0 && aperture != 0 && is_kind(w, sel_registerName("isKindOfClass:"), aperture) &&
-	    !flag(w, sel_registerName("isUserInteractionEnabled"));
+	if (w == 0 || aperture == 0 || !is_kind(w, sel_registerName("isKindOfClass:"), aperture))
+		return 0;
+	return which != HIDE_CURTAIN || !flag(w, sel_registerName("isUserInteractionEnabled"));
 }
 
 static void
-curtain_check(id view)
+hide_check(int which, id view)
 {
 	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
 	SEL set = sel_registerName("setHidden:");
-	unsigned k = curtain_slot(view);
+	unsigned k = hide_slot(view);
 
-	if (curtain_cover(view)) {
-		curtain_seen[k].forced = 1;
+	if (hide_wanted(which, view)) {
+		hide_seen[k].forced = 1;
 		if (!flag(view, sel_registerName("isHidden"))) {
-			curtain_hidden_orig(view, set, 1);
-			if (curtain_said < 3) {
-				fix_put("A8FIX island: the sensor curtain in the touchless aperture window "
-				    "hidden (a8fix-curtain \"1\" keeps it)\n");
-				curtain_said++;
+			hide_hidden_orig[which](view, set, 1);
+			if (hide_said[which] < 2) {
+				fix_line3("A8FIX island: hidden: ", hide_what[which], "");
+				hide_said[which]++;
 			}
 		}
-	} else if (curtain_seen[k].forced) {
-		curtain_seen[k].forced = 0;     /* moved elsewhere: as SpringBoard wants */
-		if (flag(view, sel_registerName("isHidden")) != curtain_seen[k].want)
-			curtain_hidden_orig(view, set, curtain_seen[k].want);
+	} else if (hide_seen[k].forced) {
+		hide_seen[k].forced = 0;        /* moved elsewhere: as SpringBoard wants */
+		if (flag(view, sel_registerName("isHidden")) != hide_seen[k].want)
+			hide_hidden_orig[which](view, set, hide_seen[k].want);
 	}
 }
 
 static void
-curtain_layout(id self, SEL cmd)
+hide_set(int which, id view, SEL cmd, signed char hidden)
 {
-	curtain_layout_orig(self, cmd);
-	curtain_check(self);
-}
+	unsigned k = hide_slot(view);
 
-static void
-curtain_moved(id self, SEL cmd)
-{
-	curtain_moved_orig(self, cmd);
-	curtain_check(self);
-}
-
-static void
-curtain_hidden(id self, SEL cmd, signed char hidden)
-{
-	unsigned k = curtain_slot(self);
-
-	curtain_seen[k].want = hidden;
-	if (!hidden && curtain_cover(self)) {
-		curtain_seen[k].forced = 1;
+	hide_seen[k].want = hidden;
+	if (!hidden && hide_wanted(which, view)) {
+		hide_seen[k].forced = 1;
 		hidden = 1;
 	}
-	curtain_hidden_orig(self, cmd, hidden);
+	hide_hidden_orig[which](view, cmd, hidden);
+}
+
+#define HIDE_HOOKS(K) \
+static void hide_layout_##K(id s, SEL c) { hide_layout_orig[K](s, c); hide_check(K, s); } \
+static void hide_moved_##K(id s, SEL c) { hide_moved_orig[K](s, c); hide_check(K, s); } \
+static void hide_hidden_##K(id s, SEL c, signed char h) { hide_set(K, s, c, h); }
+HIDE_HOOKS(0)
+HIDE_HOOKS(1)
+HIDE_HOOKS(2)
+static const IMP hide_layout_imp[HIDE_N] = { (IMP)hide_layout_0, (IMP)hide_layout_1, (IMP)hide_layout_2 };
+static const IMP hide_moved_imp[HIDE_N] = { (IMP)hide_moved_0, (IMP)hide_moved_1, (IMP)hide_moved_2 };
+static const IMP hide_hidden_imp[HIDE_N] = { (IMP)hide_hidden_0, (IMP)hide_hidden_1, (IMP)hide_hidden_2 };
+
+static int
+hide_keep(const char *path)
+{
+	id text = fix_switch_text(path);
+
+	return text != 0 && ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String"))[0] == '1';
 }
 
 static void
 curtain_apply(void)
 {
-	Class c;
+	for (int k = 0; k < HIDE_N; k++) {
+		Class c;
+
+		if (hide_done[k] || (c = objc_getClass(hide_class[k])) == 0)
+			continue;
+		hide_done[k] = 1;
+		if (hide_keep(k == HIDE_CURTAIN ? CURTAIN_SWITCH : KEYLINE_SWITCH)) {
+			fix_line3("A8FIX island: kept (switch \"1\"): ", hide_what[k], "");
+			continue;
+		}
+		hide_hidden_orig[k] = (void (*)(id, SEL, signed char))own_method(c, "setHidden:",
+		    hide_hidden_imp[k], "v20@0:8B16");
+		if (hide_hidden_orig[k] == 0) {
+			fix_line3("A8FIX island: not hooked: ", hide_class[k], "");
+			continue;
+		}
+		hide_layout_orig[k] = (void (*)(id, SEL))own_method(c, "layoutSubviews", hide_layout_imp[k], "v16@0:8");
+		hide_moved_orig[k] = (void (*)(id, SEL))own_method(c, "didMoveToWindow", hide_moved_imp[k], "v16@0:8");
+		fix_line3("A8FIX island: hooks in for ", hide_class[k], "");
+	}
+}
+
+/*
+ * v14g: the island's content draws its countdown with a black shadow at 33%
+ * (ClockAngel's layers): on the island's black platter it cannot be seen,
+ * and it costs 6 draws and 4 render-target switches each time the island is
+ * redrawn.  In a process whose name ends in "Angel", -[CALayer
+ * setShadowOpacity:] sets 0; /private/var/mobile/Library/a8fix-angelshadow
+ * "1" keeps the shadows.
+ */
+#define ANGEL_SHADOW_SWITCH "/private/var/mobile/Library/a8fix-angelshadow"
+
+static void (*shadow_set_orig)(id, SEL, float);
+static int shadow_said;
+
+static void
+shadow_set(id self, SEL cmd, float opacity)
+{
+	if (opacity > 0 && shadow_said < 3) {
+		fix_put("A8FIX island content: a layer shadow dropped (a8fix-angelshadow \"1\" keeps it)\n");
+		shadow_said++;
+	}
+	shadow_set_orig(self, cmd, 0);
+}
+
+/* ---- v14b: long CoreAnimation animations (P3, Live Activity cost) ------- */
+
+/*
+ * A timer Live Activity keeps backboardd drawing the island 60 times a
+ * second (11-25: 598 frames in 10 s on an idle home screen, 52 draws each):
+ * the end of the timer's progress ring moves by a thousandth of a pixel a
+ * frame.  When /private/var/mobile/Library/a8fix-animlog exists (read when
+ * the process starts), -[CALayer addAnimation:forKey:] is watched: an
+ * animation longer than 2 s is logged ("A8FIX anim: ..."), and if the file
+ * holds a number N from 1 to 30 its preferred frame rate range becomes
+ * 1..N (CAAnimation.preferredFrameRateRange, iOS 15) before it is added.
+ */
+#define ANIM_SWITCH "/private/var/mobile/Library/a8fix-animlog"
+
+typedef struct { float minimum, maximum, preferred; } fix_fps_range;
+
+static void (*anim_add_orig)(id, SEL, id, id);
+static int anim_fps;                    /* 0: log only */
+static int anim_all;                    /* in an "Angel": every animation */
+static int anim_said;
+
+static void
+anim_add(id self, SEL cmd, id anim, id key)
+{
+	signed char (*responds)(id, SEL, SEL) = (signed char (*)(id, SEL, SEL))objc_msgSend;
+	double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+	float (*flt)(id, SEL) = (float (*)(id, SEL))objc_msgSend;
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	SEL sel_fps = sel_registerName("preferredFrameRateRange");
+	SEL sel_set_fps = sel_registerName("setPreferredFrameRateRange:");
+	double d = 0;
+	float rep = 0;
+
+	if (anim != 0 && responds(anim, sel_registerName("respondsToSelector:"), sel_registerName("duration"))) {
+		d = dbl(anim, sel_registerName("duration"));
+		rep = flt(anim, sel_registerName("repeatCount"));
+	}
+	if (d > 2.0 || rep > 100 || anim_all) {
+		fix_fps_range before = { 0, 0, 0 }, now;
+		int has = responds(anim, sel_registerName("respondsToSelector:"), sel_fps);
+
+		if (has)
+			before = ((fix_fps_range (*)(id, SEL))objc_msgSend)(anim, sel_fps);
+		if (anim_fps > 0 && has && d < 1e9 && rep < 1e9 &&
+		    responds(anim, sel_registerName("respondsToSelector:"), sel_set_fps)) {
+			now.minimum = 1;
+			now.maximum = (float)anim_fps;
+			now.preferred = (float)anim_fps;
+			((void (*)(id, SEL, fix_fps_range))objc_msgSend)(anim, sel_set_fps, now);
+		}
+		if (anim_said < 60) {
+			struct vline l;
+			id path = responds(anim, sel_registerName("respondsToSelector:"), sel_registerName("keyPath")) ?
+			    get(anim, sel_registerName("keyPath")) : 0;
+
+			l.n = 0;
+			vl_str(&l, "A8FIX anim: layer ");
+			vl_str(&l, class_getName(object_getClass(self)));
+			vl_str(&l, " key ");
+			vl_str(&l, key ? fix_utf8(key) : "-");
+			vl_str(&l, " ");
+			vl_str(&l, class_getName(object_getClass(anim)));
+			vl_str(&l, " path ");
+			vl_str(&l, path ? fix_utf8(path) : "-");
+			vl_str(&l, " duration ");
+			if (d > 1e9)
+				vl_str(&l, "inf");
+			else
+				vl_num(&l, d);
+			vl_str(&l, " s repeat ");
+			if (rep > 1e9)
+				vl_str(&l, "inf");
+			else
+				vl_num(&l, rep);
+			vl_str(&l, " fps ");
+			vl_num(&l, before.minimum);
+			vl_str(&l, "-");
+			vl_num(&l, before.maximum);
+			vl_str(&l, "/");
+			vl_num(&l, before.preferred);
+			if (anim_fps > 0)
+				vl_str(&l, has ? " -> 1-N" : " (no range)");
+			vl_str(&l, "\n");
+			write(2, l.b, l.n);
+			anim_said++;
+		}
+	}
+	anim_add_orig(self, cmd, anim, key);
+}
+
+/*
+ * The timer's island content is drawn by ClockAngel (SwiftUI), which
+ * updates the progress ring on a CADisplayLink every frame (11-25: ClockAngel
+ * 10% CPU and backboardd 60% on an idle home screen): its
+ * ClockAngel.TimerAnimationCountdown objects each run a CADisplayLink at 30
+ * frames a second for a ring that moves a thousandth of a pixel a frame.  In
+ * a process whose name ends in "Angel", display links made for a target
+ * whose class name has "Countdown" in it are capped at 10 frames a second
+ * (the digits still turn over within 0.1 s of each second), and each tick's
+ * changes are made without implicit animations (below); other links are
+ * only logged (40 lines).  /private/var/mobile/Library/a8fix-angelfps holding
+ * N (1-60) caps at N instead; "0" leaves Apple's rate and animations.
+ */
+#define ANGEL_FPS_SWITCH "/private/var/mobile/Library/a8fix-angelfps"
+
+static int fix_streq(const char *a, const char *b);
+
+static id (*dl_make_orig)(id, SEL, id, SEL);
+static void (*dl_range_orig)(id, SEL, fix_fps_range);
+static void (*dl_fps_orig)(id, SEL, long);
+static int dl_fps = 10, dl_said;
+static id dl_capped[16];                /* the countdown's links */
+static unsigned dl_next;
+
+static int
+dl_is_capped(id link)
+{
+	for (unsigned k = 0; k < 16; k++)
+		if (dl_capped[k] == link)
+			return 1;
+	return 0;
+}
+
+static int
+fix_contains_word(const char *s, const char *word)
+{
+	for (; s && *s; s++) {
+		const char *a = s, *b = word;
+
+		while (*a && *b && *a == *b) {
+			a++;
+			b++;
+		}
+		if (*b == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static void
+dl_log(const char *what, id link, double a, double b, double c)
+{
+	struct vline l;
+
+	if (dl_said >= 40)
+		return;
+	dl_said++;
+	l.n = 0;
+	vl_str(&l, "A8FIX displaylink: ");
+	vl_str(&l, what);
+	vl_str(&l, " ");
+	vl_num(&l, a);
+	vl_str(&l, " ");
+	vl_num(&l, b);
+	vl_str(&l, " ");
+	vl_num(&l, c);
+	vl_str(&l, dl_is_capped(link) ? " (countdown link)\n" : "\n");
+	write(2, l.b, l.n);
+}
+
+/*
+ * Each tick, updateCountdownAnimation sets the ring's strokeStart and the
+ * end cap's transform with Core Animation's implicit actions on: every tick
+ * starts a 0.25 s animation, so with ticks 30 (or 10) times a second there is
+ * always one running and backboardd redraws the island every frame.  The
+ * tick's changes are made with actions off (one redraw a tick).
+ */
+static void (*cd_update_orig)(id, SEL);
+static Class cd_class;
+
+static void
+cd_update(id self, SEL cmd)
+{
+	Class tx = objc_getClass("CATransaction");
+
+	if (tx == 0) {
+		cd_update_orig(self, cmd);
+		return;
+	}
+	((void (*)(Class, SEL))objc_msgSend)(tx, sel_registerName("begin"));
+	((void (*)(Class, SEL, signed char))objc_msgSend)(tx, sel_registerName("setDisableActions:"), 1);
+	cd_update_orig(self, cmd);
+	((void (*)(Class, SEL))objc_msgSend)(tx, sel_registerName("commit"));
+}
+
+static void
+cd_hook(Class c, SEL action)
+{
+	Method m;
+
+	if (cd_class != 0 || c == 0 || action == 0)
+		return;
+	cd_class = c;
+	m = class_getInstanceMethod(c, action);
+	if (m == 0 || !fix_streq(sel_getName(action), "updateCountdownAnimation"))
+		return;
+	cd_update_orig = (void (*)(id, SEL))method_setImplementation(m, (IMP)cd_update);
+	fix_put("A8FIX displaylink: countdown ticks without implicit animations\n");
+}
+
+static id
+dl_make(id self, SEL cmd, id target, SEL action)
+{
+	id link = dl_make_orig(self, cmd, target, action);
+	const char *who = target ? class_getName(object_getClass(target)) : "-";
+	int countdown = fix_contains_word(who, "Countdown");
+	struct vline l;
+
+	if (countdown && target != 0 && dl_fps > 0)
+		cd_hook(object_getClass(target), action);
+	if (link != 0 && countdown && dl_fps > 0) {
+		dl_capped[dl_next++ % 16] = link;
+		if (dl_fps_orig != 0)
+			dl_fps_orig(link, sel_registerName("setPreferredFramesPerSecond:"), dl_fps);
+	}
+	if (dl_said < 40) {
+		dl_said++;
+		l.n = 0;
+		vl_str(&l, "A8FIX displaylink: made for ");
+		vl_str(&l, who);
+		vl_str(&l, " -");
+		vl_str(&l, action ? (const char *)action : "?");
+		vl_str(&l, countdown && dl_fps > 0 ? " (capped)\n" : "\n");
+		write(2, l.b, l.n);
+	}
+	return link;
+}
+
+static void
+dl_range(id self, SEL cmd, fix_fps_range r)
+{
+	dl_log("range asked", self, r.minimum, r.maximum, r.preferred);
+	if (dl_fps > 0 && dl_is_capped(self) && r.maximum > 0) {
+		float n = (float)dl_fps;
+
+		r.maximum = r.maximum > n ? n : r.maximum;
+		r.preferred = (r.preferred > r.maximum || r.preferred <= 0) ? r.maximum : r.preferred;
+		r.minimum = r.minimum > r.preferred ? r.preferred : r.minimum;
+		if (r.minimum < 1)
+			r.minimum = 1;
+		if (r.preferred < r.minimum)
+			r.preferred = r.minimum;
+		if (r.maximum < r.preferred)
+			r.maximum = r.preferred;
+	}
+	dl_range_orig(self, cmd, r);
+}
+
+static void
+dl_set_fps(id self, SEL cmd, long fps)
+{
+	dl_log("fps asked", self, (double)fps, 0, 0);
+	if (dl_fps > 0 && dl_is_capped(self) && (fps == 0 || fps > dl_fps))
+		fps = dl_fps;
+	dl_fps_orig(self, cmd, fps);
+}
+
+static int
+fix_ends_with(const char *s, const char *tail)
+{
+	unsigned long a = 0, b = 0;
+
+	while (s && s[a])
+		a++;
+	while (tail[b])
+		b++;
+	return s && a >= b && fix_streq(s + a - b, tail);
+}
+
+static void
+dl_apply(void)
+{
+	Class link = objc_getClass("CADisplayLink");
+	id text;
+	Method m;
+
+	if (link == 0 || !fix_ends_with(getprogname(), "Angel"))
+		return;
+	text = fix_switch_text(ANGEL_FPS_SWITCH);
+	if (text != 0) {
+		dl_fps = ((int (*)(id, SEL))objc_msgSend)(text, sel_registerName("intValue"));
+		if (dl_fps < 1 || dl_fps > 60)
+			dl_fps = 0;             /* "0" (or junk): Apple's own 30 */
+	}
+	if (!hide_keep(ANGEL_SHADOW_SWITCH) && objc_getClass("CALayer") != 0 &&
+	    (m = class_getInstanceMethod(objc_getClass("CALayer"), sel_registerName("setShadowOpacity:"))) != 0)
+		shadow_set_orig = (void (*)(id, SEL, float))method_setImplementation(m, (IMP)shadow_set);
+	m = class_getClassMethod(link, sel_registerName("displayLinkWithTarget:selector:"));
+	if (m)
+		dl_make_orig = (id (*)(id, SEL, id, SEL))method_setImplementation(m, (IMP)dl_make);
+	m = class_getInstanceMethod(link, sel_registerName("setPreferredFrameRateRange:"));
+	if (m)
+		dl_range_orig = (void (*)(id, SEL, fix_fps_range))method_setImplementation(m, (IMP)dl_range);
+	m = class_getInstanceMethod(link, sel_registerName("setPreferredFramesPerSecond:"));
+	if (m)
+		dl_fps_orig = (void (*)(id, SEL, long))method_setImplementation(m, (IMP)dl_set_fps);
+	fix_put(dl_fps ? "A8FIX displaylink: countdown links capped (a8fix-angelfps)\n" :
+	    "A8FIX displaylink: hooked, countdown at Apple's rate (a8fix-angelfps \"0\")\n");
+}
+
+static int anim_done;
+
+static void
+anim_apply(void)
+{
+	Class layer;
+	Method m;
 	id text;
 
-	if (curtain_done || (c = objc_getClass("_SBSystemApertureMagiciansCurtainView")) == 0)
+	if (anim_done || (layer = objc_getClass("CALayer")) == 0)
 		return;
-	curtain_done = 1;
-	text = fix_switch_text(CURTAIN_SWITCH);
-	if (text != 0 && ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String"))[0] == '1') {
-		fix_put("A8FIX island: sensor curtain kept (a8fix-curtain \"1\")\n");
+	anim_done = 1;
+	dl_apply();
+	text = fix_switch_text(ANIM_SWITCH);
+	if (text == 0)
 		return;
-	}
-	curtain_hidden_orig = (void (*)(id, SEL, signed char))own_method(c, "setHidden:",
-	    (IMP)curtain_hidden, "v20@0:8B16");
-	if (curtain_hidden_orig == 0) {
-		fix_put("A8FIX island: curtain not hooked\n");
+	anim_fps = ((int (*)(id, SEL))objc_msgSend)(text, sel_registerName("intValue"));
+	anim_all = fix_ends_with(getprogname(), "Angel");
+	if (anim_fps < 1 || anim_fps > 30)
+		anim_fps = 0;
+	m = class_getInstanceMethod(layer, sel_registerName("addAnimation:forKey:"));
+	if (m == 0)
 		return;
-	}
-	curtain_layout_orig = (void (*)(id, SEL))own_method(c, "layoutSubviews", (IMP)curtain_layout, "v16@0:8");
-	curtain_moved_orig = (void (*)(id, SEL))own_method(c, "didMoveToWindow", (IMP)curtain_moved, "v16@0:8");
-	fix_put(curtain_layout_orig && curtain_moved_orig ? "A8FIX island: sensor curtain hooks in\n" :
-	    "A8FIX island: curtain partly hooked\n");
+	anim_add_orig = (void (*)(id, SEL, id, id))method_setImplementation(m, (IMP)anim_add);
+	fix_put(anim_fps ? "A8FIX anim: long animations logged and slowed (a8fix-animlog)\n" :
+	    "A8FIX anim: long animations logged (a8fix-animlog)\n");
 }
 
 /* ---- Auto-Lock (v8) --------------------------------------------------- */
@@ -1191,6 +1586,7 @@ fix_image_added(const void *mh, long slide)
 	bl_apply();
 	layout_apply();
 	idle_apply();
+	anim_apply();
 	if (fix_is_springboard)
 		curtain_apply();
 }
@@ -2072,6 +2468,7 @@ fix_init(void)
 	bl_apply();
 	layout_apply();
 	idle_apply();
+	anim_apply();
 	fix_is_springboard = fix_streq(getprogname(), "SpringBoard");
 	if (fix_is_springboard)
 		curtain_apply();

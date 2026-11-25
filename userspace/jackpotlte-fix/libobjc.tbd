@@ -8,5 +8,6 @@ exports:
     symbols:     [ _objc_getClass, _sel_registerName, _class_getInstanceMethod, _objc_msgSend,
                    _class_getClassMethod, _method_setImplementation, _method_getTypeEncoding,
                    _class_getName, _object_getClass,
-                   _class_getSuperclass, _class_getMethodImplementation, _class_addMethod ]
+                   _class_getSuperclass, _class_getMethodImplementation, _class_addMethod,
+                   _class_copyMethodList, _method_getName, _sel_getName ]
 ...
