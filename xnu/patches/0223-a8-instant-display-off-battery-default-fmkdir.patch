@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 10:55:56 -0500
+Subject: [PATCH] 0223-a8-instant-display-off-battery-default-fmkdir.patch
+
+---
+ bsd/dev/a5xelte_usb.c                 |  5 +++-
+ bsd/dev/a8_files.c                    | 25 ++++++++++++++++++
+ bsd/dev/jackpotlte_pmic.c             |  9 ++++---
+ bsd/vfs/vfs_syscalls.c                | 18 +++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 37 +++++++++++++++++++++++++++
+ 5 files changed, 90 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index adc0091..9d76fb3 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1656,6 +1656,7 @@ a8s_shot(unsigned scale)
+ extern void a8f_get(const char *args);
+ extern void a8f_put(const char *args);
+ extern void a8f_mv(const char *args);     /* a8_files.c, 0217 */
++extern void a8f_mkdir(const char *args);  /* a8_files.c, 0223 */
+ extern void a8f_data(const char *b64);
+ extern void a8f_end(void);
+ extern void a8f_ls(const char *args);
+@@ -1722,7 +1723,7 @@ a8s_command(const char *line)
+ 		    "key power|up|down|home [MS] | wake | "
+ 		    "peek ADDR [WORDS] | poke ADDR VALUE | "
+ 		    "reboot [recovery|download]\n");
+-		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | fmv FROM TO | "
++		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | fmv FROM TO | fmkdir DIR | "
+ 		    "fput PATH SIZE CRC32 [MODE UID GID], fd BASE64..., fend "
+ 		    "(only under /private/var/) | date [SECONDS] | flip [0|1]\n");
+ 		printf("A8SH: X Y are panel pixels (1080x2220, as in shot x SCALE); "
+@@ -1934,6 +1935,8 @@ a8s_command(const char *line)
+ 		a8f_end();
+ 	} else if (a8s_word(line, "fls", &rest)) {
+ 		a8f_ls(rest);
++	} else if (a8s_word(line, "fmkdir", &rest)) {
++		a8f_mkdir(rest);        /* 0223 */
+ 	} else if (a8s_word(line, "fmv", &rest)) {
+ 		a8f_mv(rest);           /* 0217 */
+ 	} else if (a8s_word(line, "vlock", &rest)) {
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index 6c3d5ae..21d0118 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -39,12 +39,14 @@
+ #include <string.h>
+ 
+ int a8_kernel_rename(const char *from, const char *to);         /* vfs_syscalls.c */
++int a8_kernel_mkdir(const char *path);                          /* vfs_syscalls.c, 0223 */
+ void a8f_get(const char *args);
+ void a8f_put(const char *args);
+ void a8f_data(const char *b64);
+ void a8f_end(void);
+ void a8f_ls(const char *args);
+ void a8f_mv(const char *args);
++void a8f_mkdir(const char *args);
+ void a8f_date(const char *args);
+ bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size);
+ bool a8_fix_library_ok(void);
+@@ -569,6 +571,29 @@ a8f_mv(const char *args)
+ 	printf("A8F MV %s -> %s: %s (%d)\n", from, to, error ? "failed" : "done", error);
+ }
+ 
++/*
++ * 0223: console "fmkdir PATH" makes a folder under /private/var/ (no . or
++ * ..), mode 0755, owned by root: a place to move files aside to with fmv
++ * (the console deletes nothing).
++ */
++void
++a8f_mkdir(const char *args)
++{
++	char path[A8F_PATH];
++	int error;
++
++	if (!a8f_word(&args, path, sizeof(path))) {
++		printf("A8F MKDIR error: fmkdir PATH (under /private/var/)\n");
++		return;
++	}
++	if (strncmp(path, "/private/var/", 13) != 0 || a8f_has(path, "/../") || a8f_has(path, "/./")) {
++		printf("A8F MKDIR error: only under /private/var/ (no . or ..): %s\n", path);
++		return;
++	}
++	error = a8_kernel_mkdir(path);
++	printf("A8F MKDIR %s: %s (%d)\n", path, error ? "failed" : "done", error);
++}
++
+ void
+ a8f_ls(const char *args)
+ {
+diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
+index 24fb13b..7d66e22 100644
+--- a/bsd/dev/jackpotlte_pmic.c
++++ b/bsd/dev/jackpotlte_pmic.c
+@@ -740,12 +740,15 @@ jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+ 
+ 	lck_mtx_lock(&jp_lock);
+ 	if (jp_enabled < 0) {
+-		int value = 0;
++		/* 0223: on by default (it has run on every boot since 11-23),
++		 * which frees "a8battery=1" from the boot-args; a8battery=0
++		 * turns it off. */
++		int value = 1;
+ 		(void)PE_parse_boot_argn("a8battery", &value, sizeof(value));
+-		jp_enabled = (value == 1) ? 1 : 0;
++		jp_enabled = (value != 0) ? 1 : 0;
+ 		if (!jp_enabled) {
+ 			printf("JACKPOTLTE BATTERY: off "
+-			    "(a8battery=1 reads the s2mu004 charger/fuel gauge)\n");
++			    "(a8battery=0; without it the s2mu004 charger/fuel gauge is read)\n");
+ 		}
+ 	}
+ 	if (!jp_enabled) {
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 15f58c0..a2d75dc 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9903,6 +9903,24 @@ mkdir(proc_t p, struct mkdir_args *uap, __unused int32_t *retval)
+ 	           UIO_USERSPACE);
+ }
+ 
++#if defined(JACKPOTLTE)
++/*
++ * 0223: the A8 USB console's fmkdir (bsd/dev/a8_files.c), so that files can
++ * be moved aside into a folder of their own. Kernel path, kernel credentials,
++ * mode 0755.
++ */
++int a8_kernel_mkdir(const char *path);
++int
++a8_kernel_mkdir(const char *path)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, 0755);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++#endif
++
+ int
+ mkdirat(proc_t p, struct mkdirat_args *uap, __unused int32_t *retval)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6f39f17..97f0c8f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -444,6 +444,43 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		/* Fade out: halve every channel each vsync, then black (step 6),
+ 		 * then idle; a5fb_offdim stops it after that many steps. */
+ 		uint32_t step = fb->fFadeStep;
++		if (sweet_fb_off_dim >= 7) {
++			/*
++			 * 0223: off at once. Each halving step above reads every
++			 * pixel of the panel memory (not cached, ~0.25 s a pass), so
++			 * the seven steps came down the screen as dark bands for
++			 * about 1.5 s (user report 11-25: "like blankets of shades
++			 * coming down"). Now the panel memory is written black with
++			 * stores only (no reads), while the panel still shows the
++			 * last CoreAnimation buffer, and then shown: black at the
++			 * next frame. a5fb_offdim=0..6 keeps the old fade.
++			 */
++			if (step == 0) {
++				fb->fFadeStep = 7;
++				IOLockUnlock(fb->fLock);
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++					for (uint32_t x = 0; x < fb->fWidth / 2; x++) {
++						row[x] = 0;
++					}
++					if (fb->fWidth & 1) {
++						((volatile uint32_t *)row)[fb->fWidth - 1] = 0;
++					}
++				}
++				__asm__ __volatile__ ("dsb sy" ::: "memory");
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++				if (a8_idma != 0 && a8_shown_addr != (uint32_t)fb->fPhys) {
++					IOLockLock(fb->fPresentLock);
++					a8_scan_to_panel(fb, false);
++					IOLockUnlock(fb->fPresentLock);
++				}
++#endif
++			} else {
++				IOLockUnlock(fb->fLock);
++			}
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			return;
++		}
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
+ 		if (step == 0 && a8_idma != 0 && a8_shown_addr != (uint32_t)fb->fPhys) {
+ 			/* The fade works on the panel memory: show it, with the
+-- 
+2.43.0
+
