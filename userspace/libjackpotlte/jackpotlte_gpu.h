@@ -52,6 +52,7 @@ enum {
 	JT_PANFROST_MADVISE      = 0x48,
 	JT_WAIT                  = 0x7d,
 	JT_SURFACE               = 0x7e,
+	JT_SUBMIT2               = 0x7f,        /* 0218: two submits in one call */
 };
 
 /* PANFROST_JD_REQ_FS: the job chain is a fragment shader. */
@@ -183,6 +184,10 @@ int  jt_bo_release(struct jt_gpu *g, uint32_t handle);
 
 int  jt_get_param(struct jt_gpu *g, uint32_t which, uint64_t *value);
 
+/* 0218: two submit requests in one kernel call (selector 0x7f), queued in
+ * order; each request's jc comes back as its job's number (0: not queued).
+ * Returns 0 or -errno; a kernel older than 0218 answers unsupported. */
+int jt_submit2(struct jt_gpu *g, struct jt_submit_req pair[2]);
 uint64_t jt_submit(struct jt_gpu *g, uint64_t chain, bool fragment,
     const uint32_t *handles, uint32_t count, int *error);
 int  jt_wait_bo(struct jt_gpu *g, uint32_t handle, int64_t timeout_ns);

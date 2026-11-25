@@ -98,10 +98,15 @@ bo_seq_set(uint32_t handle, uint64_t seq)
 }
 
 /* A kernel wait for job `seq`; a success says every job up to it is done. */
+static void held_flush(struct jt_gpu *g);     /* 0218 */
+
 static int
 wait_seq_noted(struct jt_gpu *g, uint64_t seq, int64_t timeout_ns)
 {
-	int ret = jt_wait_seq(g, seq, timeout_ns);
+	int ret;
+
+	held_flush(g);                  /* 0218: never wait behind a held submit */
+	ret = jt_wait_seq(g, seq, timeout_ns);
 
 	if (ret == 0) {
 		note_done(seq);
@@ -273,11 +278,107 @@ gem_close(struct jt_gpu *g, void *arg, size_t size)
 	return buffer_close(g, request->handle);
 }
 
+/*
+ * 0218 (kernel 0218, selector 0x7f): one kernel call per render pass.  Mesa
+ * submits a batch's vertex/tiler chain with no sync object when a fragment
+ * chain follows (pan_jm.c, jm_submit_batch), then the fragment chain right
+ * after; each was an IOKit round trip (Settings ~22 passes a frame, Control
+ * Center ~39).  Such a vertex/tiler submit is held, with a copy of its buffer
+ * list (Mesa frees its own once the ioctl returns), and goes to the kernel
+ * with the fragment submit that follows, in one call, in order.  Anything
+ * else first sends a held submit alone: every other request, every wait, and
+ * the frame-end look at the last job, so no buffer of a held job is ever
+ * reported idle.  A kernel older than 0218 answers unsupported: single
+ * submits from then on.  /private/var/mobile/Library/a8gl-pair "0": off.
+ */
+static pthread_mutex_t held_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct jt_submit_req held;               /* jc 0: nothing held */
+static uint32_t *held_handles;
+static uint32_t held_cap;
+static int pair_mode = -1;                      /* -1 not read yet, 0 off, 1 on */
+static uint64_t pairs_sent;
+
+static bool
+pair_on(void)
+{
+	if (pair_mode < 0) {
+		char c = '1';
+		int fd = open("/private/var/mobile/Library/a8gl-pair", O_RDONLY | O_CLOEXEC);
+
+		if (fd >= 0) {
+			if (read(fd, &c, 1) != 1) {
+				c = '1';
+			}
+			close(fd);
+		}
+		pair_mode = c == '0' ? 0 : 1;
+	}
+	return pair_mode > 0;
+}
+
+/* The bookkeeping of a submit the kernel took (seq) or did not (0). */
+static void
+submit_done(const struct jt_submit_req *request, const uint32_t *handles, uint64_t seq)
+{
+	if (seq == 0) {
+		/* Not queued: the buffers keep a busy mark, and their WAIT_BOs go to
+		 * the kernel, which knows what really ran. */
+		return;
+	}
+	for (uint32_t i = 0; handles != NULL && i < request->bo_handle_count; i++) {
+		bo_seq_set(handles[i], seq);
+	}
+	__atomic_store_n(&last_seq, seq, __ATOMIC_RELEASE);
+	if (request->out_sync != 0) {
+		pthread_mutex_lock(&sync_lock);
+		syncobj_seq[request->out_sync % JT_SYNCOBJS] = seq;
+		pthread_mutex_unlock(&sync_lock);
+	}
+}
+
+/* Queue one request now; its job's number, or 0 with *error set. */
+static uint64_t
+submit_now(struct jt_gpu *g, const struct jt_submit_req *request, const uint32_t *handles, int *error)
+{
+	/* The kernel copyin()s the handle array itself, so only its address
+	 * travels (0154:527-540).  It reads just the fragment bit of
+	 * `requirements`. */
+	return jt_submit(g, request->jc, (request->requirements & JT_JD_REQ_FS) != 0,
+	    request->bo_handle_count != 0 ? handles : NULL, request->bo_handle_count, error);
+}
+
+/* A held submit goes alone (held_lock held). */
+static void
+held_flush_locked(struct jt_gpu *g)
+{
+	int error = 0;
+	uint64_t seq;
+
+	if (held.jc == 0) {
+		return;
+	}
+	seq = submit_now(g, &held, held_handles, &error);
+	submit_done(&held, held_handles, seq);
+	held.jc = 0;
+}
+
+static void
+held_flush(struct jt_gpu *g)
+{
+	if (__atomic_load_n(&held.jc, __ATOMIC_ACQUIRE) == 0 || g == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&held_lock);
+	held_flush_locked(g);
+	pthread_mutex_unlock(&held_lock);
+}
+
 static int
 submit(struct jt_gpu *g, void *arg, size_t size)
 {
 	struct jt_submit_req *request = arg;    /* Linux's struct's first 40 bytes */
 	const uint32_t *handles;
+	bool fragment;
 	uint64_t seq;
 	int error = 0;
 
@@ -290,26 +391,64 @@ submit(struct jt_gpu *g, void *arg, size_t size)
 			bo_seq_set(handles[i], BO_SEQ_BUSY);
 		}
 	}
-	/* The kernel copyin()s the handle array itself, so only its address
-	 * travels (0154:527-540).  It reads just the fragment bit of
-	 * `requirements`. */
-	seq = jt_submit(g, request->jc, (request->requirements & JT_JD_REQ_FS) != 0,
-	    request->bo_handle_count != 0 ? handles : NULL, request->bo_handle_count, &error);
-	if (handles != NULL) {
-		/* Not queued: the buffers keep a busy mark, and their WAIT_BOs go to
-		 * the kernel, which knows what really ran. */
-		for (uint32_t i = 0; seq != 0 && i < request->bo_handle_count; i++) {
-			bo_seq_set(handles[i], seq);
+	fragment = (request->requirements & JT_JD_REQ_FS) != 0;
+	pthread_mutex_lock(&held_lock);
+	if (held.jc != 0 && (!fragment || request->in_sync_count != 0)) {
+		held_flush_locked(g);           /* not its partner: the held one goes first */
+	}
+	if (!fragment && request->jc != 0 && request->out_sync == 0 &&
+	    request->in_sync_count == 0 && pair_on()) {
+		uint32_t n = request->bo_handle_count;
+
+		if (n > held_cap) {
+			uint32_t *grown = realloc(held_handles, (size_t) n * sizeof(uint32_t));
+
+			if (grown != NULL) {
+				held_handles = grown;
+				held_cap = n;
+			}
+		}
+		if (n <= held_cap && (n == 0 || handles != NULL)) {
+			if (n != 0) {
+				memcpy(held_handles, handles, (size_t) n * sizeof(uint32_t));
+			}
+			held = *request;
+			held.bo_handles = (uint64_t) (uintptr_t) held_handles;
+			__atomic_thread_fence(__ATOMIC_RELEASE);
+			pthread_mutex_unlock(&held_lock);
+			return 0;               /* queued with its fragment chain */
 		}
 	}
+	if (fragment && held.jc != 0) {
+		struct jt_submit_req pair[2];
+
+		pair[0] = held;
+		pair[1] = *request;
+		error = jt_submit2(g, pair);
+		if (error == 0) {
+			submit_done(&held, held_handles, pair[0].jc);
+			held.jc = 0;
+			pairs_sent++;
+			pthread_mutex_unlock(&held_lock);
+			seq = pair[1].jc;
+			submit_done(request, handles, seq);
+			if (seq == 0) {
+				return -EIO;
+			}
+			__atomic_store_n(&last_seq, seq, __ATOMIC_RELEASE);
+			request->jc = seq;
+			return 0;
+		}
+		/* A kernel older than 0218 (or a refusal): single submits from now on. */
+		pair_mode = 0;
+		error = 0;
+		held_flush_locked(g);
+	}
+	pthread_mutex_unlock(&held_lock);
+	seq = submit_now(g, request, handles, &error);
+	submit_done(request, handles, seq);
 	if (seq == 0) {
 		return error != 0 ? error : -EIO;
-	}
-	__atomic_store_n(&last_seq, seq, __ATOMIC_RELEASE);
-	if (request->out_sync != 0) {
-		pthread_mutex_lock(&sync_lock);
-		syncobj_seq[request->out_sync % JT_SYNCOBJS] = seq;
-		pthread_mutex_unlock(&sync_lock);
 	}
 	request->jc = seq;
 	return 0;
@@ -472,6 +611,9 @@ jackpotlte_drm_ioctl(struct jt_gpu *g, unsigned long request, void *arg, size_t 
 
 	if (g == NULL) {
 		return -ENODEV;
+	}
+	if (number != JT_PANFROST_SUBMIT) {
+		held_flush(g);                  /* 0218: a held submit goes first */
 	}
 	switch (number) {
 	case JT_DRM_GEM_CLOSE:          return gem_close(g, arg, size);
@@ -684,6 +826,7 @@ drmCloseBufferHandle(int fd, uint32_t handle)
 uint64_t
 jackpotlte_drm_last_seq(void)
 {
+	held_flush(jackpotlte_drm_gpu());       /* 0218: the frame's last job, really sent */
 	return __atomic_load_n(&last_seq, __ATOMIC_ACQUIRE);
 }
 
