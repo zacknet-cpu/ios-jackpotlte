@@ -89,6 +89,9 @@ static struct {
    GLboolean (*is_enabled)(GLenum);
    void (*enable)(GLenum);
    void (*disable)(GLenum);
+   void (*get_uniformfv)(GLuint, GLint, GLfloat *);        /* glca21 */
+   GLint (*get_attrib_location)(GLuint, const GLchar *);
+   void (*scissor)(GLint, GLint, GLsizei, GLsizei);
    int loaded;
 } gl;
 
@@ -164,6 +167,9 @@ load(void)
    PROC(is_enabled, "glIsEnabled");
    PROC(enable, "glEnable");
    PROC(disable, "glDisable");
+   PROC(get_uniformfv, "glGetUniformfv");
+   PROC(get_attrib_location, "glGetAttribLocation");
+   PROC(scissor, "glScissor");
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -1114,13 +1120,182 @@ plain_end(struct plain_state *state)
    gl.active_texture((GLenum)state->active);
 }
 
+/*
+ * glca21: each draw scissored to its own vertices.  panfrost sizes a pass (the
+ * tiles its fragment job loads and stores) by the union of its draws'
+ * viewport and scissor, and CoreAnimation draws with the whole target as the
+ * viewport and no scissor, so every pass on the screen loads and stores all
+ * 9.6 MB however little it draws.  Control Center's backdrops end the screen's
+ * pass about 8 times a frame (11-25 Mesa log: "read of 1080x2220 ... submits
+ * its writer: 1080x2220, 1 draws"), the main GPU cost there.  Here a draw's
+ * vertex_position (client memory) goes through the program's vertex_matrix
+ * and the viewport, and the draw gets that box, 2 pixels wider, as its
+ * scissor (within CoreAnimation's own scissor); the scissor state is put back
+ * after the draw.  Draws whose vertices are not floats in client memory, with
+ * w <= 0, more than 4096 vertices, or a box of most of the viewport are left
+ * alone.  Switch: a8gl-bounds "0".
+ */
+static int bounds_on = 1;
+static unsigned long bounds_draws, bounds_cut, bounds_left;
+#define BOUNDS_PROGRAMS 2048
+static struct {
+   GLint matrix, position;
+   GLuint known;
+} bounds_prog[BOUNDS_PROGRAMS];
+
+struct bounds_state {
+   GLboolean was_on;
+   GLint box[4];
+   bool active;
+};
+
+static bool
+bounds_point(const char *base, GLint stride, GLint size, GLuint index, const GLfloat *m,
+             const GLint *vp, float *x, float *y)
+{
+   const float *p = (const float *)(const void *)(base + (size_t)stride * index);
+   float vx = p[0], vy = p[1], vz = size > 2 ? p[2] : 0.f, vw = size > 3 ? p[3] : 1.f;
+   float cx = m[0] * vx + m[4] * vy + m[8] * vz + m[12] * vw;
+   float cy = m[1] * vx + m[5] * vy + m[9] * vz + m[13] * vw;
+   float cw = m[3] * vx + m[7] * vy + m[11] * vz + m[15] * vw;
+
+   if (!(cw > 1e-6f))
+      return false;
+   *x = ((cx / cw) * .5f + .5f) * (float)vp[2] + (float)vp[0];
+   *y = ((cy / cw) * .5f + .5f) * (float)vp[3] + (float)vp[1];
+   return true;
+}
+
+static bool
+bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struct bounds_state *state)
+{
+   GLint program = 0, matrix, position, on = 0, size = 0, kind = 0, stride = 0, buffer = 0;
+   GLint elements = 0, vp[4] = { 0, 0, 0, 0 };
+   GLfloat m[16];
+   void *pointer = NULL;
+   float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
+
+   state->active = false;
+   if (!bounds_on || count <= 0 || count > 4096 || gl.get_uniformfv == NULL ||
+       gl.get_attrib_location == NULL || gl.scissor == NULL)
+      return false;
+   bounds_draws++;
+   gl.get_integerv(0x8B8D /* CURRENT_PROGRAM */, &program);
+   if (program <= 0)
+      goto left;
+   if (program < BOUNDS_PROGRAMS && bounds_prog[program].known == (GLuint)program) {
+      matrix = bounds_prog[program].matrix;
+      position = bounds_prog[program].position;
+   } else {
+      matrix = gl.get_uniform_location((GLuint)program, "vertex_matrix");
+      position = gl.get_attrib_location((GLuint)program, "vertex_position");
+      if (program < BOUNDS_PROGRAMS) {
+         bounds_prog[program].matrix = matrix;
+         bounds_prog[program].position = position;
+         bounds_prog[program].known = (GLuint)program;
+      }
+   }
+   if (matrix < 0 || position < 0)
+      goto left;
+   gl.get_vertex_attribiv((GLuint)position, 0x8622 /* ENABLED */, &on);
+   gl.get_vertex_attribiv((GLuint)position, 0x8623 /* SIZE */, &size);
+   gl.get_vertex_attribiv((GLuint)position, 0x8625 /* TYPE */, &kind);
+   gl.get_vertex_attribiv((GLuint)position, 0x8624 /* STRIDE */, &stride);
+   gl.get_vertex_attribiv((GLuint)position, 0x889f /* BUFFER_BINDING */, &buffer);
+   gl.get_vertex_attrib_pointerv((GLuint)position, 0x8645 /* POINTER */, &pointer);
+   if (!on || buffer != 0 || pointer == NULL || kind != 0x1406 /* FLOAT */ || size < 2)
+      goto left;
+   if (stride == 0)
+      stride = size * 4;
+   if (indices != NULL || type != 0) {
+      gl.get_integerv(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &elements);
+      if (elements != 0 || indices == NULL ||
+          (type != 0x1401 && type != 0x1403 && type != 0x1405))
+         goto left;
+   }
+   gl.get_uniformfv((GLuint)program, matrix, m);
+   gl.get_integerv(0x0BA2 /* VIEWPORT */, vp);
+   if (vp[2] <= 0 || vp[3] <= 0)
+      goto left;
+   for (GLsizei i = 0; i < count; i++) {
+      GLuint index;
+      float x, y;
+
+      if (indices == NULL)
+         index = (GLuint)(first + i);
+      else if (type == 0x1403)
+         index = ((const GLushort *)indices)[i];
+      else if (type == 0x1401)
+         index = ((const GLubyte *)indices)[i];
+      else
+         index = ((const GLuint *)indices)[i];
+      if (!bounds_point((const char *)pointer, stride, size, index, m, vp, &x, &y))
+         goto left;
+      minx = x < minx ? x : minx;
+      maxx = x > maxx ? x : maxx;
+      miny = y < miny ? y : miny;
+      maxy = y > maxy ? y : maxy;
+   }
+   {
+      GLint x0 = (GLint)__builtin_floorf(minx) - 2, y0 = (GLint)__builtin_floorf(miny) - 2;
+      GLint x1 = (GLint)__builtin_ceilf(maxx) + 2, y1 = (GLint)__builtin_ceilf(maxy) + 2;
+
+      if (minx < -1e8f || miny < -1e8f || maxx > 1e8f || maxy > 1e8f)
+         goto left;
+      x0 = x0 < vp[0] ? vp[0] : x0;
+      y0 = y0 < vp[1] ? vp[1] : y0;
+      x1 = x1 > vp[0] + vp[2] ? vp[0] + vp[2] : x1;
+      y1 = y1 > vp[1] + vp[3] ? vp[1] + vp[3] : y1;
+      state->was_on = gl.is_enabled(0x0C11 /* SCISSOR_TEST */);
+      gl.get_integerv(0x0C10 /* SCISSOR_BOX */, state->box);
+      if (state->was_on) {
+         x0 = x0 < state->box[0] ? state->box[0] : x0;
+         y0 = y0 < state->box[1] ? state->box[1] : y0;
+         x1 = x1 > state->box[0] + state->box[2] ? state->box[0] + state->box[2] : x1;
+         y1 = y1 > state->box[1] + state->box[3] ? state->box[1] + state->box[3] : y1;
+      }
+      if (x1 < x0)
+         x1 = x0;
+      if (y1 < y0)
+         y1 = y0;
+      if ((float)(x1 - x0) * (float)(y1 - y0) > .85f * (float)vp[2] * (float)vp[3])
+         goto left;
+      if (!state->was_on)
+         gl.enable(0x0C11);
+      gl.scissor(x0, y0, x1 - x0, y1 - y0);
+      state->active = true;
+      bounds_cut++;
+      return true;
+   }
+left:
+   bounds_left++;
+   return false;
+}
+
+static void
+bounds_end(struct bounds_state *state)
+{
+   if (!state->active)
+      return;
+   gl.scissor(state->box[0], state->box[1], state->box[2], state->box[3]);
+   if (!state->was_on)
+      gl.disable(0x0C11);
+   if ((bounds_draws & 16383) == 0)
+      say("glca21: %lu draws, %lu scissored to their vertices, %lu left alone",
+          bounds_draws, bounds_cut, bounds_left);
+}
+
 static void
 my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 {
    struct plain_state state;
+   struct bounds_state bounds;
    bool ours = plain_begin(context, &state);
+   bool cut = bounds_begin(first, count, 0, NULL, &bounds);
 
    next_draw_arrays(context, mode, first, count);
+   if (cut)
+      bounds_end(&bounds);
    if (ours)
       plain_end(&state);
 }
@@ -1129,9 +1304,13 @@ static void
 my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
    struct plain_state state;
+   struct bounds_state bounds;
    bool ours = plain_begin(context, &state);
+   bool cut = bounds_begin(0, count, type, indices, &bounds);
 
    next_draw_elements(context, mode, count, type, indices);
+   if (cut)
+      bounds_end(&bounds);
    if (ours)
       plain_end(&state);
 }
@@ -1173,9 +1352,15 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
          wide_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
             fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-bounds", "r");         /* glca21 */
+         bounds_on = !(f != NULL && fgetc(f) == '0');
+         if (f != NULL)
+            fclose(f);
       }
-      say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s, wide downsample %s%s",
+      say("ca fixes: glsl rewrite %s, no-program draws %s, shapes without derivatives %s, wide downsample %s, "
+          "draws scissored to their vertices %s%s",
           glsl_on ? "on" : "off", plain_on ? "on" : "off", shapes_on ? "on" : "off", wide_on ? "on" : "off",
+          bounds_on ? "on" : "off",
           debug_shape ? ", SHAPE DEBUG (a8gl-dbg-shape)" : "");
       if (access("/private/var/mobile/Library/a8gl-nohooks", F_OK) != 0)
          hook_coreanimation();
