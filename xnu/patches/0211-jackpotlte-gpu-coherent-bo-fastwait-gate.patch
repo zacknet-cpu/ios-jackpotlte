@@ -1,0 +1,602 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 23cd28f..9f13ef3 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1904,9 +1904,11 @@ a8s_command(const char *line)
+ 			rest++;
+ 		}
+ 		/* 0203: "flip a" async SwapEnd, "flip s" synchronous again;
+-		 * 0207: "flip g" / "flip n" a swap waits for the GPU or not */
++		 * 0207: "flip g" / "flip n" a swap waits for the GPU or not;
++		 * 0211: "flip o" / "flip e" the gate holds only scan-out jobs or all */
+ 		int on = *rest == '0' ? 0 : *rest == '1' ? 1 : *rest == 'a' ? 2 : *rest == 's' ? 3 :
+-		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : *rest == 'd' ? 6 : *rest == 'w' ? 7 : -1;
++		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : *rest == 'd' ? 6 : *rest == 'w' ? 7 :
++		    *rest == 'o' ? 8 : *rest == 'e' ? 9 : -1;
+ 		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
+ 	} else if (a8s_word(line, "date", &rest)) {
+ 		while (*rest == ' ') {
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index f8dfc35..fa8a1ef 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -52,6 +52,9 @@ void jackpotlte_mali_unmap(uint64_t gpu, uint64_t size);
+ void jackpotlte_mali_mapped(void);
+ uint32_t jackpotlte_mali_submit(uint64_t chain, bool fragment);
+ uint64_t jackpotlte_mali_enqueue(uint64_t chain, bool fragment);
++uint64_t jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate);
++void jackpotlte_mali_mapped_range(uint64_t gpu, uint64_t size);
++void jackpotlte_mali_report(void);
+ bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
+ void jackpotlte_mali_start(volatile uint32_t *mali);
+ 
+@@ -150,6 +153,8 @@ static const uint32_t jt_g3d_gate[] = {
+ #define JT_MALI_AS_TRANSTAB_HI	0x04u
+ #define JT_MALI_AS_MEMATTR_LO	0x08u
+ #define JT_MALI_AS_MEMATTR_HI	0x0cu
++#define JT_MALI_AS_LOCKADDR_LO	0x10u		/* 0211: region for LOCK */
++#define JT_MALI_AS_LOCKADDR_HI	0x14u
+ #define JT_MALI_AS_COMMAND	0x18u		/* 1 = UPDATE */
+ #define JT_MALI_AS_FAULTSTATUS	0x1cu
+ #define JT_MALI_AS_FAULTADDR_LO	0x20u
+@@ -159,6 +164,10 @@ static const uint32_t jt_g3d_gate[] = {
+ #define JT_MALI_AS_TRANSCFG_HI	0x34u
+ #define JT_MALI_AS_STATUS_ACTIVE 1u
+ #define JT_MALI_AS_COMMAND_UPDATE 1u
++#define JT_MALI_AS_COMMAND_LOCK	2u		/* 0211: lock AS_LOCKADDR's region */
++#define JT_MALI_AS_COMMAND_FLUSH_PT 4u		/* 0211: drop the region's walk
++						 * and TLB entries, then unlock
++						 * (panfrost_mmu.c) */
+ #define JT_MALI_AS_TRANSCFG_IDENTITY 2u		/* ADRMODE_IDENTITY */
+ #define JT_MALI_AS_TRANSCFG_AARCH64_4K 6u	/* ADRMODE_AARCH64_4K */
+ #define JT_MALI_AS_TRANSCFG_WALK_WB (2u << 24)	/* PTW_MEMATTR_WRITE_BACK */
+@@ -626,6 +635,161 @@ jt_wait_reg(uint32_t at, uint32_t mask, uint32_t want, uint32_t ms)
+ 	return (jt_rd(jt_gpu, at) & mask) == want;
+ }
+ 
++/*
++ * 0211: tunables (boot-args, read once) and counters.
++ *  a8gpunap   a job wait's nap in us once the first 300 us of polling are
++ *             over (default 50; 0153-0210 slept 200 us at a time, so a job's
++ *             end was seen up to 200 us late, several times a frame).
++ *  a8mmuflush 1 (default): a buffer entered into or taken out of address
++ *             space 0 drops only its own range from the MMU (LOCK +
++ *             FLUSH_PT, as panfrost_mmu.c does), which is allowed while jobs
++ *             run; 0: the whole address space is set up again (UPDATE), which
++ *             waits for the running job (0153-0210).
++ */
++static int jt_tuned;
++static uint32_t jt_nap_us = 50;
++static int jt_mmu_region = 1;
++static uint64_t jt_jobs[2], jt_job_ns[2], jt_job_max_ns[2], jt_jobs_failed, jt_jobs_fast_fail;
++static uint64_t jt_mmu_flushes, jt_mmu_updates, jt_mmu_slow;
++static uint64_t jt_jobs_gated, jt_jobs_free;
++static unsigned jt_fault_dumps;
++
++static void
++jt_tune(void)
++{
++	uint32_t v;
++
++	if (jt_tuned) {
++		return;
++	}
++	if (PE_parse_boot_argn("a8gpunap", &v, sizeof(v)) && v >= 5 && v <= 1000) {
++		jt_nap_us = v;
++	}
++	if (PE_parse_boot_argn("a8mmuflush", &v, sizeof(v))) {
++		jt_mmu_region = v != 0;
++	}
++	jt_tuned = 1;
++}
++
++/* A job on `slot` done (true), failed or stopped by an MMU fault (false,
++ * *mmu set for the fault), or not done within `ms`.  0153-0210 waited for
++ * the done bit alone, so a failed job (its fault bit set at once) or one
++ * held by an MMU fault (neither bit) cost the whole second. */
++static bool
++jt_wait_job(uint32_t slot, uint32_t ms, bool *mmu)
++{
++	uint32_t done = 1u << slot, fail = 1u << (slot + 16), raw;
++	uint64_t deadline, nap;
++
++	*mmu = false;
++	for (int i = 0; i < 60; i++) {		/* 300 us at 5 us */
++		raw = jt_rd(jt_gpu, JT_MALI_JOB_INT_RAWSTAT);
++		if (raw & (done | fail)) {
++			return (raw & fail) == 0;
++		}
++		if (jt_rd(jt_gpu, JT_MALI_MMU_INT_RAWSTAT) & 0x10001u) {
++			*mmu = true;
++			return false;
++		}
++		delay(5);
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		raw = jt_rd(jt_gpu, JT_MALI_JOB_INT_RAWSTAT);
++		if (raw & (done | fail)) {
++			return (raw & fail) == 0;
++		}
++		if (jt_rd(jt_gpu, JT_MALI_MMU_INT_RAWSTAT) & 0x10001u) {
++			*mmu = true;
++			return false;
++		}
++		clock_interval_to_deadline(jt_nap_us, NSEC_PER_USEC, &nap);
++		lck_mtx_lock(&jt_wait_lock);
++		(void)lck_mtx_sleep_deadline(&jt_wait_lock, LCK_SLEEP_DEFAULT,
++		    (event_t)&jt_wait_event, THREAD_UNINT, nap);
++		lck_mtx_unlock(&jt_wait_lock);
++	}
++	raw = jt_rd(jt_gpu, JT_MALI_JOB_INT_RAWSTAT);
++	return (raw & done) && !(raw & fail);
++}
++
++/* With jt_mali_lock held: AS 0 has no command running (true), within 10 ms. */
++static bool
++jt_as0_ready(void)
++{
++	for (int i = 0; i < 10000; i++) {
++		if (!(jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_STATUS) &
++		    JT_MALI_AS_STATUS_ACTIVE)) {
++			return true;
++		}
++		delay(1);
++	}
++	jt_mmu_slow++;
++	return false;
++}
++
++/* With jt_mali_lock held: the MMU forgets what it cached of [start, start +
++ * size), as panfrost_mmu.c's lock_region() + AS_COMMAND_FLUSH_PT: the smallest
++ * naturally aligned power-of-two block holding the range, at least 32 KB, its
++ * log2 minus one in the low bits of LOCKADDR. */
++static void
++jt_as0_flush_range(uint64_t start, uint64_t size)
++{
++	uint64_t end = start + size, region;
++	uint32_t width;
++
++	if (size == 0 || jt_gpu == NULL) {
++		return;
++	}
++	width = 64u - (uint32_t)__builtin_clzll(start ^ (end - 1));
++	if (width < 15u) {
++		width = 15u;
++	}
++	width -= 1u;
++	region = (start & ~((1ull << width) - 1)) | width;
++	(void)jt_as0_ready();
++	jt_wr(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_LOCKADDR_LO, (uint32_t)region);
++	jt_wr(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_LOCKADDR_HI, (uint32_t)(region >> 32));
++	jt_wr(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_COMMAND, JT_MALI_AS_COMMAND_LOCK);
++	(void)jt_as0_ready();
++	jt_wr(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_COMMAND, JT_MALI_AS_COMMAND_FLUSH_PT);
++	(void)jt_as0_ready();
++	jt_mmu_flushes++;
++}
++
++/* 0211: what a faulting job held, for reading next to the fault line: `words`
++ * 32-bit words at GPU address `gpu`, through the same tables the GPU walks. */
++static void
++jt_dump_gpu(const char *what, uint64_t gpu, unsigned words)
++{
++	for (unsigned i = 0; i < words; i += 8) {
++		uint32_t w[8];
++		unsigned n = 0;
++
++		while (n < 8 && i + n < words) {
++			uint64_t at = gpu + 4ull * (i + n);
++			uint64_t pte = jt_pt_lookup(at & ~0xfffull);
++			vm_offset_t kva;
++
++			if (!(pte & 1)) {
++				break;
++			}
++			kva = phystokv((pte & JT_PTE_ADDRESS) + (at & 0xfffull));
++			FlushPoC_DcacheRegion(kva & ~(vm_offset_t)63, 64);
++			w[n++] = *(volatile uint32_t *)kva;
++		}
++		printf("JACKPOTLTE MALI: %s %#llx+%#x:", what,
++		    (unsigned long long)gpu, i * 4);
++		for (unsigned k = 0; k < n; k++) {
++			printf(" %08x", w[k]);
++		}
++		printf("%s\n", n < 8 && i + n < words ? " (not mapped)" : "");
++		if (n < 8 && i + n < words) {
++			break;
++		}
++	}
++}
++
+ bool
+ jackpotlte_mali_ready(void)
+ {
+@@ -741,10 +905,16 @@ jackpotlte_mali_unmap(uint64_t gpu, uint64_t size)
+ 	if (jt_pt_pgd == NULL) {
+ 		return;
+ 	}
++	jt_tune();
+ 	lck_mtx_lock(&jt_mali_lock);
+ 	for (uint64_t at = gpu; at < gpu + size; at += 4096) {
+ 		jt_unmap_page(at);
+ 	}
++	if (jt_mmu_region) {		/* 0211: only this range, jobs may run */
++		jt_as0_flush_range(gpu, size);
++		lck_mtx_unlock(&jt_mali_lock);
++		return;
++	}
+ 	lck_mtx_unlock(&jt_mali_lock);
+ 
+ 	lck_mtx_lock(&jt_job_lock);	/* an entry taken out: the TLB may hold it */
+@@ -762,10 +932,27 @@ jackpotlte_mali_mapped(void)
+ 	lck_mtx_lock(&jt_job_lock);
+ 	lck_mtx_lock(&jt_mali_lock);
+ 	jt_as0_update(jt_gpu, jt_pt_pgd_phys, jt_as0_transcfg);
++	jt_mmu_updates++;
+ 	lck_mtx_unlock(&jt_mali_lock);
+ 	lck_mtx_unlock(&jt_job_lock);
+ }
+ 
++/* 0211: after the pages of [gpu, gpu + size) went in: with a8mmuflush (the
++ * default) only that range is dropped from the MMU, without waiting for the
++ * running job; otherwise as jackpotlte_mali_mapped(). */
++void
++jackpotlte_mali_mapped_range(uint64_t gpu, uint64_t size)
++{
++	jt_tune();
++	if (!jt_mmu_region) {
++		jackpotlte_mali_mapped();
++		return;
++	}
++	lck_mtx_lock(&jt_mali_lock);
++	jt_as0_flush_range(gpu, size);
++	lck_mtx_unlock(&jt_mali_lock);
++}
++
+ /* One job chain from GPU address `chain`, run to its end before this returns:
+  * fragment chains on slot 0, the rest on slot 1.  0 when it finished,
+  * otherwise the slot's status (or 0xff for no answer within a second), and
+@@ -777,12 +964,16 @@ jackpotlte_mali_submit(uint64_t chain, bool fragment)
+ 	uint32_t slot = fragment ? 0 : 1;
+ 	uint32_t js = fragment ? JT_MALI_JS0 : JT_MALI_JS1;
+ 	uint32_t raw, status = 0;
+-	bool finished;
++	bool finished, mmu = false;
++	uint64_t t0;
+ 
++	jt_tune();
+ 	lck_mtx_lock(&jt_job_lock);
+ 	lck_mtx_lock(&jt_mali_lock);
++	t0 = mach_absolute_time();
+ 	jt_wr(jt_gpu, JT_MALI_JOB_INT_CLEAR,
+ 	    (1u << slot) | (1u << (slot + 16)));
++	jt_wr(jt_gpu, JT_MALI_MMU_INT_CLEAR, 0x10001u);	/* 0211: AS 0 fault/bus bits */
+ 	jt_wr(jt_gpu, js + JT_MALI_JS_HEAD_NEXT_LO, (uint32_t)chain);
+ 	jt_wr(jt_gpu, js + JT_MALI_JS_HEAD_NEXT_HI, (uint32_t)(chain >> 32));
+ 	jt_wr(jt_gpu, js + JT_MALI_JS_AFFINITY_NEXT_LO, jt_shader_mask);
+@@ -791,8 +982,23 @@ jackpotlte_mali_submit(uint64_t chain, bool fragment)
+ 	jt_wr(jt_gpu, js + JT_MALI_JS_COMMAND_NEXT, JT_MALI_JS_COMMAND_START);
+ 	lck_mtx_unlock(&jt_mali_lock);
+ 
+-	finished = jt_wait_reg(JT_MALI_JOB_INT_RAWSTAT,
+-	    (1u << slot) | (1u << (slot + 16)), 1u << slot, 1000);
++	finished = jt_wait_job(slot, 1000, &mmu);
++	{
++		uint64_t ns;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		jt_jobs[slot]++;
++		jt_job_ns[slot] += ns;
++		if (ns > jt_job_max_ns[slot]) {
++			jt_job_max_ns[slot] = ns;
++		}
++		if (!finished) {
++			jt_jobs_failed++;
++			if (ns < 900ull * NSEC_PER_MSEC) {
++				jt_jobs_fast_fail++;
++			}
++		}
++	}
+ 
+ 	lck_mtx_lock(&jt_mali_lock);
+ 	if (!finished) {
+@@ -871,6 +1077,32 @@ jackpotlte_mali_submit(uint64_t chain, bool fragment)
+ 			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_TRANSTAB_LO)),
+ 			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_TRANSCFG_LO),
+ 			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_STATUS));
++			/* 0211: the allocator never gives an address twice, so
++			 * a fault below where it stands is a buffer that went
++			 * (or was never made); and what the job held. */
++			printf("JACKPOTLTE MALI: allocator at %#llx (addresses "
++			    "from %#llx), %s\n", (unsigned long long)jt_next_address,
++			    (unsigned long long)JT_GPU_ADDRESS_FIRST,
++			    mmu ? "stopped at the MMU fault" : "no MMU fault");
++			if (jt_fault_dumps < 3) {
++				jt_fault_dumps++;
++				jt_dump_gpu("job", chain, 16);
++				if (fragment) {
++					uint64_t fbd = 0, w = 0;
++					uint64_t pte = jt_pt_lookup((chain + 0x28) & ~0xfffull);
++
++					if (pte & 1) {
++						vm_offset_t kva = phystokv((pte & JT_PTE_ADDRESS) +
++						    ((chain + 0x28) & 0xfffull));
++						FlushPoC_DcacheRegion(kva & ~(vm_offset_t)63, 64);
++						w = *(volatile uint64_t *)kva;
++						fbd = w & ~0x3full;
++					}
++					if (fbd != 0) {
++						jt_dump_gpu("fbd", fbd, 64);
++					}
++				}
++			}
+ 		}
+ 		jt_wr(jt_gpu, JT_MALI_GPU_INT_CLEAR, 0xffffffffu);
+ 		jt_wr(jt_gpu, JT_MALI_GPU_CMD, 1u);
+@@ -955,12 +1187,27 @@ extern void sweet_fb_gpu_gate(void);    /* SweetFramebuffer.cpp, 0207 */
+ 
+ uint64_t
+ jackpotlte_mali_enqueue(uint64_t chain, bool fragment)
++{
++	return jackpotlte_mali_enqueue_gated(chain, fragment, true);
++}
++
++/* 0211: `gate` false for a job that cannot draw into the buffer on the panel
++ * (the user client asks for it only for fragment jobs naming a scan-out
++ * buffer when a8gatescan is on), so offscreen passes and vertex/tiler jobs
++ * are not held while the panel takes a flip. */
++uint64_t
++jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate)
+ {
+ 	uint64_t seq;
+ 	unsigned at;
+ 
+ 	/* 0207: with async SwapEnd, not into a buffer the panel still shows. */
+-	sweet_fb_gpu_gate();
++	if (gate) {
++		sweet_fb_gpu_gate();
++		__atomic_fetch_add(&jt_jobs_gated, 1, __ATOMIC_RELAXED);
++	} else {
++		__atomic_fetch_add(&jt_jobs_free, 1, __ATOMIC_RELAXED);
++	}
+ 	lck_mtx_lock(&jt_queue_lock);
+ 	if (!jt_worker_started) {
+ 		thread_t thread;
+@@ -1016,6 +1263,22 @@ jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns)
+ 	return done;
+ }
+ 
++/* 0211: the console "flip" report's GPU line. */
++void
++jackpotlte_mali_report(void)
++{
++	uint64_t avg0 = jt_jobs[0] ? jt_job_ns[0] / jt_jobs[0] / 1000 : 0;
++	uint64_t avg1 = jt_jobs[1] ? jt_job_ns[1] / jt_jobs[1] / 1000 : 0;
++
++	jt_tune();
++	printf("A8 GPU: jobs fragment %llu (avg %llu us, max %llu us), other %llu (avg %llu us, "
++	    "max %llu us); failed %llu (%llu seen early); held for the panel %llu, not held %llu; "
++	    "MMU range flushes %llu, full updates %llu, slow %llu; nap %u us; allocator at %#llx\n",
++	    jt_jobs[0], avg0, jt_job_max_ns[0] / 1000, jt_jobs[1], avg1, jt_job_max_ns[1] / 1000,
++	    jt_jobs_failed, jt_jobs_fast_fail, jt_jobs_gated, jt_jobs_free, jt_mmu_flushes,
++	    jt_mmu_updates, jt_mmu_slow, jt_nap_us, (unsigned long long)jt_next_address);
++}
++
+ /* Leave the GPU up and hand it to the service: address space 0 on the tables,
+  * the allocator at its first address (called once bring-up succeeded). */
+ void
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+index dcbb4c6..b9b2f3f 100644
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -30,6 +30,7 @@
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOSubMemoryDescriptor.h>
++#include <pexpert/pexpert.h>                    /* 0211: PE_parse_boot_argn */
+ #include <mach/vm_param.h>
+ #include <kern/clock.h>
+ #include <sys/systm.h>
+@@ -54,10 +55,43 @@ bool jackpotlte_mali_parameter(uint32_t which, uint64_t * value);
+ uint64_t jackpotlte_mali_address(uint64_t size);
+ bool jackpotlte_mali_map(uint64_t gpu, uint64_t phys);
+ void jackpotlte_mali_mapped(void);
++void jackpotlte_mali_mapped_range(uint64_t gpu, uint64_t size);
+ void jackpotlte_mali_unmap(uint64_t gpu, uint64_t size);
+ uint32_t jackpotlte_mali_submit(uint64_t chain, bool fragment);
+ uint64_t jackpotlte_mali_enqueue(uint64_t chain, bool fragment);
++uint64_t jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate);
+ bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
++/* iokit/Kernel/arm/SweetFramebuffer.cpp, 0211 */
++bool sweet_fb_is_scanout(uint64_t pa);
++bool sweet_fb_gate_scanout_only(void);
++/* osfmk/arm64 caches_asm.s */
++void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++}
++
++/*
++ * 0211: a new buffer's memory is zeroed by the processor through the kernel's
++ * cached mapping (IOBufferMemoryDescriptor, Z_ZERO), but the GPU does not see
++ * the processor's caches.  Until those lines are written back the GPU reads
++ * whatever an earlier owner of the pages left in memory, and a dirty line
++ * written back later overwrites what Mesa or the GPU put there since.  That
++ * fits the faults seen on 11-24/25 after an hour or more of use: fragment
++ * jobs fetching shaders at addresses inside an earlier, dead backboardd's
++ * tiler heap.  Linux makes the pages coherent when panfrost maps them
++ * (dma_map_sgtable); here the buffer is cleaned and invalidated to the point
++ * of coherency once, when it is made.  Boot-arg a8boclean=0 skips it.
++ */
++static int gMaliClean = -1;
++
++static bool
++mali_clean_on(void)
++{
++	if (gMaliClean < 0) {
++		int on = 1;
++
++		PE_parse_boot_argn("a8boclean", &on, sizeof(on));
++		gMaliClean = on != 0;
++	}
++	return gMaliClean > 0;
+ }
+ 
+ /* Linux's include/uapi/drm/panfrost_drm.h and drm.h: the requests' numbers and
+@@ -143,6 +177,7 @@ struct mali_buffer {
+ 	SweetSurface *       surface;
+ 	uint64_t             address, size;
+ 	uint64_t             last_seq;          /* the last job given it */
++	bool                 scanout;           /* 0211: pixels in the panel's reserved memory */
+ };
+ 
+ static IOLock * gMaliLock;
+@@ -280,7 +315,7 @@ JackpotlteMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from,
+ 		IOLog("JackpotlteMali: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
+ 		return NULL;
+ 	}
+-	jackpotlte_mali_mapped();
++	jackpotlte_mali_mapped_range(b->address, size);
+ 	OSIncrementAtomic((SInt32 *) &gMaliBuffers);
+ 	b->size = size;
+ 	return b;
+@@ -303,6 +338,9 @@ JackpotlteMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 		IOLog("JackpotlteMali: no memory for a buffer of %llu bytes\n", size);
+ 		return kIOReturnNoMemory;
+ 	}
++	if (mali_clean_on() && memory->getBytesNoCopy() != NULL) {     /* 0211: zeros into memory */
++		FlushPoC_DcacheRegion((vm_offset_t) memory->getBytesNoCopy(), (size_t) size);
++	}
+ 	b = newBuffer(memory, 0, size, &request->handle);
+ 	if (b == NULL) {
+ 		memory->release();
+@@ -315,8 +353,8 @@ JackpotlteMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	 * the log says whether a later failure is inside this request. */
+ 	static uint32_t jm_buffers_logged;     /* 0191: one line a texture was ~100 lines a minute */
+ 	if (jm_buffers_logged++ < 64 || (jm_buffers_logged & 1023) == 0) {
+-		IOLog("JackpotlteMali: buffer %u: %llu bytes at %#llx\n",
+-		    request->handle, size, b->address);
++		IOLog("JackpotlteMali: buffer %u: %llu bytes at %#llx%s\n",
++		    request->handle, size, b->address, mali_clean_on() ? ", cleaned" : "");
+ 	}
+ 	return kIOReturnSuccess;
+ }
+@@ -400,6 +438,12 @@ JackpotlteMaliUserClient::surfaceBuffer(struct jackpotlte_surface * request)
+ 	}
+ 	b->memory = memory;                     /* newBuffer does not set it */
+ 	b->surface = s;                         /* the reference from sweet_surface_copy */
++	{
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
++
++		b->scanout = phys != 0 && sweet_fb_is_scanout(phys);   /* 0211 */
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -554,7 +598,29 @@ JackpotlteMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
+ 		fSubmits++;
+ 		gMaliSubmits++;
+ 		if (r.submit.jc != 0) {
+-			seq = jackpotlte_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
++			bool fragment = (r.submit.requirements & PANFROST_JD_REQ_FS) != 0;
++			bool gate = true;
++
++			/* 0211: with a8gatescan (default), only a fragment job that names a
++			 * scan-out buffer waits for the panel to take a pending flip. */
++			if (sweet_fb_gate_scanout_only()) {
++				gate = false;
++				for (uint32_t i = 0; fragment && !gate && i < r.submit.bo_handle_count && i < 4096; i += 64) {
++					uint32_t handles[64];
++					uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++
++					if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles,
++					    n * sizeof(uint32_t)) != 0) {
++						gate = true;
++						break;
++					}
++					for (uint32_t k = 0; k < n && !gate; k++) {
++						b = buffer(handles[k]);
++						gate = b != NULL && b->scanout;
++					}
++				}
++			}
++			seq = jackpotlte_mali_enqueue_gated(r.submit.jc, fragment, gate);
+ 			if (seq == 0) {
+ 				gMaliFailed++;
+ 			}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 621e537..fd73f22 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -572,6 +572,32 @@ extern "C" uint64_t jackpotlte_mali_queued_seq(void);            /* jackpotlte_m
+ extern "C" bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
+ extern "C" void sweet_fb_gpu_gate(void);
+ extern "C" void sweet_fb_gpu_done(uint64_t seq);
++extern "C" bool sweet_fb_is_scanout(uint64_t pa);               /* 0211 */
++extern "C" bool sweet_fb_gate_scanout_only(void);               /* 0211 */
++extern "C" void jackpotlte_mali_report(void);                   /* jackpotlte_mali.c, 0211 */
++
++/* 0211: which GPU jobs wait in sweet_fb_gpu_gate().  Boot-arg a8gatescan
++ * (default 1) and console "flip o": only fragment jobs that name a scan-out
++ * buffer (the user client checks each job's buffer list), since only those
++ * can draw into the buffer on the panel; "flip e": every job, as 0207. */
++static int           a8_gate_scan = -1;
++
++static bool
++a8_gate_scan_on(void)
++{
++	if (a8_gate_scan < 0) {
++		int on = 1;
++		PE_parse_boot_argn("a8gatescan", &on, sizeof(on));
++		a8_gate_scan = on != 0;
++	}
++	return a8_gate_scan > 0;
++}
++
++extern "C" bool
++sweet_fb_gate_scanout_only(void)
++{
++	return a8_gate_scan_on();
++}
+ 
+ #define A8_FB_RESERVED          0x1400000ull    /* reserved-memory framebuffer@0xEC000000 */
+ #define A8_IDMA0                0x148b1000ul
+@@ -869,6 +895,16 @@ sweet_fb_scanout_claim(SweetSurface *s)
+ 	return md;
+ }
+ 
++/* 0211: whether physical address `pa` is in the panel's reserved memory (the
++ * panel buffer and the second scan-out buffer both live there). */
++extern "C" bool
++sweet_fb_is_scanout(uint64_t pa)
++{
++	AppleCLCD *fb = sweet_fb_main;
++
++	return fb != NULL && pa >= (uint64_t)fb->fPhys && pa < (uint64_t)fb->fPhys + A8_FB_RESERVED;
++}
++
+ extern "C" void
+ sweet_fb_scanout_release(SweetSurface *s)
+ {
+@@ -1010,6 +1046,11 @@ sweet_fb_flip_set(int on)
+ 		a8_flip_defer = on == 6;
+ 		on = -1;
+ 	}
++	if (on == 8 || on == 9) {                       /* 0211: "flip o" / "flip e" */
++		(void)a8_gate_scan_on();
++		a8_gate_scan = on == 8;
++		on = -1;
++	}
+ 	if (on >= 0) {
+ 		(void)a8_flip_on();
+ 		if (fb != NULL) {
+@@ -1032,6 +1073,9 @@ sweet_fb_flip_set(int on)
+ 	IOLog("A8 FLIP: deferred flips %s: %llu left to the GPU worker, %llu done by it; "
+ 	    "%llu jobs waited for one (%llu us)\n", a8_flip_defer_on() ? "on" : "off",
+ 	    a8_flip_deferred, a8_flip_defer_done, a8_gate_defer, a8_gate_defer_us);
++	IOLog("A8 FLIP: the gate holds %s\n", a8_gate_scan_on() ?
++	    "only fragment jobs naming a scan-out buffer (flip o)" : "every job (flip e)");
++	jackpotlte_mali_report();
+ 	return a8_flip_on();
+ }
+ 
