@@ -1,0 +1,92 @@
+From a8b63ba3b16b6160735fe99c720cd0ea88efb1a6 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Wed, 25 Nov 2026 00:52:25 -0500
+Subject: [PATCH] 0217-a8-console-fmv.patch
+
+---
+ bsd/dev/a5xelte_usb.c |  5 ++++-
+ bsd/dev/a8_files.c    | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 5053ae7..068231e 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1655,6 +1655,7 @@ a8s_shot(unsigned scale)
+ /* bsd/dev/a8_files.c */
+ extern void a8f_get(const char *args);
+ extern void a8f_put(const char *args);
++extern void a8f_mv(const char *args);     /* a8_files.c, 0217 */
+ extern void a8f_data(const char *b64);
+ extern void a8f_end(void);
+ extern void a8f_ls(const char *args);
+@@ -1718,7 +1719,7 @@ a8s_command(const char *line)
+ 		    "key power|up|down|home [MS] | wake | "
+ 		    "peek ADDR [WORDS] | poke ADDR VALUE | "
+ 		    "reboot [recovery|download]\n");
+-		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | "
++		printf("A8SH: files: fget PATH [OFF [LEN]] | fls DIR | fmv FROM TO | "
+ 		    "fput PATH SIZE CRC32 [MODE UID GID], fd BASE64..., fend "
+ 		    "(only under /private/var/) | date [SECONDS] | flip [0|1]\n");
+ 		printf("A8SH: X Y are panel pixels (1080x2220, as in shot x SCALE); "
+@@ -1930,6 +1931,8 @@ a8s_command(const char *line)
+ 		a8f_end();
+ 	} else if (a8s_word(line, "fls", &rest)) {
+ 		a8f_ls(rest);
++	} else if (a8s_word(line, "fmv", &rest)) {
++		a8f_mv(rest);           /* 0217 */
+ 	} else if (a8s_word(line, "vlock", &rest)) {
+ 		/* 0204: the software vsync locked to the panel's frame starts */
+ 		while (*rest == ' ') {
+diff --git a/bsd/dev/a8_files.c b/bsd/dev/a8_files.c
+index 6bf7030..b925222 100644
+--- a/bsd/dev/a8_files.c
++++ b/bsd/dev/a8_files.c
+@@ -44,6 +44,7 @@ void a8f_put(const char *args);
+ void a8f_data(const char *b64);
+ void a8f_end(void);
+ void a8f_ls(const char *args);
++void a8f_mv(const char *args);
+ void a8f_date(const char *args);
+ bool a8_gl_resolve_inject(const char *library, size_t liblen, char *out, size_t out_size);
+ bool a8_fix_library_ok(void);
+@@ -495,6 +496,36 @@ a8f_end(void)
+ 	a8f_put_reset();
+ }
+ 
++/*
++ * 0217: console "fmv FROM TO" renames a file or a directory, both paths under
++ * /private/var/ (the data volume; no . or ..), with kernel credentials.  It is
++ * the reversible way to take a file out of the way: move it aside, and back.
++ * First use: LaunchServices' database (InternalDaemon/<id>/Library/Caches/
++ * com.apple.LaunchServices-*.csstore, and its SystemDataOnly- twin) moved
++ * aside, so that lsd builds it anew now that it knows the extension points
++ * (0216).  The Galaxy S7 port removes it once for the same reason
++ * (wardevsa/ios-a5xelte gpu/eagl/test/hero-run.c, remove_ls_db_once).
++ */
++void
++a8f_mv(const char *args)
++{
++	char from[A8F_PATH], to[A8F_PATH];
++	int error;
++
++	if (!a8f_word(&args, from, sizeof(from)) || !a8f_word(&args, to, sizeof(to))) {
++		printf("A8F MV error: fmv FROM TO (both under /private/var/)\n");
++		return;
++	}
++	if (strncmp(from, "/private/var/", 13) != 0 || strncmp(to, "/private/var/", 13) != 0 ||
++	    a8f_has(from, "/../") || a8f_has(from, "/./") ||
++	    a8f_has(to, "/../") || a8f_has(to, "/./")) {
++		printf("A8F MV error: only under /private/var/ (no . or ..): %s -> %s\n", from, to);
++		return;
++	}
++	error = a8_kernel_rename(from, to);
++	printf("A8F MV %s -> %s: %s (%d)\n", from, to, error ? "failed" : "done", error);
++}
++
+ void
+ a8f_ls(const char *args)
+ {
+-- 
+2.43.0
+
