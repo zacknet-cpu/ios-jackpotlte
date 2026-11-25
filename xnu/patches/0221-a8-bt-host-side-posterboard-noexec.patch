@@ -1,4 +1,4 @@
-From 3c6c607c9d84f5c46f3bf84321fef872b580ea8a Mon Sep 17 00:00:00 2001
+From 1002b5a3688c757f90d9802ad7c6d50178fd3981 Mon Sep 17 00:00:00 2001
 From: a <a@b>
 Date: Wed, 25 Nov 2026 08:08:10 -0500
 Subject: [PATCH] 0221-a8-bt-host-side-posterboard-noexec.patch
@@ -10,9 +10,9 @@ Subject: [PATCH] 0221-a8-bt-host-side-posterboard-noexec.patch
  bsd/dev/a5xelte_scsc.h           |   5 +
  bsd/dev/mem.c                    |  29 +-
  bsd/kern/kern_exec.c             |  45 +-
- iokit/Kernel/arm/A8Bluetooth.cpp |  69 +++
+ iokit/Kernel/arm/A8Bluetooth.cpp |  70 +++
  iokit/conf/files.arm64           |   1 +
- 8 files changed, 1039 insertions(+), 33 deletions(-)
+ 8 files changed, 1040 insertions(+), 33 deletions(-)
  create mode 100644 iokit/Kernel/arm/A8Bluetooth.cpp
 
 diff --git a/bsd/dev/a5xelte_bt.c b/bsd/dev/a5xelte_bt.c
@@ -1238,10 +1238,10 @@ index d3115dd..ac771be 100644
  	/* Save space for envv[] NULL terminator */
 diff --git a/iokit/Kernel/arm/A8Bluetooth.cpp b/iokit/Kernel/arm/A8Bluetooth.cpp
 new file mode 100644
-index 0000000..df01e8a
+index 0000000..400f98b
 --- /dev/null
 +++ b/iokit/Kernel/arm/A8Bluetooth.cpp
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,70 @@
 +/*
 + * 0221: the Galaxy A8's Bluetooth for iOS's bluetoothd: an IOService named
 + * "bluetooth", which bluetoothd looks for first, with what it reads of it:
@@ -1251,6 +1251,7 @@ index 0000000..df01e8a
 + * (jesvi-eulah/Jesvi-iOS, xnu/files/iokit/Kernel/RedwoodWLAN.cpp).
 + */
 +#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
 +#include <IOKit/IOService.h>
 +#include <libkern/c++/OSData.h>
 +
