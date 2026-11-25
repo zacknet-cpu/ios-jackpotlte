@@ -1314,9 +1314,358 @@ posters_register(void *context)
 	fix_put(fix_utf8(report));
 }
 
+/* ---- v13: the wallpaper (P6), part 1: what SpringBoard shows ------------
+ * PosterBoard does not run (kernel 0221 refuses it while its poster
+ * extensions are not in LaunchServices), so the lock and home screens are
+ * black.  To find where a still picture can go: 12 s after SpringBoard
+ * starts, its windows (class, level, frame, hidden) and the views of those
+ * whose class names a wallpaper or a poster, one line each, for the console's
+ * "tee SpringBoard".
+ */
+static char wall_buf[600];
+static unsigned long wall_n;
+
+static void
+wall_add(const char *s)
+{
+	if (s == 0)
+		s = "(null)";
+	while (*s != 0 && wall_n + 2 < sizeof(wall_buf))
+		wall_buf[wall_n++] = *s++;
+	wall_buf[wall_n] = 0;
+}
+
+static void
+wall_addn(double v)
+{
+	char t[24];
+
+	fix_itoa((long)v, t);
+	wall_add(t);
+}
+
+static void
+wall_flush(void)
+{
+	wall_buf[wall_n++] = '\n';
+	write(2, wall_buf, wall_n);
+	wall_n = 0;
+}
+
+static int
+fix_contains(const char *s, const char *word)
+{
+	for (; s != 0 && *s != 0; s++) {
+		const char *a = s, *b = word;
+
+		while (*a != 0 && *a == *b) {
+			a++;
+			b++;
+		}
+		if (*b == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static void
+wall_tree(id view, int depth, unsigned long *budget)
+{
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	unsigned long (*count)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
+	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	signed char (*flag)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
+	double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+	unsigned long n, i;
+	id subs, layer;
+	fix_rect r;
+
+	if (view == 0 || depth > 9 || *budget == 0)
+		return;
+	(*budget)--;
+	r = rect(view, sel_registerName("frame"));
+	wall_add("A8FIX wall: ");
+	for (int d = 0; d < depth; d++)
+		wall_add(". ");
+	wall_add(class_getName(object_getClass(view)));
+	wall_add(" ");
+	wall_addn(r.x);
+	wall_add(",");
+	wall_addn(r.y);
+	wall_add(" ");
+	wall_addn(r.w);
+	wall_add("x");
+	wall_addn(r.h);
+	if (flag(view, sel_registerName("isHidden")))
+		wall_add(" hidden");
+	wall_add(" alpha%");
+	wall_addn(dbl(view, sel_registerName("alpha")) * 100.0);
+	layer = get(view, sel_registerName("layer"));
+	if (layer != 0) {
+		wall_add(" layer ");
+		wall_add(class_getName(object_getClass(layer)));
+		if (get(layer, sel_registerName("contents")) != 0)
+			wall_add(" with contents");
+	}
+	wall_flush();
+	subs = get(view, sel_registerName("subviews"));
+	n = subs != 0 ? count(subs, sel_registerName("count")) : 0;
+	for (i = 0; i < n && i < 16; i++)
+		wall_tree(at(subs, sel_registerName("objectAtIndex:"), i), depth + 1, budget);
+}
+
+/* v13 part 2: a still picture behind the lock or home screen.  Switch
+ * /private/var/mobile/Library/a8wall: 1 = into the lock screen's wallpaper
+ * window (_SBWallpaperSecureWindow), 2 = into the window under the home
+ * screen (SBWindow at level -1), 3 = both; the picture is a8wall.png beside
+ * it (a PNG: ImageIO decodes it in software, unlike the HEIC wallpapers).
+ * Below every other view of that window, filling it. */
+#define WALL_SWITCH     "/private/var/mobile/Library/a8wall"
+#define WALL_PICTURE    "/private/var/mobile/Library/a8wall.png"
+
+static int
+wall_switch(void)
+{
+	Class string = objc_getClass("NSString");
+	id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+	id (*from_file)(Class, SEL, id, unsigned long, id *) =
+	    (id (*)(Class, SEL, id, unsigned long, id *))objc_msgSend;
+	id text;
+
+	if (string == 0)
+		return 0;
+	text = from_file(string, sel_registerName("stringWithContentsOfFile:encoding:error:"),
+	    make(string, sel_registerName("stringWithUTF8String:"), WALL_SWITCH), 4, 0);
+	return text == 0 ? 0 : ((int (*)(id, SEL))objc_msgSend)(text, sel_registerName("intValue"));
+}
+
+static void
+wall_place(id window, const char *name, double level)
+{
+	static id picture;
+	Class string = objc_getClass("NSString"), image = objc_getClass("UIImage"),
+	    image_view = objc_getClass("UIImageView");
+	id (*make)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))objc_msgSend;
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	id view;
+
+	(void)level;
+	if (string == 0 || image == 0 || image_view == 0)
+		return;
+	if (picture == 0)
+		picture = ((id (*)(Class, SEL, id))objc_msgSend)(image,
+		    sel_registerName("imageWithContentsOfFile:"),
+		    make(string, sel_registerName("stringWithUTF8String:"), WALL_PICTURE));
+	if (picture == 0) {
+		fix_put("A8FIX wall: no picture in " WALL_PICTURE "\n");
+		return;
+	}
+	((id (*)(id, SEL))objc_msgSend)(picture, sel_registerName("retain"));
+	view = ((id (*)(id, SEL))objc_msgSend)((id)image_view, sel_registerName("alloc"));
+	view = ((id (*)(id, SEL, id))objc_msgSend)(view, sel_registerName("initWithImage:"), picture);
+	if (view == 0)
+		return;
+	((void (*)(id, SEL, fix_rect))objc_msgSend)(view, sel_registerName("setFrame:"),
+	    rect(window, sel_registerName("bounds")));
+	((void (*)(id, SEL, long))objc_msgSend)(view, sel_registerName("setContentMode:"), 2);
+	((void (*)(id, SEL, unsigned long))objc_msgSend)(view, sel_registerName("setAutoresizingMask:"), 18);
+	((void (*)(id, SEL, signed char))objc_msgSend)(view, sel_registerName("setClipsToBounds:"), 1);
+	((void (*)(id, SEL, signed char))objc_msgSend)(view, sel_registerName("setUserInteractionEnabled:"), 0);
+	((void (*)(id, SEL, id, long))objc_msgSend)(window, sel_registerName("insertSubview:atIndex:"), view, 0);
+	wall_add("A8FIX wall: picture placed in ");
+	wall_add(name);
+	wall_flush();
+}
+
+/* Places the picture as soon as the windows exist: 3 s after SpringBoard
+ * starts, then every 2 s for a minute until it went in. */
+static void
+wall_try(void *context)
+{
+	static id placed[2];
+	static int tries;
+	Class uiw = objc_getClass("UIWindow");
+	unsigned long (*count)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
+	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+	double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	int which = wall_switch(), done = 0, want = 0;
+	unsigned long n, i;
+	id wins;
+
+	(void)context;
+	if (which == 0 || uiw == 0 || !((signed char (*)(id, SEL, SEL))objc_msgSend)((id)uiw,
+	    sel_registerName("respondsToSelector:"), all))
+		return;
+	want = ((which & 1) != 0) + ((which & 2) != 0);
+	wins = ((id (*)(id, SEL, signed char, signed char))objc_msgSend)((id)uiw, all, 1, 0);
+	n = wins != 0 ? count(wins, sel_registerName("count")) : 0;
+	for (i = 0; i < n; i++) {
+		id w = at(wins, sel_registerName("objectAtIndex:"), i);
+		const char *name = class_getName(object_getClass(w));
+		double level = dbl(w, sel_registerName("windowLevel"));
+		int k = fix_streq(name, "_SBWallpaperSecureWindow") ? 0 :
+		    (level == -1.0 && fix_streq(name, "SBWindow")) ? 1 : -1;
+
+		if (k < 0 || (which & (1 << k)) == 0)
+			continue;
+		if (placed[k] != w) {
+			wall_place(w, name, level);
+			placed[k] = w;
+		}
+		done++;
+	}
+	if (done < want && ++tries < 30)
+		dispatch_after_f(dispatch_time(0, 2000000000LL), &_dispatch_main_q, 0, wall_try);
+}
+
+static void
+wall_report(void *context)
+{
+	Class uiw = objc_getClass("UIWindow");
+	unsigned long (*count)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
+	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+	double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	unsigned long n, i, budget = 160;
+	id wins;
+
+	(void)context;
+	if (uiw == 0 || !((signed char (*)(id, SEL, SEL))objc_msgSend)((id)uiw,
+	    sel_registerName("respondsToSelector:"), all)) {
+		fix_put("A8FIX wall: no window list\n");
+		return;
+	}
+	wins = ((id (*)(id, SEL, signed char, signed char))objc_msgSend)((id)uiw, all, 1, 0);
+	n = wins != 0 ? count(wins, sel_registerName("count")) : 0;
+	wall_add("A8FIX wall: ");
+	wall_addn((double)n);
+	wall_add(" windows");
+	wall_flush();
+	for (i = 0; i < n; i++) {
+		id w = at(wins, sel_registerName("objectAtIndex:"), i);
+		const char *name = class_getName(object_getClass(w));
+
+		double level = dbl(w, sel_registerName("windowLevel"));
+
+		wall_add("A8FIX wall: window ");
+		wall_add(name);
+		wall_add(" level ");
+		wall_addn(level);
+		if (((signed char (*)(id, SEL))objc_msgSend)(w, sel_registerName("isHidden")))
+			wall_add(" hidden");
+		wall_flush();
+		if (fix_contains(name, "Wallpaper") || fix_contains(name, "Poster") ||
+		    (level == -1.0 && fix_streq(name, "SBWindow")))
+			wall_tree(w, 1, &budget);
+	}
+}
+
+/*
+ * v12: BlueTool mode.  With a8bt=1 (kernel 0221) the kernel puts this library
+ * into Apple's BlueTool, and the library answers com.apple.BlueTool itself;
+ * BlueTool's own code never runs.  The kernel has booted the Bluetooth chip
+ * (bsd/dev/a5xelte_bt.c), and Apple's BlueTool would load an iPhone's
+ * firmware into whatever answers.  bluetoothd sends {kMsgId:
+ * RunBuiltinScript, kMsgArgs: {script: boot|init|deepsleep, btaddress}} and
+ * goes on when the reply says {result: 0}; RunCommand gets {result: 0,
+ * output: ""}.  As the Galaxy S20 port's bluetool_stub.c (jesvi-eulah/
+ * Jesvi-iOS userland/src), with its manufacturer 15 (Broadcom): bluetoothd
+ * restarts on a platform/chipset/manufacturer it does not know.  The main
+ * thread stays in this constructor for good (as frida-gadget's "wait" does);
+ * the listener runs on libdispatch's threads.  Its lines go to stderr: see
+ * them with the console's "tee BlueTool".
+ */
+typedef void *xpc_object_t;
+typedef const struct _xpc_type_s *xpc_type_t;
+extern const struct _xpc_type_s _xpc_type_connection, _xpc_type_dictionary;
+extern xpc_object_t xpc_connection_create_mach_service(const char *name, void *queue,
+    unsigned long long flags);
+extern void xpc_connection_set_event_handler(xpc_object_t connection, void (^handler)(xpc_object_t));
+extern void xpc_connection_resume(xpc_object_t connection);
+extern void xpc_connection_send_message(xpc_object_t connection, xpc_object_t message);
+extern xpc_type_t xpc_get_type(xpc_object_t object);
+extern xpc_object_t xpc_dictionary_create_reply(xpc_object_t original);
+extern xpc_object_t xpc_dictionary_get_value(xpc_object_t dictionary, const char *key);
+extern const char *xpc_dictionary_get_string(xpc_object_t dictionary, const char *key);
+extern xpc_object_t xpc_dictionary_get_remote_connection(xpc_object_t dictionary);
+extern void xpc_dictionary_set_int64(xpc_object_t dictionary, const char *key, long long value);
+extern void xpc_dictionary_set_string(xpc_object_t dictionary, const char *key, const char *string);
+extern xpc_object_t xpc_retain(xpc_object_t object);
+extern void xpc_release(xpc_object_t object);
+extern int pause(void);
+#define FIX_XPC_LISTENER 1ull   /* XPC_CONNECTION_MACH_SERVICE_LISTENER */
+#define FIX_BROADCOM 15
+
+static void
+bluetool_answer(xpc_object_t message)
+{
+	const char *msgid = xpc_dictionary_get_string(message, "kMsgId");
+	xpc_object_t args = xpc_dictionary_get_value(message, "kMsgArgs");
+	int dict = args != 0 && xpc_get_type(args) == &_xpc_type_dictionary;
+	const char *script = dict ? xpc_dictionary_get_string(args, "script") : 0;
+	const char *command = dict ? xpc_dictionary_get_string(args, "command") : 0;
+	xpc_object_t reply = xpc_dictionary_create_reply(message);
+
+	fix_put("A8FIX BlueTool: ");
+	fix_put(msgid != 0 ? msgid : "(no kMsgId)");
+	if (script != 0) {
+		fix_put(" script ");
+		fix_put(script);
+	}
+	if (command != 0) {
+		fix_put(" command ");
+		fix_put(command);
+	}
+	fix_put(": answered with success\n");
+	if (reply == 0)
+		return;
+	xpc_dictionary_set_int64(reply, "result", 0);
+	if (msgid != 0 && fix_streq(msgid, "RunCommand")) {
+		xpc_dictionary_set_string(reply, "output", "");
+	} else {
+		xpc_dictionary_set_int64(reply, "manufacturer", FIX_BROADCOM);
+		xpc_dictionary_set_string(reply, "firmware", "MX140 (booted by the kernel)");
+	}
+	xpc_connection_send_message(xpc_dictionary_get_remote_connection(message), reply);
+	xpc_release(reply);
+}
+
+static void
+bluetool_serve(void)
+{
+	xpc_object_t listener = xpc_connection_create_mach_service("com.apple.BlueTool", 0,
+	    FIX_XPC_LISTENER);
+
+	if (listener == 0) {
+		fix_put("A8FIX BlueTool: com.apple.BlueTool could not be listened on\n");
+		return;
+	}
+	xpc_connection_set_event_handler(listener, ^(xpc_object_t peer) {
+		if (xpc_get_type(peer) != &_xpc_type_connection)
+			return;
+		xpc_retain(peer);       /* (kept: bluetoothd connects once or twice) */
+		xpc_connection_set_event_handler(peer, ^(xpc_object_t message) {
+			if (xpc_get_type(message) == &_xpc_type_dictionary)
+				bluetool_answer(message);
+		});
+		xpc_connection_resume(peer);
+	});
+	xpc_connection_resume(listener);
+	fix_put("A8FIX BlueTool: com.apple.BlueTool answered here (the kernel booted the chip)\n");
+	for (;;)
+		pause();
+}
+
 __attribute__((constructor)) static void
 fix_init(void)
 {
+	/* v12: in BlueTool, only the stand-in (it does not return) */
+	if (fix_streq(getprogname(), "BlueTool")) {
+		bluetool_serve();
+		return;
+	}
 	log_apply();
 	dump_arm();
 	NSSetUncaughtExceptionHandler(fix_exception);
@@ -1332,4 +1681,9 @@ fix_init(void)
 	if (fix_streq(getprogname(), "SpringBoard"))
 		dispatch_after_f(dispatch_time(0, 30000000000LL), dispatch_get_global_queue(0, 0), 0,
 		    posters_register);
+	/* v13: what SpringBoard shows (for "tee SpringBoard"), and the picture */
+	if (fix_streq(getprogname(), "SpringBoard")) {
+		dispatch_after_f(dispatch_time(0, 12000000000LL), &_dispatch_main_q, 0, wall_report);
+		dispatch_after_f(dispatch_time(0, 3000000000LL), &_dispatch_main_q, 0, wall_try);
+	}
 }

@@ -10,5 +10,11 @@ exports:
                    _getenv, _free, _os_log_set_hook, _os_log_copy_message_string,
                    __NSConcreteGlobalBlock, _dispatch_source_create, _dispatch_source_set_event_handler_f,
                    _dispatch_resume, __dispatch_source_type_signal, _signal,
-                   _dlsym, _dispatch_get_global_queue ]
+                   _dlsym, _dispatch_get_global_queue,
+                   _xpc_connection_create_mach_service, _xpc_connection_set_event_handler,
+                   _xpc_connection_resume, _xpc_connection_send_message, _xpc_get_type,
+                   _xpc_dictionary_create_reply, _xpc_dictionary_get_value,
+                   _xpc_dictionary_get_string, _xpc_dictionary_get_remote_connection,
+                   _xpc_dictionary_set_int64, _xpc_dictionary_set_string, _xpc_retain,
+                   _xpc_release, __xpc_type_connection, __xpc_type_dictionary, _pause ]
 ...
