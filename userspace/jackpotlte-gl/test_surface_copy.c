@@ -81,6 +81,35 @@ void *IOSurfaceGetBaseAddress(struct __IOSurface *s) { return s->bytes; }
 uint32_t IOSurfaceGetSeed(struct __IOSurface *s) { return s->seed; }
 const void *CFRetain(const void *p) { return p; }
 void CFRelease(const void *p) { (void)p; }
+/* glca28b: jackpotlte_eagl_new_surface (shadow surfaces) links; never called here */
+struct jt_cf_callbacks { int unused; };
+const struct jt_cf_callbacks kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks;
+CFMutableDictionaryRef
+CFDictionaryCreateMutable(CFAllocatorRef allocator, long capacity, const struct jt_cf_callbacks *keys,
+                          const struct jt_cf_callbacks *values)
+{
+   (void)allocator; (void)capacity; (void)keys; (void)values;
+   return NULL;
+}
+void CFDictionarySetValue(CFMutableDictionaryRef d, const void *key, const void *value)
+{
+   (void)d; (void)key; (void)value;
+}
+CFNumberRef CFNumberCreate(CFAllocatorRef allocator, long type, const void *value)
+{
+   (void)allocator; (void)type; (void)value;
+   return NULL;
+}
+CFStringRef CFStringCreateWithCString(CFAllocatorRef allocator, const char *text, uint32_t encoding)
+{
+   (void)allocator; (void)text; (void)encoding;
+   return NULL;
+}
+IOSurfaceRef IOSurfaceCreate(CFMutableDictionaryRef properties)
+{
+   (void)properties;
+   return NULL;
+}
 int IOSurfaceLock(struct __IOSurface *s, uint32_t o, uint32_t *seed)
 { (void)s; (void)o; (void)seed; return 0; }
 int IOSurfaceUnlock(struct __IOSurface *s, uint32_t o, uint32_t *seed)
