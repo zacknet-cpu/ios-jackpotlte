@@ -93,6 +93,11 @@
  * Backdrop scale (v17b, P3a): every CABackdropLayer captures at most 25%
  * (they all captured at 100% here); a8fix-bdscale N or "1"; see bd_apply.
  *
+ * CoreImage (v17d, Bold Text crash): no CIContext can work here (no Metal,
+ * no CPU renderer in iOS 16, and its GL path needs Apple's private GLES
+ * context), so its GL context makers answer nil instead of crashing at
+ * pc 0; a8fix-cigl "1" keeps Apple's; see ci_apply.
+ *
  * Sensor curtain (v14, user report 11-25): the expanded island's X button had
  * a pill-shaped bite: the sensor cover (_SBSystemApertureMagiciansCurtainView
  * in the aperture window that takes no touches) is drawn above the content,
@@ -1503,6 +1508,87 @@ bd_apply(void)
 	write(2, l.b, l.n);
 }
 
+/* ---- v17d: CoreImage without a GL path (Bold Text crash) --------------- */
+/*
+ * iOS 16's -[CIContext initWithOptions:] has no CPU renderer (it turns
+ * "software_renderer" into "priority_request_low") and, with no MTLDevice,
+ * makes a GL context: +[CIContext internalGLContextWithOptions:] ->
+ * +internalContextWithEAGLContext:options: -> CI::GLContext, which takes the
+ * GL entry points from -[EAGLContext getMacroContextPrivate] (Apple's private
+ * GLES context).  Our EAGL has none, CoreImage's table stays all zeros and its
+ * first call (glDisable(GL_DEPTH_TEST), CoreImage +0x19c588) jumps to 0: every
+ * CIContext crashed its process, e.g. SpringBoard with Bold Text on (CoreUI's
+ * shared context; CoreImage +0x6f10/+0x7114/+0x45884, read from the phone's
+ * dyld cache 11-26).  Both makers answer nil: initWithOptions: then returns nil
+ * (it checks), so the caller gets no context instead of a crash.
+ * /private/var/mobile/Library/a8fix-cigl "1" keeps Apple's path.
+ */
+#define CI_GL_SWITCH "/private/var/mobile/Library/a8fix-cigl"
+static int ci_done;
+static unsigned ci_refused;
+
+static void
+ci_say(const char *what)
+{
+	struct vline l;
+
+	if (ci_refused++ >= 3)
+		return;
+	l.n = 0;
+	vl_str(&l, "A8FIX CoreImage: no GL context (");
+	vl_str(&l, what);
+	vl_str(&l, ") in ");
+	vl_str(&l, getprogname());
+	l.b[l.n++] = '\n';
+	write(2, l.b, l.n);
+}
+
+static id
+ci_no_gl(id self, SEL cmd, id options)
+{
+	(void)self;
+	(void)cmd;
+	(void)options;
+	ci_say("internalGLContextWithOptions:");
+	return 0;
+}
+
+static id
+ci_no_eagl(id self, SEL cmd, id eagl, id options)
+{
+	(void)self;
+	(void)cmd;
+	(void)eagl;
+	(void)options;
+	ci_say("internalContextWithEAGLContext:options:");
+	return 0;
+}
+
+static void
+ci_apply(void)
+{
+	Class c;
+	Method gl, eagl;
+	id text;
+
+	if (ci_done || (c = objc_getClass("CIContext")) == 0)
+		return;
+	ci_done = 1;
+	text = fix_switch_text(CI_GL_SWITCH);
+	if (text != 0 && ((int (*)(id, SEL))objc_msgSend)(text, sel_registerName("intValue")) == 1) {
+		fix_put("A8FIX CoreImage: Apple's GL path kept (a8fix-cigl)\n");
+		return;
+	}
+	gl = class_getClassMethod(c, sel_registerName("internalGLContextWithOptions:"));
+	eagl = class_getClassMethod(c, sel_registerName("internalContextWithEAGLContext:options:"));
+	if (gl != 0)
+		method_setImplementation(gl, (IMP)ci_no_gl);
+	if (eagl != 0)
+		method_setImplementation(eagl, (IMP)ci_no_eagl);
+	if (gl == 0 || eagl == 0)
+		fix_put("A8FIX CoreImage: a GL context maker was not found\n");
+}
+
 /* ---- v14b: long CoreAnimation animations (P3, Live Activity cost) ------- */
 
 /*
@@ -1891,6 +1977,7 @@ fix_image_added(const void *mh, long slide)
 	idle_apply();
 	anim_apply();
 	bd_apply();
+	ci_apply();
 	if (fix_is_springboard)
 		curtain_apply();
 }
@@ -2793,6 +2880,7 @@ fix_init(void)
 	idle_apply();
 	anim_apply();
 	bd_apply();
+	ci_apply();
 	fix_is_springboard = fix_streq(getprogname(), "SpringBoard");
 	if (fix_is_springboard)
 		curtain_apply();
