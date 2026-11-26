@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
-index 7d66e22..cb630c8 100644
+index 7d66e22..3b6b70e 100644
 --- a/bsd/dev/jackpotlte_pmic.c
 +++ b/bsd/dev/jackpotlte_pmic.c
 @@ -454,6 +454,15 @@ jp_read_reg(vm_offset_t i2c, uint8_t addr8, uint8_t reg, uint8_t *buf,
@@ -145,6 +145,21 @@ index 7d66e22..cb630c8 100644
  int
  jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
      int *external, int *charging, int *full)
+@@ -758,7 +854,13 @@ jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+ 
+ 	ok = jp_sample_read(&s);
+ 	if (ok) {
+-		bool changed = !jp_have ||
++		bool changed;
++
++		if (!s.temp_valid) {
++			/* 0228: the log's "unknown, last" shows the last reading */
++			s.temp_deci = jp_have ? jp_last.temp_deci : 0;
++		}
++		changed = !jp_have ||
+ 		    s.external != jp_last.external ||
+ 		    s.charging != jp_last.charging ||
+ 		    s.full != jp_last.full ||
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 0535b28..6418af5 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
