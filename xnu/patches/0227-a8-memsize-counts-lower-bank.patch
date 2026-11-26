@@ -1,0 +1,38 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 67a401d..a8c1125 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2730,6 +2730,33 @@ a8lo_give_to_vm(void)
+ 	}
+ 	printf("A8 RAM: %llu MiB of the lower bank given to the VM, free pages %u -> %u\n",
+ 	    (unsigned long long)(ptoa_64(pages) >> 20), before, vm_page_free_count);
++	/*
++	 * 0227 (P11a): the sizes everyone reads were set from the upper bank
++	 * alone (arm_vm_init.c), so hw.memsize said 2 GiB of ~3.8.  They count
++	 * the lower bank's pages now.  This runs inside vm_mem_bootstrap(),
++	 * before kernel_bootstrap() copies max_mem into machine_info (the
++	 * commpage's memory size) and before bsd_init's memorystatus_init
++	 * sizes jetsam's thresholds from max_mem; scale_setup() (zone and kmem
++	 * sizes) ran before and keeps the upper bank's.  Boot-arg a8memsize=0:
++	 * the old sizes.
++	 */
++	{
++		int count = 1;
++
++		(void)PE_parse_boot_argn("a8memsize", &count, sizeof(count));
++		if (count != 0 && pages != 0) {
++			const uint64_t bytes = ptoa_64(pages);
++
++			max_mem += bytes;
++			max_mem_actual += bytes;
++			mem_actual += bytes;
++			sane_size += bytes;
++			printf("A8 RAM: sizes now count the lower bank (0227): max_mem %llu MiB, "
++			    "max_mem_actual %llu MiB, sane_size %llu MiB\n",
++			    (unsigned long long)(max_mem >> 20), (unsigned long long)(max_mem_actual >> 20),
++			    (unsigned long long)(sane_size >> 20));
++		}
++	}
+ }
+ STARTUP(ZALLOC, STARTUP_RANK_LAST, a8lo_give_to_vm);
+ #endif /* JACKPOTLTE */
