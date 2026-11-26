@@ -1143,6 +1143,78 @@ my_glFenceSync(void *context, GLenum condition, GLbitfield flags)
  * same way); the first GPU boot's log has it too.  Everything is done after
  * glFinish, so a wait finishes the GPU and a test answers yes.
  */
+/*
+ * glca26: the fences are real.  CoreAnimation sets a fence after its work
+ * and later tests it or waits for it (before it reuses what that work drew
+ * with); answering every test and wait with glFinish made it wait for all
+ * the GPU's work, including the frame it had just sent: 13.8% of the render
+ * thread while swiping pages (11-26 profile, QuartzCore -> glFinish).  Each
+ * fence is now a GL sync object made right after the flush that SetFence
+ * always did: a test asks it without waiting, a wait waits for it alone.
+ * A fence from another context, or one this table lost, is waited for as
+ * before (glFinish).  OFF unless a8gl-fences "1": 11-26 CoreAnimation made
+ * no APPLE fence call in pages, Control Center, Settings or app runs, so
+ * this is untried code.
+ */
+#define FENCES_MAX 1024
+static struct {
+   GLuint name;
+   void *context;
+   void *sync;
+} fences_tab[FENCES_MAX];
+static int fences_on = -1;
+static unsigned long fence_sets, fence_tests, fence_busy, fence_waits, fence_old, fence_wait_us;
+static void *(*real_fence_sync)(GLenum, GLbitfield);
+static GLenum (*real_client_wait)(void *, GLbitfield, uint64_t);
+static void (*real_delete_sync)(void *);
+
+static int
+fences_ready(void)
+{
+   if (fences_on < 0) {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-fences", "r");
+      int c = f != NULL ? fgetc(f) : EOF;
+
+      if (f != NULL)
+         fclose(f);
+      real_fence_sync = (void *(*)(GLenum, GLbitfield))jackpotlte_gl_proc("glFenceSync");
+      real_client_wait = (GLenum (*)(void *, GLbitfield, uint64_t))jackpotlte_gl_proc("glClientWaitSync");
+      real_delete_sync = (void (*)(void *))jackpotlte_gl_proc("glDeleteSync");
+      fences_on = c == '1' && real_fence_sync != NULL && real_client_wait != NULL && real_delete_sync != NULL;
+      say("glca26: APPLE fences %s (a8gl-fences \"1\" makes them GL sync objects)",
+          fences_on ? "are GL sync objects" : "answered with glFinish");
+   }
+   return fences_on;
+}
+
+/* the fence's slot when it is this context's, else NULL */
+static void **
+fence_slot(void *context, GLuint fence, bool make)
+{
+   unsigned i = fence & (FENCES_MAX - 1);
+
+   if (fence == 0)
+      return NULL;
+   if (fences_tab[i].name != fence || fences_tab[i].context != context) {
+      if (!make)
+         return NULL;
+      if (fences_tab[i].sync != NULL && fences_tab[i].context == context)
+         real_delete_sync(fences_tab[i].sync);
+      fences_tab[i].name = fence;
+      fences_tab[i].context = context;
+      fences_tab[i].sync = NULL;
+   }
+   return &fences_tab[i].sync;
+}
+
+static void
+fence_report(void)
+{
+   if (((fence_sets + fence_tests + fence_waits) & 4095) == 1)
+      say("glca26: fences set %lu, tested %lu (%lu busy), waited %lu (%lu us, %lu as glFinish)",
+          fence_sets, fence_tests, fence_busy, fence_waits, fence_wait_us, fence_old);
+}
+
 static void
 my_glGenFencesAPPLE(void *context, GLsizei n, GLuint *fences)
 {
@@ -1150,23 +1222,45 @@ my_glGenFencesAPPLE(void *context, GLsizei n, GLuint *fences)
    GLsizei i;
 
    (void)context;
-   for (i = 0; fences != NULL && i < n; i++)
+   for (i = 0; fences != NULL && i < n; i++) {
       fences[i] = next++;
+      if (next == 0)
+         next = 1;
+   }
 }
 
 static void
 my_glDeleteFencesAPPLE(void *context, GLsizei n, const GLuint *fences)
 {
-   (void)context;
-   (void)n;
-   (void)fences;
+   GLsizei i;
+
+   if (fences_on <= 0 || fences == NULL)
+      return;
+   jackpotlte_gl_use(context);
+   for (i = 0; i < n; i++) {
+      void **slot = fence_slot(context, fences[i], false);
+
+      if (slot != NULL && *slot != NULL) {
+         real_delete_sync(*slot);
+         *slot = NULL;
+      }
+   }
 }
 
 static void
 my_glSetFenceAPPLE(void *context, GLuint fence)
 {
-   (void)fence;
+   void **slot;
+
    my_glFlush(context);
+   if (!fences_ready() || (slot = fence_slot(context, fence, true)) == NULL)
+      return;
+   jackpotlte_gl_use(context);
+   if (*slot != NULL)
+      real_delete_sync(*slot);
+   *slot = real_fence_sync(0x9117 /* SYNC_GPU_COMMANDS_COMPLETE */, 0);
+   fence_sets++;
+   fence_report();
 }
 
 static GLboolean
@@ -1179,16 +1273,50 @@ my_glIsFenceAPPLE(void *context, GLuint fence)
 static GLboolean
 my_glTestFenceAPPLE(void *context, GLuint fence)
 {
-   (void)fence;
-   my_glFinish(context);
-   return 1;
+   void **slot;
+   GLenum r;
+
+   if (!fences_ready() || (slot = fence_slot(context, fence, false)) == NULL || *slot == NULL) {
+      if (fences_on > 0 && fence_slot(context, fence, false) != NULL)
+         return 1;             /* set before glca26 knew it: nothing to wait for */
+      fence_old++;
+      my_glFinish(context);
+      return 1;
+   }
+   jackpotlte_gl_use(context);
+   fence_tests++;
+   r = real_client_wait(*slot, 0, 0);
+   if (r == 0x911B /* TIMEOUT_EXPIRED */) {
+      fence_busy++;
+      fence_report();
+      return 0;
+   }
+   fence_report();
+   return 1;                    /* signalled, or it failed: do not hold CoreAnimation */
 }
 
 static void
 my_glFinishFenceAPPLE(void *context, GLuint fence)
 {
-   (void)fence;
-   my_glFinish(context);
+   void **slot;
+   uint64_t t0;
+
+   if (!fences_ready() || (slot = fence_slot(context, fence, false)) == NULL || *slot == NULL) {
+      fence_old++;
+      my_glFinish(context);
+      return;
+   }
+   jackpotlte_gl_use(context);
+   t0 = mach_absolute_time();
+   if (real_client_wait(*slot, 0x1 /* SYNC_FLUSH_COMMANDS_BIT */, 2000000000ull) == 0x911D /* WAIT_FAILED */) {
+      fence_old++;
+      my_glFinish(context);
+      return;
+   }
+   fence_waits++;
+   fence_wait_us += (unsigned long)ticks_us(mach_absolute_time() - t0);
+   fence_report();
+   frame_end("glFinishFenceAPPLE", 1);   /* the GPU is done with that work: clean as after a finish */
 }
 
 static GLboolean
@@ -1200,13 +1328,40 @@ my_glTestObjectAPPLE(void *context, GLenum object, GLuint name)
    return 1;
 }
 
+/*
+ * glca26b: CoreAnimation calls glFinishObjectAPPLE(GL_TEXTURE, name) before
+ * it deletes a render target, and each one waited for all the GPU's work.
+ * Mesa already keeps a deleted texture's memory until the jobs that use it
+ * are done, and later GPU work on the same memory runs after them, so with
+ * a8gl-objflush "1" such a call only flushes (an experiment: a CPU reader
+ * of that surface right after would need the wait).  Counted either way.
+ */
+static unsigned long obj_finishes, obj_flushed;
+
 static void
 my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 {
    static unsigned shown;
+   static int flush_only = -1;
 
+   if (flush_only < 0) {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-objflush", "r");
+
+      flush_only = f != NULL && fgetc(f) == '1';
+      if (f != NULL)
+         fclose(f);
+      say("glca26b: glFinishObjectAPPLE %s (a8gl-objflush)", flush_only ? "only flushes" : "waits for the GPU");
+   }
    if (shown++ < 8)
-      say("glFinishObjectAPPLE(%#x, %d): the GPU is waited for", object, name);
+      say("glFinishObjectAPPLE(%#x, %d): %s", object, name, flush_only ? "flushed" : "the GPU is waited for");
+   obj_finishes++;
+   if ((obj_finishes & 1023) == 1)
+      say("glca26b: %lu glFinishObjectAPPLE calls, %lu glFinish waits in all", obj_finishes, finishes);
+   if (flush_only && object == 0x1702 /* GL_TEXTURE */) {
+      obj_flushed++;
+      my_glFlush(context);
+      return;
+   }
    my_glFinish(context);
 }
 
