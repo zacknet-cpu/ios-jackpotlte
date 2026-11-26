@@ -315,6 +315,15 @@ jt_submit2(struct jt_gpu *g, struct jt_submit_req pair[2])
 	return request(g, JT_SUBMIT2, pair, 2 * sizeof(pair[0]));
 }
 
+int
+jt_submitn(struct jt_gpu *g, struct jt_submit_req *reqs, unsigned n)
+{
+	if (g == NULL || reqs == NULL || n == 0 || n > JT_SUBMITN_MAX) {
+		return -EINVAL;
+	}
+	return request(g, JT_SUBMITN, reqs, (size_t) n * sizeof(reqs[0]));
+}
+
 /* Wait until the job that last used `handle` has finished. */
 int
 jt_wait_bo(struct jt_gpu *g, uint32_t handle, int64_t timeout_ns)

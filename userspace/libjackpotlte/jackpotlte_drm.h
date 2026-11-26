@@ -19,6 +19,7 @@
  *                                 display's own memory (0154's 0x7e)
  *   jackpotlte_drm_last_seq       the number of the last job submitted
  *   jackpotlte_drm_wait_seq       and waiting for one by its number (0x7d)
+ *   jackpotlte_drm_flush_end      panfrost_flush's end: held submits go (0230)
  *
  * The request numbers are Linux's, and our kernel's selectors are those
  * numbers' low bytes (0154:66-79), so a request is not renumbered.  Its
@@ -181,6 +182,10 @@ int jackpotlte_drm_surface(int fd, struct jackpotlte_drm_surface *surface);
  * `relative_ns` at most: 0 when it is done, -ETIMEDOUT when it is not. */
 uint64_t jackpotlte_drm_last_seq(void);
 int jackpotlte_drm_wait_seq(uint64_t seq, int64_t relative_ns);
+/* 0230: called by panfrost_flush (tools/mesa-jackpotlte/0007) once every batch
+ * is submitted: whatever is held is sent.  Until it is first called nothing is
+ * held beyond one pass, exactly as 0218. */
+void jackpotlte_drm_flush_end(void);
 
 /*
  * One DRM request, as drmIoctl() would carry it, without the errno dance: 0 or
