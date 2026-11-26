@@ -703,14 +703,36 @@ bind_big_once(void)
       say("glca14: no kern.a8_bind_big (kernel before 0204): render thread not bound");
 }
 
-/* glca13: before a frame goes to the GPU, the panel's last update taken */
+/* glca13: before a frame goes to the GPU, the panel's last update taken.
+ * glca27b: since kernel 0215 the GPU worker itself holds every job that
+ * draws into the buffer on the panel until the panel took the last flip,
+ * so this wait on the render thread (0.4 ms a frame in pages, 1.25 ms in
+ * Control Center, up to 7 ms) only keeps it from building the next pass.
+ * /private/var/mobile/Library/a8gl-settle "0": no wait here. */
+static int
+settle_on(void)
+{
+   static int on = -1;
+
+   if (on < 0) {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-settle", "r");
+
+      on = !(f != NULL && fgetc(f) == '0');
+      if (f != NULL)
+         fclose(f);
+      say("glca27b: the render thread %s for the panel before a batch goes (a8gl-settle)",
+          on ? "waits" : "does not wait");
+   }
+   return on;
+}
+
 static void
 flip_settle(void)
 {
    uint32_t us = 0;
    size_t size = sizeof(us);
 
-   if (flip_async_on() <= 0)
+   if (flip_async_on() <= 0 || !settle_on())
       return;
    if (sysctlbyname("kern.a8_flip_wait", &us, &size, NULL, 0) == 0) {
       perf.latch += us;
