@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Thu, 26 Nov 2026 01:33:06 -0500
+Subject: [PATCH] 0224-a8-gpu-queue-256.patch
+
+---
+ bsd/dev/jackpotlte_mali.c | 27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index 64d90b3..19bc235 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -1331,14 +1331,19 @@ jackpotlte_mali_submit(uint64_t chain, bool fragment)
+ 
+ /* The job queue, run by a thread of its own (redwood_mali.c:957-1080): a
+  * submission returns at once with the job's number, and whoever needs a job
+- * done waits for that number. */
+-#define JT_MALI_QUEUE	64
++ * done waits for that number.  0224: 256 places (was 64): a Control Center
++ * frame is ~80 jobs, and while the first one that draws to the panel waits
++ * for the flip, the rest filled the queue and the render thread slept in
++ * the submit until the panel took the flip. */
++#define JT_MALI_QUEUE	256
+ static struct {
+ 	uint64_t chain, seq, queued;
+ 	bool fragment;
+ 	bool gate;              /* 0215: waits for the panel in the worker */
+ } jt_queue[JT_MALI_QUEUE];
+ static unsigned jt_queue_head, jt_queue_count;
++static unsigned jt_queue_deepest;               /* 0224 */
++static uint64_t jt_full_waits, jt_full_ns;      /* 0224: submits that found the queue full */
+ static uint64_t jt_queued_seq, jt_done_seq;
+ static bool jt_worker_started;
+ static LCK_MTX_DECLARE(jt_queue_lock, &jt_mali_lock_group);
+@@ -1488,9 +1493,16 @@ jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate)
+ 		lck_mtx_unlock(&jt_queue_lock);
+ 		return 0;
+ 	}
+-	while (jt_queue_count == JT_MALI_QUEUE) {
+-		lck_mtx_sleep(&jt_queue_lock, LCK_SLEEP_DEFAULT,
+-		    (event_t)&jt_queue_head, THREAD_UNINT);
++	if (jt_queue_count == JT_MALI_QUEUE) {
++		uint64_t w0 = mach_absolute_time(), wns;
++
++		while (jt_queue_count == JT_MALI_QUEUE) {
++			lck_mtx_sleep(&jt_queue_lock, LCK_SLEEP_DEFAULT,
++			    (event_t)&jt_queue_head, THREAD_UNINT);
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - w0, &wns);
++		jt_full_waits++;
++		jt_full_ns += wns;
+ 	}
+ 	seq = ++jt_queued_seq;
+ 	at = (jt_queue_head + jt_queue_count) % JT_MALI_QUEUE;
+@@ -1500,6 +1512,9 @@ jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate)
+ 	jt_queue[at].gate = in_worker;
+ 	jt_queue[at].queued = mach_absolute_time();
+ 	jt_queue_count++;
++	if (jt_queue_count > jt_queue_deepest) {
++		jt_queue_deepest = jt_queue_count;
++	}
+ 	lck_mtx_unlock(&jt_queue_lock);
+ 	wakeup((caddr_t)&jt_queue_count);
+ 	return seq;
+@@ -1547,6 +1562,8 @@ jackpotlte_mali_report(void)
+ 	    jt_started ? jt_start_ns / jt_started / 1000 : 0, jt_started, jt_idle_caught, jt_idle_slept,
+ 	    jt_spin_us, submits, submits ? submit_ns / submits / 1000 : 0,
+ 	    submits ? enqueue_ns / submits / 1000 : 0, jackpotlte_mali_uc_pairs());
++	printf("A8 GPU: queue of %u: deepest %u; full %llu times, %llu us asleep in all (0224)\n",
++	    (unsigned)JT_MALI_QUEUE, jt_queue_deepest, jt_full_waits, jt_full_ns / 1000);
+ 
+ 	jt_tune();
+ 	printf("A8 GPU: jobs fragment %llu (avg %llu us, max %llu us), other %llu (avg %llu us, "
+-- 
+2.53.0
+
