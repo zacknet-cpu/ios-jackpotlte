@@ -203,6 +203,8 @@ int jackpotlte_drm_ioctl(struct jt_gpu *gpu, unsigned long request, void *arg, s
  */
 struct jt_gpu *jackpotlte_drm_gpu(void);
 void jackpotlte_drm_attach(struct jt_gpu *gpu);
+/* 11-26: waits until every buffer close queued for the closer thread is done */
+void jackpotlte_drm_close_drain(void);
 
 /*
  * A DRM_IOCTL_* code from its two parts, as drmIoctl() reads them: the number

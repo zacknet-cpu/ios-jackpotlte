@@ -574,6 +574,7 @@ test_drm_ioctl(void)
 		jackpotlte_drm_unmap(-1, 5, memory);
 		CHECK(f->unmaps == 0, "unmap did not keep the mapping");
 		CHECK(drmCloseBufferHandle(-1, 5) == 0, "close failed");
+		jackpotlte_drm_close_drain();   /* 11-26: closes run on a thread of their own */
 		CHECK(f->unmaps == 1 && f->unmap_handle == 5, "the mapping was not unmapped");
 		CHECK(f->selector == JT_DRM_GEM_CLOSE, "selector %#x", f->selector);
 	}

@@ -14,6 +14,8 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -142,6 +144,7 @@ jackpotlte_drm_attach(struct jt_gpu *g)
 {
 	struct jt_gpu *old;
 
+	jackpotlte_drm_close_drain();   /* the queued closes belong to the old one */
 	pthread_mutex_lock(&gpu_lock);
 	old = gpu;
 	gpu = g;
@@ -245,6 +248,118 @@ jackpotlte_drm_unmap(int fd, uint32_t handle, void *address)
 	}
 }
 
+/*
+ * 11-26 (P3c): buffers given back on a thread of their own.  The kernel's
+ * GEM_CLOSE (0154 freeBuffer) first waits until the buffer's last job is
+ * done, then takes its GPU mapping out and frees its memory, and the CPU
+ * unmap before it is another kernel call.  Mesa gives buffers back in
+ * panfrost_batch_cleanup, right after their batch is submitted, so the
+ * render thread waited for the GPU there: 15% of backboardd's render thread
+ * while opening and closing an app (11-26 profile, jt_bo_release).  Here the
+ * bookkeeping stays on the caller's thread and the two kernel calls go to a
+ * queue served in order by one thread, which first waits for the buffer
+ * with WAIT_BO (no lock held in the kernel) so that GEM_CLOSE does not wait
+ * under the user client's lock.  The kernel keeps the handle taken until the
+ * close really happens, so nothing can be given the same handle before.  /private/var/mobile/Library/a8gl-closer "0": closes as before.
+ */
+#define JT_CLOSE_QUEUE          2048
+static struct {
+	struct jt_gpu *g;
+	uint32_t handle;
+	void *address;
+	uint64_t size;
+} close_q[JT_CLOSE_QUEUE];
+static unsigned close_head, close_count, close_busy;
+static pthread_mutex_t close_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t close_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t close_done = PTHREAD_COND_INITIALIZER;
+static int closer_state;                /* 0 unknown, 1 running, -1 off */
+
+static void *
+closer_main(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		struct jt_gpu *g;
+		uint32_t handle;
+		void *address;
+		uint64_t size;
+
+		pthread_mutex_lock(&close_lock);
+		while (close_count == 0) {
+			pthread_cond_wait(&close_cond, &close_lock);
+		}
+		g = close_q[close_head].g;
+		handle = close_q[close_head].handle;
+		address = close_q[close_head].address;
+		size = close_q[close_head].size;
+		close_head = (close_head + 1) % JT_CLOSE_QUEUE;
+		close_count--;
+		close_busy = 1;
+		pthread_mutex_unlock(&close_lock);
+		/* The kernel's GEM_CLOSE waits for the buffer's last job with the
+		 * user client's lock held (0154 freeBuffer), which would hold the
+		 * render thread's next submit too; WAIT_BO waits without it. */
+		(void)jt_wait_bo(g, handle, 2000000000ll);
+		if (address != NULL) {
+			(void)jt_bo_unmap(g, handle, address, size);
+		}
+		(void)jt_bo_release(g, handle);
+		pthread_mutex_lock(&close_lock);
+		close_busy = 0;
+		pthread_cond_broadcast(&close_done);
+		pthread_mutex_unlock(&close_lock);
+	}
+	return NULL;
+}
+
+/* Every queued close done (a new connection, and the host test). */
+void
+jackpotlte_drm_close_drain(void)
+{
+	pthread_mutex_lock(&close_lock);
+	while (close_count != 0 || close_busy) {
+		pthread_cond_wait(&close_done, &close_lock);
+	}
+	pthread_mutex_unlock(&close_lock);
+}
+
+/* true when the close was queued (the caller is done) */
+static bool
+close_later(struct jt_gpu *g, uint32_t handle, void *address, uint64_t size)
+{
+	bool queued = false;
+
+	pthread_mutex_lock(&close_lock);
+	if (closer_state == 0) {
+		FILE *f = fopen("/private/var/mobile/Library/a8gl-closer", "r");
+		int c = f != NULL ? fgetc(f) : EOF;
+		pthread_t thread;
+
+		if (f != NULL) {
+			fclose(f);
+		}
+		closer_state = -1;
+		if (c != '0' && pthread_create(&thread, NULL, closer_main, NULL) == 0) {
+			pthread_detach(thread);
+			closer_state = 1;
+		}
+	}
+	if (closer_state == 1 && close_count < JT_CLOSE_QUEUE) {
+		unsigned at = (close_head + close_count) % JT_CLOSE_QUEUE;
+
+		close_q[at].g = g;
+		close_q[at].handle = handle;
+		close_q[at].address = address;
+		close_q[at].size = size;
+		close_count++;
+		queued = true;
+		pthread_cond_signal(&close_cond);
+	}
+	pthread_mutex_unlock(&close_lock);
+	return queued;
+}
+
 /* Give a buffer back: its mapping first, then the buffer and its address. */
 static int
 buffer_close(struct jt_gpu *g, uint32_t handle)
@@ -256,10 +371,13 @@ buffer_close(struct jt_gpu *g, uint32_t handle)
 		return -EINVAL;
 	}
 	maps_forget(handle, &address, &size);
+	bo_seq_set(handle, 0);          /* a new buffer under this handle: no job yet */
+	if (close_later(g, handle, address, size)) {
+		return 0;
+	}
 	if (address != NULL) {
 		(void)jt_bo_unmap(g, handle, address, size);
 	}
-	bo_seq_set(handle, 0);          /* a new buffer under this handle: no job yet */
 	return jt_bo_release(g, handle);
 }
 
