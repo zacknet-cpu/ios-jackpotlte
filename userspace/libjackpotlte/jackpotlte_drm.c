@@ -80,6 +80,11 @@ static uint32_t next_syncobj = 1;
 #define BO_SEQ_BUSY             UINT64_MAX
 static uint64_t bo_seq[JT_MAPS];
 static uint64_t done_seq;
+/* 11-26: handles that came from a surface import (JT_SURFACE).  The kernel
+ * gives a surface that is imported again the handle it already has (0154
+ * surfaceBuffer), so such a buffer is closed at once, never queued: a
+ * queued close would take the buffer away from the second import. */
+static uint8_t bo_surface[JT_MAPS];
 
 static void
 note_done(uint64_t seq)
@@ -169,6 +174,7 @@ jackpotlte_drm_attach(struct jt_gpu *g)
 	/* A new connection numbers its jobs from 1 again. */
 	for (uint32_t i = 0; i < JT_MAPS; i++) {
 		bo_seq[i] = 0;
+		bo_surface[i] = 0;
 	}
 	__atomic_store_n(&done_seq, 0, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&sync_lock);
@@ -260,7 +266,9 @@ jackpotlte_drm_unmap(int fd, uint32_t handle, void *address)
  * queue served in order by one thread, which first waits for the buffer
  * with WAIT_BO (no lock held in the kernel) so that GEM_CLOSE does not wait
  * under the user client's lock.  The kernel keeps the handle taken until the
- * close really happens, so nothing can be given the same handle before.  /private/var/mobile/Library/a8gl-closer "0": closes as before.
+ * close really happens, so nothing can be given the same handle before,
+ * except a surface imported again: those close at once (bo_surface).
+ * /private/var/mobile/Library/a8gl-closer "0": closes as before.
  */
 #define JT_CLOSE_QUEUE          2048
 static struct {
@@ -372,7 +380,8 @@ buffer_close(struct jt_gpu *g, uint32_t handle)
 	}
 	maps_forget(handle, &address, &size);
 	bo_seq_set(handle, 0);          /* a new buffer under this handle: no job yet */
-	if (close_later(g, handle, address, size)) {
+	if (!(handle < JT_MAPS && __atomic_exchange_n(&bo_surface[handle], 0, __ATOMIC_ACQ_REL)) &&
+	    close_later(g, handle, address, size)) {
 		return 0;
 	}
 	if (address != NULL) {
@@ -712,6 +721,9 @@ surface(struct jt_gpu *g, void *arg, size_t size)
 		return ret;
 	}
 	request->handle = info.handle;
+	if (info.handle != 0 && info.handle < JT_MAPS) {
+		__atomic_store_n(&bo_surface[info.handle], 1, __ATOMIC_RELEASE);
+	}
 	request->size = info.size;
 	request->offset = info.offset;
 	request->row_bytes = info.rowBytes;
