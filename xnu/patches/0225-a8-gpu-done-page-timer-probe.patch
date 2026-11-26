@@ -1,0 +1,192 @@
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index 19bc235..d205465 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -26,6 +26,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/cpu_number.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
+@@ -58,6 +59,7 @@ void jackpotlte_mali_mapped_range(uint64_t gpu, uint64_t size);
+ void jackpotlte_mali_report(void);
+ bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
+ void jackpotlte_mali_start(volatile uint32_t *mali);
++void jackpotlte_mali_done_page(volatile uint64_t *page);       /* 0225 */
+ 
+ /* ---- windows ---- */
+ #define JT_MALI_PA		0x11500000u
+@@ -1348,10 +1350,73 @@ static uint64_t jt_queued_seq, jt_done_seq;
+ static bool jt_worker_started;
+ static LCK_MTX_DECLARE(jt_queue_lock, &jt_mali_lock_group);
+ 
++/*
++ * 0225: the last finished job's number in a page that programs map
++ * read-only (JackpotlteMali.cpp, client memory type kJackpotlteDonePage).
++ * Jobs finish in order, so libjackpotlte answers a buffer's WAIT_BO from it
++ * and its own record of each buffer's last job, with no call: "idle" and,
++ * for a look with timeout 0, "busy" too (each such call cost ~35 us, 4.6%
++ * of Control Center's render thread on 11-26).  [0] the last finished job,
++ * [1] JT_DONE_PAGE_MAGIC, [2] the last queued job (for a look only).
++ */
++extern kern_return_t sysctl_thread_bind_cpuid(int32_t cpuid);  /* sched_prim.c */
++
++#define JT_DONE_PAGE_MAGIC      0x31454e4f44384141ull   /* "AA8DONE1" */
++static volatile uint64_t *jt_done_page;
++
++void
++jackpotlte_mali_done_page(volatile uint64_t *page)
++{
++	lck_mtx_lock(&jt_queue_lock);
++	page[2] = jt_queued_seq;
++	__atomic_store_n(&page[0], jt_done_seq, __ATOMIC_RELEASE);
++	__atomic_store_n(&page[1], JT_DONE_PAGE_MAGIC, __ATOMIC_RELEASE);
++	jt_done_page = page;
++	lck_mtx_unlock(&jt_queue_lock);
++	printf("JACKPOTLTE MALI: done page (0225): job %llu finished, %llu queued\n",
++	    jt_done_seq, jt_queued_seq);
++}
++
++/*
++ * 0225 (P3j step 1): what the user-mode timebase would need.  0112 made
++ * user_timebase_type() USER_TIMEBASE_NONE, so every mach_absolute_time in
++ * every program is a trap (~2 us).  User-mode reads use CNTVCT_EL0, which
++ * agrees with the kernel's CNTPCT_EL0 only when CNTVOFF is the same on all
++ * eight cpus, and EL0 may read it only with CNTKCTL_EL1.EL0VCTEN (bit 1).
++ * Read-only: each cpu's CNTPCT - CNTVCT (= its CNTVOFF), CNTKCTL_EL1 and
++ * CNTFRQ_EL0, once, from the GPU worker before it settles on its own cpu.
++ */
++static void
++jt_timer_probe(void)
++{
++	for (int cpu = 0; cpu < 8; cpu++) {
++		uint64_t p0, v, p1, kctl, frq;
++		int on;
++
++		if (sysctl_thread_bind_cpuid(cpu) != KERN_SUCCESS) {
++			printf("A8 TIMER: cpu %d: cannot bind\n", cpu);
++			continue;
++		}
++		on = cpu_number();
++		__builtin_arm_isb(0xf);
++		p0 = __builtin_arm_rsr64("CNTPCT_EL0");
++		__builtin_arm_isb(0xf);
++		v = __builtin_arm_rsr64("CNTVCT_EL0");
++		__builtin_arm_isb(0xf);
++		p1 = __builtin_arm_rsr64("CNTPCT_EL0");
++		kctl = __builtin_arm_rsr64("CNTKCTL_EL1");
++		frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++		printf("A8 TIMER: cpu %d (on %d): CNTPCT-CNTVCT %lld (read window %llu ticks), "
++		    "CNTVCT %llu, CNTKCTL_EL1 %#llx (EL0VCTEN %llu, EL0PCTEN %llu), CNTFRQ %llu\n",
++		    cpu, on, (long long)((p0 + p1) / 2 - v), p1 - p0, v, kctl,
++		    (kctl >> 1) & 1, kctl & 1, frq);
++	}
++	(void)sysctl_thread_bind_cpuid(-1);
++}
++
+ extern void sweet_fb_gpu_done(uint64_t seq);   /* SweetFramebuffer.cpp, 0209 */
+ extern bool sweet_fb_gate_in_worker(void);     /* SweetFramebuffer.cpp, 0215 */
+ extern void sweet_fb_gpu_gate_worker(uint64_t seq, uint64_t done);
+-extern kern_return_t sysctl_thread_bind_cpuid(int32_t cpuid);  /* sched_prim.c */
+ 
+ /*
+  * 0212: the worker on a core of its own.  It is a kernel thread, above every
+@@ -1371,6 +1436,7 @@ jt_mali_worker(void *parameter, wait_result_t result)
+ 
+ 	(void)parameter;
+ 	(void)result;
++	jt_timer_probe();               /* 0225: read-only, once */
+ 	{
+ 		int cpu = 5;
+ 
+@@ -1429,6 +1495,9 @@ jt_mali_worker(void *parameter, wait_result_t result)
+ 		jt_queue_head = (jt_queue_head + 1) % JT_MALI_QUEUE;
+ 		jt_queue_count--;
+ 		jt_done_seq = seq;
++		if (jt_done_page != NULL) {
++			__atomic_store_n(&jt_done_page[0], seq, __ATOMIC_RELEASE);     /* 0225 */
++		}
+ 		lck_mtx_unlock(&jt_queue_lock);
+ 		wakeup((caddr_t)&jt_done_seq);
+ 		wakeup((caddr_t)&jt_queue_head);
+@@ -1505,6 +1574,9 @@ jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate)
+ 		jt_full_ns += wns;
+ 	}
+ 	seq = ++jt_queued_seq;
++	if (jt_done_page != NULL) {
++		jt_done_page[2] = seq;          /* 0225: a look only */
++	}
+ 	at = (jt_queue_head + jt_queue_count) % JT_MALI_QUEUE;
+ 	jt_queue[at].chain = chain;
+ 	jt_queue[at].seq = seq;
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+index c0cd027..3fdba09 100644
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -62,6 +62,7 @@ uint32_t jackpotlte_mali_submit(uint64_t chain, bool fragment);
+ uint64_t jackpotlte_mali_enqueue(uint64_t chain, bool fragment);
+ uint64_t jackpotlte_mali_enqueue_gated(uint64_t chain, bool fragment, bool gate);
+ bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
++void jackpotlte_mali_done_page(volatile uint64_t * page);      /* 0225 */
+ /* iokit/Kernel/arm/SweetFramebuffer.cpp, 0211 */
+ bool sweet_fb_is_scanout(uint64_t pa);
+ bool sweet_fb_gate_scanout_only(void);
+@@ -112,6 +113,11 @@ enum {
+ 	kJackpotlteSubmit2      = 0x7f,         /* ours (0218): two submits in one call */
+ };
+ 
++/* 0225: client memory type of the page holding the last finished job's
++ * number (jackpotlte_mali.c, jt_done_page), mapped read-only; buffer handles
++ * (the other types) stay below MALI_BUFFERS. */
++#define kJackpotlteDonePage     0x7fff0000u
++
+ struct jackpotlte_surface {
+ 	uint32_t surface;                       /* the SweetSurface's ID */
+ 	uint32_t handle;                        /* kSurfaceDescribe: no buffer is wanted; else, back: the buffer */
+@@ -188,6 +194,8 @@ static IOLock * gMaliLock;
+ static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed;
+ static uint64_t gMaliSubmitNs, gMaliEnqueueNs, gMaliTimedSubmits;     /* 0213 */
+ static uint64_t gMaliPairs;                                    /* 0218: kJackpotlteSubmit2 calls */
++static IOBufferMemoryDescriptor * gMaliDonePage;                /* 0225 */
++static uint32_t gMaliDoneMaps;                                  /* 0225 */
+ 
+ extern "C" void jackpotlte_mali_uc_stats(uint64_t * submits, uint64_t * ns, uint64_t * enqueue_ns);
+ extern "C" uint64_t jackpotlte_mali_uc_pairs(void);          /* 0218 */
+@@ -507,6 +515,18 @@ JackpotlteMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * option
+ 	struct mali_buffer * b;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
++	if (type == kJackpotlteDonePage) {      /* 0225: one page for every client, read-only */
++		if (gMaliDonePage == NULL) {
++			return kIOReturnNoMemory;
++		}
++		gMaliDonePage->retain();
++		*memory = gMaliDonePage;
++		*options = kIOMapReadOnly;
++		if (gMaliDoneMaps++ < 8) {
++			IOLog("JackpotlteMali: done page mapped (0225)\n");
++		}
++		return kIOReturnSuccess;
++	}
+ 	IOLockLock(gMaliLock);
+ 	b = buffer(type);
+ 	if (b != NULL) {
+@@ -772,6 +792,16 @@ jackpotlte_mali_service_thread(void * parameter, wait_result_t result)
+ 		return;
+ 	}
+ 	gMaliLock = IOLockAlloc();
++	/* 0225: the done page, before any program can open the service */
++	gMaliDonePage = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, PAGE_SIZE, PAGE_SIZE);
++	if (gMaliDonePage != NULL && gMaliDonePage->getBytesNoCopy() != NULL) {
++		bzero(gMaliDonePage->getBytesNoCopy(), PAGE_SIZE);
++		jackpotlte_mali_done_page((volatile uint64_t *) gMaliDonePage->getBytesNoCopy());
++	} else {
++		OSSafeReleaseNULL(gMaliDonePage);
++		IOLog("JackpotlteMali: no done page (0225); waits go through calls\n");
++	}
+ 	provider = IOService::getPlatform();
+ 	gpu = OSTypeAlloc(JackpotlteMali);
+ 	if (gMaliLock == NULL || gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
