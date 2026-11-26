@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
+index 3b6b70e..eb63085 100644
+--- a/bsd/dev/jackpotlte_pmic.c
++++ b/bsd/dev/jackpotlte_pmic.c
+@@ -496,10 +496,13 @@ jp_charger(vm_offset_t chg)
+ 		printf("JACKPOTLTE PMIC: charger ctrl0[0x10]=%#04x en_chg=%u\n",
+ 		    c0, (c0 >> 7) & 1u);
+ 	}
+-	/* CTRL6 = (V-3900)/10 mV, i.e. V = reg*10 + 3900 (charger.c:399-403). */
++	/* CTRL6 SET_VF_VBAT[5:0] = (V-3900)/10 mV, i.e. V = field*10 + 3900
++	 * (charger.h:189-192, charger.c s2mu004_get_regulation_voltage masks
++	 * 0x3f).  0229 (P11b): the top two bits are not part of it; the whole
++	 * byte 0x6d read as "4990 mV", the field 0x2d is 4350 mV. */
+ 	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_CTRL6, &c6, 1)) {
+ 		printf("JACKPOTLTE PMIC: charger ctrl6[0x16]=%#04x "
+-		    "cv=%umV\n", c6, (unsigned)c6 * 10u + 3900u);
++		    "cv=%umV (0229)\n", c6, (unsigned)(c6 & 0x3fu) * 10u + 3900u);
+ 	}
+ }
+ 
