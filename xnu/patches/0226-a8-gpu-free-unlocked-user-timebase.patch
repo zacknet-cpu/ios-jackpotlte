@@ -1,0 +1,241 @@
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index d205465..6625ee9 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -1619,6 +1619,8 @@ jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns)
+ /* 0211: the console "flip" report's GPU line. */
+ extern void jackpotlte_mali_uc_stats(uint64_t *submits, uint64_t *ns, uint64_t *enqueue_ns);  /* JackpotlteMali.cpp, 0213 */
+ extern uint64_t jackpotlte_mali_uc_pairs(void);    /* JackpotlteMali.cpp, 0218 */
++extern void jackpotlte_mali_uc_frees(uint64_t *frees, uint64_t *ns, uint64_t *takes,
++    uint64_t *wait_ns, uint64_t *wait_max_ns);    /* JackpotlteMali.cpp, 0226 */
+ 
+ void
+ jackpotlte_mali_report(void)
+@@ -1636,6 +1638,15 @@ jackpotlte_mali_report(void)
+ 	    submits ? enqueue_ns / submits / 1000 : 0, jackpotlte_mali_uc_pairs());
+ 	printf("A8 GPU: queue of %u: deepest %u; full %llu times, %llu us asleep in all (0224)\n",
+ 	    (unsigned)JT_MALI_QUEUE, jt_queue_deepest, jt_full_waits, jt_full_ns / 1000);
++	{
++		uint64_t frees = 0, free_ns = 0, takes = 0, wait_ns = 0, wait_max = 0;
++
++		jackpotlte_mali_uc_frees(&frees, &free_ns, &takes, &wait_ns, &wait_max);
++		printf("A8 GPU: buffers freed outside the lock %llu (avg %llu us); requests waited for "
++		    "the lock avg %llu us over %llu, max %llu us (0226)\n",
++		    frees, frees ? free_ns / frees / 1000 : 0, takes ? wait_ns / takes / 1000 : 0, takes,
++		    wait_max / 1000);
++	}
+ 
+ 	jt_tune();
+ 	printf("A8 GPU: jobs fragment %llu (avg %llu us, max %llu us), other %llu (avg %llu us, "
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+index 3fdba09..adf6c7b 100644
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -186,8 +186,38 @@ struct mali_buffer {
+ 	uint64_t             address, size;
+ 	uint64_t             last_seq;          /* the last job given it */
+ 	bool                 scanout;           /* 0211: pixels in the panel's reserved memory */
++	bool                 closing;           /* 0226: being freed outside gMaliLock; the handle stays taken */
+ };
+ 
++/*
++ * 0226: GEM_CLOSE frees a buffer outside gMaliLock.  freeBuffer() waits for
++ * the buffer's last job, takes its pages out of the GPU's tables (and the
++ * TLB), gives its addresses back and releases its memory; all of that under
++ * gMaliLock held every other request of every client, so libjackpotlte's
++ * closer thread held up the render thread's submits (11-26 CC profile:
++ * submit calls ~50 us each against 3 us of work in submitOne).  Now the slot
++ * is marked closing (buffer() and the surface lookup skip it, newBuffer()
++ * does not reuse it: its memory pointer stays), the lock is dropped for the
++ * slow part (jackpotlte_mali_unmap/_release take jt_mali_lock themselves)
++ * and the slot is cleared under the lock again.  clientClose() waits for
++ * closes in flight.  Boot-arg a8gpufree=0: freed under the lock, as before.
++ */
++static int gMaliFreeUnlocked = -1;
++static uint64_t gMaliFreesUnlocked, gMaliFreeNs;
++static uint64_t gMaliLockTakes, gMaliLockWaitNs, gMaliLockWaitMaxNs;   /* 0226: requests' wait for gMaliLock */
++
++static bool
++mali_free_unlocked(void)
++{
++	if (gMaliFreeUnlocked < 0) {
++		int on = 1;
++
++		PE_parse_boot_argn("a8gpufree", &on, sizeof(on));
++		gMaliFreeUnlocked = on != 0;
++	}
++	return gMaliFreeUnlocked > 0;
++}
++
+ static IOLock * gMaliLock;
+ 
+ /* Activity counters, for a fault report to show; nothing reads them yet. */
+@@ -206,6 +236,22 @@ jackpotlte_mali_uc_pairs(void)
+ 	return gMaliPairs;
+ }
+ 
++/* 0226: frees done outside gMaliLock and their time, and how long requests
++ * waited for gMaliLock, for the flip report */
++extern "C" void jackpotlte_mali_uc_frees(uint64_t * frees, uint64_t * ns, uint64_t * takes,
++    uint64_t * wait_ns, uint64_t * wait_max_ns);
++
++void
++jackpotlte_mali_uc_frees(uint64_t * frees, uint64_t * ns, uint64_t * takes, uint64_t * wait_ns,
++    uint64_t * wait_max_ns)
++{
++	*frees = gMaliFreesUnlocked;
++	*ns = gMaliFreeNs;
++	*takes = gMaliLockTakes;
++	*wait_ns = gMaliLockWaitNs;
++	*wait_max_ns = gMaliLockWaitMaxNs;
++}
++
+ /* 0213: kernel time of a submit (the "flip" report's second A8 GPU line) */
+ extern "C" void
+ jackpotlte_mali_uc_stats(uint64_t * submits, uint64_t * ns, uint64_t * enqueue_ns)
+@@ -248,8 +294,10 @@ class JackpotlteMaliUserClient : public IOUserClient
+ 	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
+ 	uint32_t                fNextBuffer;
+ 	uint32_t                fSubmits, fFailed, fRequests, fParams;
++	uint32_t                fClosing;               /* 0226: closes outside gMaliLock in flight */
+ 
+ 	struct mali_buffer * buffer(uint32_t handle);
++	void releaseBuffer(struct mali_buffer * b);     /* 0226: freeBuffer without the bzero */
+ 	void freeBuffer(struct mali_buffer * b);
+ 	IOReturn createBO(struct drm_panfrost_create_bo * request);
+ 	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle);
+@@ -283,15 +331,16 @@ JackpotlteMaliUserClient::start(IOService * provider)
+ struct mali_buffer *
+ JackpotlteMaliUserClient::buffer(uint32_t handle)
+ {
+-	if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++	if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL ||
++	    fBuffers[handle - 1].closing) {
+ 		return NULL;
+ 	}
+ 	return &fBuffers[handle - 1];
+ }
+ 
+-/* With the lock held. */
++/* With the lock held, or (0226) on a copy of the slot without it. */
+ void
+-JackpotlteMaliUserClient::freeBuffer(struct mali_buffer * b)
++JackpotlteMaliUserClient::releaseBuffer(struct mali_buffer * b)
+ {
+ 	bool idle = true;
+ 
+@@ -304,6 +353,13 @@ JackpotlteMaliUserClient::freeBuffer(struct mali_buffer * b)
+ 	if (b->surface != NULL) {
+ 		b->surface->release();
+ 	}
++}
++
++/* With the lock held. */
++void
++JackpotlteMaliUserClient::freeBuffer(struct mali_buffer * b)
++{
++	releaseBuffer(b);
+ 	bzero(b, sizeof(*b));
+ }
+ 
+@@ -454,7 +510,7 @@ JackpotlteMaliUserClient::surfaceBuffer(struct jackpotlte_surface * request)
+ 		return kIOReturnSuccess;
+ 	}
+ 	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
+-		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s && !fBuffers[i].closing) {
+ 			b = &fBuffers[i];
+ 			request->handle = i + 1;
+ 			break;
+@@ -486,6 +542,9 @@ IOReturn
+ JackpotlteMaliUserClient::clientClose(void)
+ {
+ 	IOLockLock(gMaliLock);
++	while (fClosing != 0) {                 /* 0226: closes outside the lock finish first */
++		IOLockSleep(gMaliLock, &fClosing, THREAD_UNINT);
++	}
+ 	for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
+ 		if (fBuffers[i].memory != NULL) {
+ 			freeBuffer(&fBuffers[i]);
+@@ -685,7 +744,17 @@ JackpotlteMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
+ 		}
+ 		return ret;
+ 	}
+-	IOLockLock(gMaliLock);
++	{
++		uint64_t w0 = mach_absolute_time(), wns;
++
++		IOLockLock(gMaliLock);
++		absolutetime_to_nanoseconds(mach_absolute_time() - w0, &wns);
++		gMaliLockTakes++;               /* 0226 */
++		gMaliLockWaitNs += wns;
++		if (wns > gMaliLockWaitMaxNs) {
++			gMaliLockWaitMaxNs = wns;
++		}
++	}
+ 	/* Bring-up aid: this log stopped after 32 requests, and one frame's
+ 	 * setup is longer than that, so what the client asked for just before
+ 	 * it died was never printed.  256 covers a whole frame's setup and
+@@ -750,10 +819,27 @@ JackpotlteMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
+ 		break;
+ 	case kDrmGemClose:
+ 		b = buffer(r.close.handle);
+-		if (b != NULL) {
+-			freeBuffer(b);
+-		} else {
++		if (b == NULL) {
+ 			ret = kIOReturnNotFound;
++		} else if (mali_free_unlocked()) {
++			/* 0226: the slow part without gMaliLock, on a copy of the slot */
++			struct mali_buffer gone = *b;
++			uint64_t t0 = mach_absolute_time(), ns;
++
++			b->closing = true;
++			fClosing++;
++			IOLockUnlock(gMaliLock);
++			releaseBuffer(&gone);
++			IOLockLock(gMaliLock);
++			bzero(b, sizeof(*b));
++			if (--fClosing == 0) {
++				IOLockWakeup(gMaliLock, &fClosing, false);
++			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			gMaliFreesUnlocked++;
++			gMaliFreeNs += ns;
++		} else {
++			freeBuffer(b);
+ 		}
+ 		break;
+ 	default:
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 3fd9809..f177aa8 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -464,7 +464,26 @@ user_cont_hwclock_allowed(void)
+ uint8_t
+ user_timebase_type(void)
+ {
+-#if defined(A5XELTE)
++#if defined(A5XELTE) && defined(JACKPOTLTE)
++	/*
++	 * 0226 (P3j): the A8 (Exynos 7885).  0225 read CNTPCT - CNTVCT = 0 on
++	 * all eight cpus (the secondary entry zeroes CNTVOFF_EL2, start.s), so
++	 * CNTVCT is the kernel's CNTPCT everywhere and programs may read it
++	 * themselves: mach_absolute_time stops being a trap (~2 us) in every
++	 * process.  This also lets EL0 read the counters
++	 * (_enable_timebase_event_stream, each cpu).  Boot-arg a8utb=0: the
++	 * trap again.
++	 */
++	static int a8_utb = -1;
++
++	if (a8_utb < 0) {
++		int on = 1;
++
++		(void)PE_parse_boot_argn("a8utb", &on, sizeof(on));
++		a8_utb = on != 0;
++	}
++	return a8_utb ? USER_TIMEBASE_SPEC : USER_TIMEBASE_NONE;
++#elif defined(A5XELTE)
+ 	/* CNTVCT has different firmware offsets across Exynos7580 CPUs. */
+ 	return USER_TIMEBASE_NONE;
+ #elif HAS_ACNTVCT
