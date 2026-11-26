@@ -183,13 +183,29 @@ def build():
     subtype = os.environ.get('A8_ARTWORK_SUBTYPE')
     if subtype:
         root.children = [n for n in root.children if n.prop('name') != mkadt.cstr('product')]
-        root.children.append(mkadt.node('product', [
+        props = [
             ('AAPL,phandle', mkadt.u32(999)),
             ('artwork-device-idiom', mkadt.cstr('iphone')),
             ('artwork-device-subtype', mkadt.u32(int(subtype, 0))),
             ('artwork-scale-factor', mkadt.u32(int(os.environ.get('A8_ARTWORK_SCALE', '3'), 0))),
             ('artwork-dynamic-displaymode', mkadt.u32(0)),
-        ]))
+        ]
+        # P17 (2026-11-26): ArtworkTraits also wants the display gamut and the
+        # graphics feature set (CoreUI logs a fault in every app without
+        # them). Key names are the ones libMobileGestalt reads from
+        # IODeviceTree:/product (strings of the phone's own 16.7 copy); the
+        # feature set strings are its built-in A11 pair, matching the D22AP
+        # identity above. sRGB, not P3, as the S7 port (wardevsa/ios-a5xelte
+        # mkadt_herolte.py): P3 makes CoreAnimation ask for 10-bit surfaces
+        # the GL path does not have. A8_PRODUCT_TRAITS=0 builds the old node.
+        if os.environ.get('A8_PRODUCT_TRAITS', '1') != '0':
+            props += [
+                ('artwork-display-gamut', mkadt.cstr('sRGB')),
+                ('graphics-featureset-class', mkadt.cstr('APPLE4')),
+                ('graphics-featureset-fallbacks',
+                 mkadt.cstr('APPLE3:APPLE3v1:APPLE2:APPLE1:GLES2,0')),
+            ]
+        root.children.append(mkadt.node('product', props))
     return root
 
 
