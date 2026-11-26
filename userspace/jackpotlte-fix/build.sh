@@ -6,7 +6,8 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:-$here/libjackpotlte-fix.dylib}
 ld=$(command -v ld64.lld || echo /usr/lib/llvm-18/bin/ld64.lld)
-clang --target=arm64-apple-ios16.0 -O2 -Wall -Wextra -Werror -fno-stack-protector \
+clang --target=arm64-apple-ios16.0 -O2 -Wall -Wextra -Werror -Wno-unknown-warning-option \
+    -Wno-cast-function-type-mismatch -fno-stack-protector \
     -fno-builtin -nostdlib -fblocks -c "$here/fix.c" -o "$out.o"
 "$ld" -arch arm64 -platform_version ios 16.0 16.0 -dylib -adhoc_codesign \
     -install_name /private/var/mobile/Library/libjackpotlte-fix.dylib \

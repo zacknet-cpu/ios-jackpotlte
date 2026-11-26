@@ -79,6 +79,17 @@
  * (117.5-242.5 pt, 11.3-48 pt).  a8fix-sbmargin holding a number keeps v10's
  * edge layout; a8fix-sbvcenter "0" keeps the items' heights.
  *
+ * Status bar (v16, user reports 11-26): the battery jumped to the top edge and
+ * then into place whenever the bar came back (closing Control Center,
+ * unlocking, leaving an app).  v14 left items that were still fading in
+ * (alpha 0) where UIKit had put them, high up, until the next layout.  Now
+ * every item that is not hidden is moved; the group is measured from the
+ * visible items, or from the fading ones when none is visible.  The items also
+ * sit a little toward the screen's edges: 5 pt out from the middle of each
+ * ear, or the number in a8fix-sbout (0 to 30 pt; "0" = v14's centred items).
+ * a8fix-sblog "1" logs each layout pass that moves or skips something, and
+ * the bar's visual provider's methods once.
+ *
  * Sensor curtain (v14, user report 11-25): the expanded island's X button had
  * a pill-shaped bite: the sensor cover (_SBSystemApertureMagiciansCurtainView
  * in the aperture window that takes no touches) is drawn above the content,
@@ -672,10 +683,16 @@ own_method(Class cls, const char *selector, IMP imp, const char *types)
 
 #define SB_MARGIN_SWITCH  "/private/var/mobile/Library/a8fix-sbmargin"
 #define SB_VCENTER_SWITCH "/private/var/mobile/Library/a8fix-sbvcenter"
+#define SB_OUT_SWITCH     "/private/var/mobile/Library/a8fix-sbout"
+#define SB_LOG_SWITCH     "/private/var/mobile/Library/a8fix-sblog"
+#define SB_LOG_MAX        400
 
 static void (*sb_fg_layout_orig)(id, SEL);
 static double sb_margin = -1;           /* v10's edge margin; 0: v14's ears */
 static int sb_vcenter = 1;              /* v14: on the island's middle line */
+static double sb_out = 5;               /* v16: points out from each ear's middle */
+static int sb_log;                      /* v16: a8fix-sblog "1" */
+static int sb_logged;
 static int sb_said;
 
 /* the text of a switch file (an NSString), or 0 when there is none */
@@ -705,6 +722,14 @@ sb_margin_now(void)
 		text = fix_switch_text(SB_VCENTER_SWITCH);
 		sb_vcenter = !(text != 0 &&
 		    ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String"))[0] == '0');
+		text = fix_switch_text(SB_OUT_SWITCH);
+		if (text != 0) {
+			v = dbl(text, sel_registerName("doubleValue"));
+			sb_out = (v >= 0 && v <= 30) ? v : sb_out;
+		}
+		text = fix_switch_text(SB_LOG_SWITCH);
+		sb_log = text != 0 &&
+		    ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String"))[0] == '1';
 	}
 	return sb_margin;
 }
@@ -792,9 +817,11 @@ sb_edges(id self, fix_rect b, double m)
  * avoidance frame (-[_UIStatusBar avoidanceFrame], which SpringBoard keeps on
  * the island and on a compact Live Activity) when it is a plausible one, else
  * the idle pill (the sensor curtain: 125 pt wide, centred, 11.3 to 48 pt).
+ * v16b: OX is where the bar starts on the screen (Control Center's compact
+ * bar starts at 55 pt); the pill is centred on the screen, not on the bar.
  */
 static fix_rect
-sb_island(id fg, fix_rect b, const char **from)
+sb_island(id fg, fix_rect b, double ox, double sw, const char **from)
 {
 	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
 	signed char (*responds)(id, SEL, SEL) = (signed char (*)(id, SEL, SEL))objc_msgSend;
@@ -808,7 +835,7 @@ sb_island(id fg, fix_rect b, const char **from)
 		if (!responds(v, sel_registerName("respondsToSelector:"), avoid))
 			continue;
 		f = convert(fg, sel_registerName("convertRect:fromView:"), rect(v, avoid), v);
-		if (f.w >= 40 && f.h >= 10 && f.h <= 60 && f.x >= 12 && f.x + f.w <= b.w - 12 &&
+		if (f.w >= 40 && f.h >= 10 && f.h <= 60 && f.x + ox >= 12 && f.x + ox + f.w <= sw - 12 &&
 		    f.y >= -2 && f.y < b.h) {
 			*from = class_getName(object_getClass(v));
 			return f;
@@ -819,10 +846,79 @@ sb_island(id fg, fix_rect b, const char **from)
 	*from = "default (no avoidance frame)";
 pill:
 	f.w = 125;
-	f.x = (b.w - f.w) / 2;
+	f.x = (sw - f.w) / 2 - ox;
 	f.y = 11.3;
 	f.h = 36.7;
 	return f;
+}
+
+/* v16 (a8fix-sblog "1"): the methods of the bar's visual provider, once, so a
+ * later fix can change UIKit's own layout instead of moving its results */
+static void
+sb_log_provider(id fg)
+{
+	static int done;
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	signed char (*responds)(id, SEL, SEL) = (signed char (*)(id, SEL, SEL))objc_msgSend;
+	SEL vp = sel_registerName("visualProvider");
+	id v = fg, provider = 0;
+
+	if (done || !sb_log)
+		return;
+	done = 1;
+	for (int up = 0; up < 4 && v != 0 && provider == 0; up++, v = get(v, sel_registerName("superview")))
+		if (responds(v, sel_registerName("respondsToSelector:"), vp))
+			provider = get(v, vp);
+	if (provider == 0) {
+		fix_put("A8FIX sb: no visual provider found\n");
+		return;
+	}
+	for (Class c = object_getClass(provider); c != 0 && sb_logged < SB_LOG_MAX; c = class_getSuperclass(c)) {
+		const char *cn = class_getName(c);
+
+		if (cn[0] == 'N' && cn[1] == 'S' && cn[2] == 'O')
+			break;          /* NSObject */
+		for (int meta = 0; meta < 2; meta++) {
+			unsigned int count = 0;
+			Method *list = class_copyMethodList(meta ? object_getClass((id)c) : c, &count);
+			struct vline l;
+
+			l.n = 0;
+			vl_str(&l, meta ? "A8FIX sb provider + " : "A8FIX sb provider - ");
+			vl_str(&l, cn);
+			vl_str(&l, ":");
+			for (unsigned int i = 0; i < count; i++) {
+				const char *s = sel_getName(method_getName(list[i]));
+				const char *t = method_getTypeEncoding(list[i]);
+				unsigned long len = 0;
+
+				while (s[len])
+					len++;
+				if (l.n + len + 24 > sizeof(l.b) - 2) {
+					vl_str(&l, "\n");
+					l.b[l.n - 1] = '\n';
+					write(2, l.b, l.n);
+					sb_logged++;
+					l.n = 0;
+					vl_str(&l, "A8FIX sb provider ... ");
+				}
+				vl_str(&l, " ");
+				vl_str(&l, s);
+				if (t && t[0] != 'v' && t[0] != '@') {
+					/* the return type when it is a number or a struct */
+					char r[2] = { t[0], 0 };
+
+					vl_str(&l, "=");
+					vl_str(&l, t[0] == '{' ? "struct" : r);
+				}
+			}
+			l.b[l.n++] = '\n';
+			write(2, l.b, l.n);
+			sb_logged++;
+			if (list)
+				free(list);
+		}
+	}
 }
 
 /*
@@ -832,7 +928,14 @@ pill:
  * screen's edges and 4 pt from the island, each on the island's middle line
  * (a8fix-sbvcenter "0" leaves the heights alone).  Only the bar that spans
  * the screen at its top (Control Center's own bar is inset and keeps its
- * layout).
+ * layout).  v16: items fading in (alpha 0) move too, and each group sits
+ * sb_out points out from its ear's middle (a8fix-sbout).  v16b: v14 asked for
+ * the bar at the screen's top left; the bars that carry the items during a
+ * transition are elsewhere (an app's card moving and shrinking, the cover
+ * sheet above the screen, Control Center's compact bar at 55 pt) and kept
+ * UIKit's high layout, so the battery jumped when the real bar took over.
+ * Now: (A) every bar as wide as the screen, in its own points, wherever it is;
+ * (B) a bar at the top flush with a screen edge, in screen points.
  */
 static void
 sb_ears(id self, fix_rect b)
@@ -846,73 +949,200 @@ sb_ears(id self, fix_rect b)
 	fix_rect (*convert)(id, SEL, fix_rect, id) = (fix_rect (*)(id, SEL, fix_rect, id))objc_msgSend;
 	void (*set_rect)(id, SEL, fix_rect) = (void (*)(id, SEL, fix_rect))objc_msgSend;
 	static double said_il = -1, said_ir = -1;
-	double lmin = 1e9, lmax = -1e9, rmin = 1e9, rmax = -1e9, dl = 0, dr = 0;
-	double il, ir, ic, iy, sw = screen_width();
-	unsigned long n, nl = 0, nr = 0, moved = 0;
+	static double main_il, main_ir, main_iy;     /* v16b: the main bar's island */
+	static int main_set;
+	/* [0] the visible items, [1] the ones fading in (alpha 0); per side */
+	double lmin[2] = { 1e9, 1e9 }, lmax[2] = { -1e9, -1e9 }, rmin[2] = { 1e9, 1e9 }, rmax[2] = { -1e9, -1e9 };
+	unsigned long nl[2] = { 0, 0 }, nr[2] = { 0, 0 };
+	double l0 = 0, l1 = 0, r0 = 0, r1 = 0, dl = 0, dr = 0;
+	double il, ir, ic, iy, ox, sw = screen_width();
+	unsigned long n, moved = 0;
+	int lv, rv;
 	const char *from = "";
 	fix_rect w, island;
 	id views;
+	struct vline dl_line;
 
 	w = convert(self, sel_registerName("convertRect:toView:"), b, 0);
-	if (w.x < -1 || w.x > 1 || w.y < -1 || w.y > 1 || (sw > 0 && (w.w < sw - 1 || w.w > sw + 1)))
+	if (sw < 250)
+		sw = b.w;
+	if (b.w > sw - 1 && b.w < sw + 1) {
+		/* (A) a screen-wide bar, wherever it is drawn and however it is scaled
+		 * (an app's card, the cover sheet, the switcher): its own points */
+		ox = 0;
+	} else if (w.y > -1 && w.y < 1 && w.w > b.w - 1 && w.w < b.w + 1 && b.w >= sw / 2 &&
+	    ((w.x > 1 && w.x + w.w > sw - 1 && w.x + w.w < sw + 1) || (w.x > -1 && w.x < 1))) {
+		/* (B) part of the top bar, flush with a screen edge (Control Center's
+		 * compact bar, 55-360 pt, that hands the battery back) */
+		ox = w.x;
+	} else {
+		/* Control Center's own expanded bar (inset), scaled parts */
+		if (sb_log && sb_logged < SB_LOG_MAX) {
+			struct vline l;
+
+			l.n = 0;
+			vl_str(&l, "A8FIX sb: bar skipped (bounds ");
+			vl_num(&l, b.w);
+			vl_str(&l, " wide; in its window ");
+			vl_num(&l, w.x);
+			vl_str(&l, ",");
+			vl_num(&l, w.y);
+			vl_str(&l, " ");
+			vl_num(&l, w.w);
+			vl_str(&l, "x");
+			vl_num(&l, w.h);
+			vl_str(&l, ")\n");
+			write(2, l.b, l.n);
+			sb_logged++;
+		}
 		return;
-	island = sb_island(self, b, &from);
-	il = island.x;
-	ir = island.x + island.w;
+	}
+	sb_log_provider(self);
+	if (ox != 0) {
+		/* (B): its own avoidance frame is in the main bar's points (it put
+		 * the island 55 pt too far right), so the main bar's island is used */
+		if (main_set) {
+			il = main_il;
+			ir = main_ir;
+			iy = main_iy;
+			from = "the main bar's";
+		} else {
+			il = (sw - 125) / 2;
+			ir = il + 125;
+			iy = 11.3 + 36.7 / 2;
+			from = "default (no main bar yet)";
+		}
+	} else {
+		island = sb_island(self, b, 0, sw, &from);
+		il = island.x;           /* screen points from here on */
+		ir = il + island.w;
+		iy = island.y + island.h / 2;
+		if (w.x > -1 && w.x < 1 && w.y > -1 && w.y < 1 && w.w > sw - 1 && w.w < sw + 1) {
+			main_il = il;    /* the bar at the screen's top left */
+			main_ir = ir;
+			main_iy = iy;
+			main_set = 1;
+		}
+	}
 	ic = (il + ir) / 2;
-	iy = island.y + island.h / 2;
 	views = get(self, sel_registerName("subviews"));
 	n = views ? count(views, sel_registerName("count")) : 0;
 	for (unsigned long i = 0; i < n; i++) {
 		id v = at(views, sel_registerName("objectAtIndex:"), i);
+		int faded;
 		fix_rect f;
 
-		if (flag(v, sel_registerName("isHidden")) || dbl(v, sel_registerName("alpha")) < 0.01)
+		if (flag(v, sel_registerName("isHidden")))
 			continue;
 		f = rect(v, sel_registerName("frame"));
-		if (f.w < 0.5 || f.w > b.w / 3 || f.y + f.h / 2 > iy + 4)
+		f.x += ox;
+		if (f.w < 0.5 || f.w > sw / 3 || f.y + f.h / 2 > iy + 4)
 			continue;       /* nothing bar-wide, nothing in a lower row */
+		faded = dbl(v, sel_registerName("alpha")) < 0.01;
 		if (f.x + f.w / 2 < ic) {
-			lmin = f.x < lmin ? f.x : lmin;
-			lmax = f.x + f.w > lmax ? f.x + f.w : lmax;
-			nl++;
+			lmin[faded] = f.x < lmin[faded] ? f.x : lmin[faded];
+			lmax[faded] = f.x + f.w > lmax[faded] ? f.x + f.w : lmax[faded];
+			nl[faded]++;
 		} else {
-			rmin = f.x < rmin ? f.x : rmin;
-			rmax = f.x + f.w > rmax ? f.x + f.w : rmax;
-			nr++;
+			rmin[faded] = f.x < rmin[faded] ? f.x : rmin[faded];
+			rmax[faded] = f.x + f.w > rmax[faded] ? f.x + f.w : rmax[faded];
+			nr[faded]++;
 		}
 	}
-	if (nl) {
-		dl = il / 2 - (lmin + lmax) / 2;
-		if (lmax + dl > il - 4)
-			dl = il - 4 - lmax;
-		if (lmin + dl < 6)
-			dl = 6 - lmin;
+	/* a group is measured from its visible items, or from the fading ones
+	 * when none is visible yet */
+	lv = nl[0] ? 0 : 1;
+	rv = nr[0] ? 0 : 1;
+	if (nl[lv]) {
+		l0 = lmin[lv];
+		l1 = lmax[lv];
+		dl = il / 2 - (l0 + l1) / 2 - sb_out;
+		if (l1 + dl > il - 4)
+			dl = il - 4 - l1;
+		if (l0 + dl < 6)
+			dl = 6 - l0;
 	}
-	if (nr) {
-		dr = (ir + b.w) / 2 - (rmin + rmax) / 2;
-		if (rmin + dr < ir + 4)
-			dr = ir + 4 - rmin;
-		if (rmax + dr > b.w - 6)
-			dr = b.w - 6 - rmax;
+	if (nr[rv]) {
+		r0 = rmin[rv];
+		r1 = rmax[rv];
+		dr = (ir + sw) / 2 - (r0 + r1) / 2 + sb_out;
+		if (r0 + dr < ir + 4)
+			dr = ir + 4 - r0;
+		if (r1 + dr > sw - 6)
+			dr = sw - 6 - r1;
 	}
+	dl_line.n = 0;
 	for (unsigned long i = 0; i < n; i++) {
 		id v = at(views, sel_registerName("objectAtIndex:"), i);
 		fix_rect f, g;
+		int moves;
 
-		if (flag(v, sel_registerName("isHidden")) || dbl(v, sel_registerName("alpha")) < 0.01)
+		if (flag(v, sel_registerName("isHidden")))
 			continue;
 		f = rect(v, sel_registerName("frame"));
-		if (f.w < 0.5 || f.w > b.w / 3 || f.y + f.h / 2 > iy + 4)
+		f.x += ox;
+		if (f.w < 0.5 || f.w > sw / 3 || f.y + f.h / 2 > iy + 4)
 			continue;
 		g = f;
 		g.x = sb_px(f.x + ((f.x + f.w / 2 < ic) ? dl : dr));
 		if (sb_vcenter)
 			g.y = sb_px(iy - f.h / 2);
-		if (g.x - f.x > 0.1 || f.x - g.x > 0.1 || g.y - f.y > 0.1 || f.y - g.y > 0.1) {
+		moves = g.x - f.x > 0.1 || f.x - g.x > 0.1 || g.y - f.y > 0.1 || f.y - g.y > 0.1;
+		f.x -= ox;
+		g.x -= ox;
+		if (moves) {
 			set_rect(v, sel_registerName("setFrame:"), g);
 			moved++;
 		}
+		if (sb_log) {
+			vl_str(&dl_line, "; ");
+			vl_str(&dl_line, class_getName(object_getClass(v)));
+			vl_str(&dl_line, " ");
+			vl_num(&dl_line, f.x);
+			vl_str(&dl_line, ",");
+			vl_num(&dl_line, f.y);
+			vl_str(&dl_line, " ");
+			vl_num(&dl_line, f.w);
+			vl_str(&dl_line, "x");
+			vl_num(&dl_line, f.h);
+			vl_str(&dl_line, " a");
+			vl_num(&dl_line, dbl(v, sel_registerName("alpha")));
+			vl_str(&dl_line, moves ? " ->" : " =");
+			if (moves) {
+				vl_num(&dl_line, g.x);
+				vl_str(&dl_line, ",");
+				vl_num(&dl_line, g.y);
+			}
+		}
+	}
+	if (sb_log && sb_logged < SB_LOG_MAX && (moved || nl[1] || nr[1])) {
+		struct vline l;
+
+		l.n = 0;
+		vl_str(&l, "A8FIX sb pass: bar x ");
+		vl_num(&l, ox);
+		vl_str(&l, (b.w > sw - 1 && b.w < sw + 1) ? " (A)" : " (B)");
+		vl_str(&l, " island ");
+		vl_num(&l, il);
+		vl_str(&l, "-");
+		vl_num(&l, ir);
+		vl_str(&l, " L ");
+		vl_num(&l, nl[0]);
+		vl_str(&l, "+");
+		vl_num(&l, nl[1]);
+		vl_str(&l, " faded dl ");
+		vl_num(&l, dl);
+		vl_str(&l, " R ");
+		vl_num(&l, nr[0]);
+		vl_str(&l, "+");
+		vl_num(&l, nr[1]);
+		vl_str(&l, " faded dr ");
+		vl_num(&l, dr);
+		for (unsigned long k = 0; k < dl_line.n && l.n < sizeof(l.b) - 2; k++)
+			l.b[l.n++] = dl_line.b[k];
+		l.b[l.n++] = '\n';
+		write(2, l.b, l.n);
+		sb_logged++;
 	}
 	if (sb_said < 12 && (moved || il != said_il || ir != said_ir)) {
 		struct vline l;
@@ -927,22 +1157,24 @@ sb_ears(id self, fix_rect b)
 		vl_str(&l, " (");
 		vl_str(&l, from);
 		vl_str(&l, "); left ");
-		vl_num(&l, nl);
+		vl_num(&l, nl[0] + nl[1]);
 		vl_str(&l, " items ");
-		vl_num(&l, nl ? lmin : 0);
+		vl_num(&l, nl[lv] ? l0 : 0);
 		vl_str(&l, "-");
-		vl_num(&l, nl ? lmax : 0);
+		vl_num(&l, nl[lv] ? l1 : 0);
 		vl_str(&l, " moved ");
 		vl_num(&l, dl);
 		vl_str(&l, ", right ");
-		vl_num(&l, nr);
+		vl_num(&l, nr[0] + nr[1]);
 		vl_str(&l, " items ");
-		vl_num(&l, nr ? rmin : 0);
+		vl_num(&l, nr[rv] ? r0 : 0);
 		vl_str(&l, "-");
-		vl_num(&l, nr ? rmax : 0);
+		vl_num(&l, nr[rv] ? r1 : 0);
 		vl_str(&l, " moved ");
 		vl_num(&l, dr);
-		vl_str(&l, sb_vcenter ? "; heights centred\n" : "; heights kept\n");
+		vl_str(&l, ", out ");
+		vl_num(&l, sb_out);
+		vl_str(&l, sb_vcenter ? " pt; heights centred\n" : " pt; heights kept\n");
 		write(2, l.b, l.n);
 		said_il = il;
 		said_ir = ir;
@@ -988,7 +1220,7 @@ layout_apply(void)
 		layout_sb_done = 1;
 		sb_fg_layout_orig = (void (*)(id, SEL))own_method(objc_getClass("_UIStatusBarForegroundView"),
 		    "layoutSubviews", (IMP)sb_fg_layout, "v16@0:8");
-		fix_put(sb_fg_layout_orig ? "A8FIX status bar: layout hooked (ears, or edges with a8fix-sbmargin)\n" :
+		fix_put(sb_fg_layout_orig ? "A8FIX status bar: layout hooked (v16c: ears, a8fix-sbout; edges with a8fix-sbmargin)\n" :
 		    "A8FIX status bar: not hooked\n");
 	}
 	if (!layout_cc_done && objc_getClass("CCUIOverlayStatusBarPresentationProvider") != 0) {
