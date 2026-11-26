@@ -923,6 +923,69 @@ jackpotlte_eagl_target_surface(void *context, unsigned texture, int *width, int 
    return 0;
 }
 
+/*
+ * glca28b: a surface of the shim's own, WIDTH x HEIGHT BGRA (rows a multiple
+ * of 64 bytes): a panel shadow that glca23 can make a second texture of.
+ * Its ID (0: none); *REF is what jackpotlte_eagl_free_surface lets go.
+ */
+typedef const struct __CFAllocator *CFAllocatorRef;
+typedef struct __CFDictionary *CFMutableDictionaryRef;
+typedef const struct __CFString *CFStringRef;
+typedef const struct __CFNumber *CFNumberRef;
+struct jt_cf_callbacks;
+extern const struct jt_cf_callbacks kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks;
+CFMutableDictionaryRef CFDictionaryCreateMutable(CFAllocatorRef allocator, long capacity,
+                                                 const struct jt_cf_callbacks *keys,
+                                                 const struct jt_cf_callbacks *values);
+void CFDictionarySetValue(CFMutableDictionaryRef dictionary, const void *key, const void *value);
+CFNumberRef CFNumberCreate(CFAllocatorRef allocator, long type, const void *value);
+CFStringRef CFStringCreateWithCString(CFAllocatorRef allocator, const char *text, uint32_t encoding);
+IOSurfaceRef IOSurfaceCreate(CFMutableDictionaryRef properties);
+
+static void
+surface_property(CFMutableDictionaryRef d, const char *name, int32_t value)
+{
+   CFStringRef key = CFStringCreateWithCString(NULL, name, 0x08000100 /* UTF-8 */);
+   CFNumberRef number = CFNumberCreate(NULL, 3 /* kCFNumberSInt32Type */, &value);
+
+   if (key != NULL && number != NULL)
+      CFDictionarySetValue(d, key, number);
+   if (key != NULL)
+      CFRelease(key);
+   if (number != NULL)
+      CFRelease(number);
+}
+
+uint32_t
+jackpotlte_eagl_new_surface(int width, int height, void **ref)
+{
+   CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                        &kCFTypeDictionaryValueCallBacks);
+   IOSurfaceRef surface;
+
+   *ref = NULL;
+   if (d == NULL)
+      return 0;
+   surface_property(d, "IOSurfaceWidth", width);
+   surface_property(d, "IOSurfaceHeight", height);
+   surface_property(d, "IOSurfaceBytesPerElement", 4);
+   surface_property(d, "IOSurfaceBytesPerRow", (width * 4 + 63) & ~63);
+   surface_property(d, "IOSurfacePixelFormat", 0x42475241 /* 'BGRA' */);
+   surface = IOSurfaceCreate(d);
+   CFRelease(d);
+   if (surface == NULL)
+      return 0;
+   *ref = surface;
+   return (uint32_t)IOSurfaceGetID(surface);
+}
+
+void
+jackpotlte_eagl_free_surface(void *ref)
+{
+   if (ref != NULL)
+      CFRelease(ref);
+}
+
 /* glca23: the texture bound to GL_TEXTURE_2D shows SURFACE's memory as well
  * (a second texture of the same memory, which Mesa tracks apart) */
 int

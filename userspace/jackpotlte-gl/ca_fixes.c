@@ -1841,6 +1841,7 @@ static struct {
    uint32_t surface;
    int width, height;
    bool failed;                         /* the second texture could not be made */
+   uint32_t alias_surface;              /* glca28b: the surface the second texture shows */
    unsigned boxes;                      /* drawn since the last submit we know of */
    bool full;                           /* ... or the whole buffer */
    GLint box[ALIAS_BOXES][4];
@@ -2139,19 +2140,31 @@ alias_read_box(GLuint program, int n, GLint first, GLsizei count, GLenum type, c
 }
 
 /* the second texture of screen K, made once */
+static int shadow_of(GLuint panel);
+static uint32_t alias_surface_of(int k);
+static GLuint alias_bound_name(int k);
+
 static bool
 alias_make(void *context, int k)
 {
    GLint was = 0;
+   uint32_t surface = alias_surface_of(k);
 
+   if (scr[k].alias != 0 && scr[k].alias_surface != surface) {
+      /* glca28b: its shadow was made again: a second texture of the new one */
+      gl.delete_textures(1, &scr[k].alias);
+      scr[k].alias = 0;
+      scr[k].failed = false;
+   }
    if (scr[k].alias != 0)
       return true;
-   if (scr[k].failed)
+   if (scr[k].failed || surface == 0)
       return false;
+   scr[k].alias_surface = surface;
    gl.get_integerv(GL_TEXTURE_BINDING_2D, &was);
    gl.gen_textures(1, &scr[k].alias);
    gl.bind_texture(GL_TEXTURE_2D, scr[k].alias);
-   if (scr[k].alias == 0 || !jackpotlte_eagl_alias_texture(context, scr[k].surface)) {
+   if (scr[k].alias == 0 || !jackpotlte_eagl_alias_texture(context, surface)) {
       scr[k].failed = true;
       say("glca23: no second texture of surface %u: backdrop copies end the screen's pass as before",
           scr[k].surface);
@@ -2163,8 +2176,8 @@ alias_make(void *context, int k)
    }
    scr[k].set[0] = scr[k].set[1] = scr[k].set[2] = scr[k].set[3] = -1;
    gl.bind_texture(GL_TEXTURE_2D, (GLuint)was);
-   say("glca23: texture %u is a second texture of surface %u (panel buffer texture %u)",
-       scr[k].alias, scr[k].surface, scr[k].texture);
+   say("glca23: texture %u is a second texture of surface %u (panel buffer texture %u%s)",
+       scr[k].alias, surface, scr[k].texture, surface != scr[k].surface ? ", its shadow" : "");
    return true;
 }
 
@@ -2252,7 +2265,7 @@ alias_begin(void *context, GLint first, GLsizei count, GLenum type, const void *
       /* what is really bound there (the shim's own calls bind without the table) */
       gl.active_texture(GL_TEXTURE0 + (GLenum)unit);
       gl.get_integerv(GL_TEXTURE_BINDING_2D, &bound);
-      if (bound != (GLint)scr[k].texture) {
+      if (bound != (GLint)alias_bound_name(k)) {
          gl.active_texture(GL_TEXTURE0 + (GLenum)active_unit);
          unit_tex[unit] = bound;
          as->flushed = alias_screen_of((GLuint)bound);
@@ -2269,7 +2282,7 @@ alias_begin(void *context, GLint first, GLsizei count, GLenum type, const void *
       }
       gl.active_texture(GL_TEXTURE0 + (GLenum)active_unit);
       as->unit = unit;
-      as->put_back = scr[k].texture;
+      as->put_back = alias_bound_name(k);
       pend[npend].reader = cur_tex;
       pend[npend].screen = k;
       memcpy(pend[npend].box, box, sizeof(box));
@@ -2333,6 +2346,8 @@ static struct {
    int width, height;
    GLuint tex, fbo;                     /* the shadow and its framebuffer */
    GLuint panel_fbo;                    /* ours, with the panel buffer in it: the copy's target */
+   uint32_t sid;                        /* glca28b: the shadow's own surface (0: a Mesa texture) */
+   void *ref;
    bool dirty;                          /* drawn since the last copy */
    bool failed;
 } shadow[SHADOWS];
@@ -2359,6 +2374,31 @@ shadow_of(GLuint panel)
          if (shadow[k].names[n] == panel)
             return k;
    return -1;
+}
+
+/* glca28b: the surface glca23's second texture of screen K shows (with
+ * shadows: its shadow's own surface; 0 when the shadow has none) */
+static uint32_t
+alias_surface_of(int k)
+{
+   int s;
+
+   if (!shadow_on)
+      return scr[k].surface;
+   s = shadow_of(scr[k].texture);
+   return s >= 0 && !shadow[s].failed ? shadow[s].sid : 0;
+}
+
+/* what is really bound when CoreAnimation binds screen K's texture */
+static GLuint
+alias_bound_name(int k)
+{
+   int s;
+
+   if (!shadow_on)
+      return scr[k].texture;
+   s = shadow_of(scr[k].texture);
+   return s >= 0 && !shadow[s].failed && shadow[s].tex != 0 ? shadow[s].tex : scr[k].texture;
 }
 
 static int
@@ -2415,7 +2455,7 @@ shadow_blit(GLuint from, GLuint to, int width, int height, bool discard)
 
 /* a shadow for the panel buffer texture PANEL (SURFACE, WIDTHxHEIGHT), with its content */
 static int
-shadow_make(GLuint panel, uint32_t surface, int width, int height)
+shadow_make(void *context, GLuint panel, uint32_t surface, int width, int height)
 {
    GLint tex = 0, draw = 0, read = 0, filter[4];
    GLuint t = 0, f[2] = { 0, 0 };
@@ -2442,8 +2482,19 @@ shadow_make(GLuint panel, uint32_t surface, int width, int height)
    gl.get_tex_parameteriv(GL_TEXTURE_2D, 0x2803 /* WRAP_T */, &filter[3]);
    gl.gen_textures(1, &t);
    gl.bind_texture(GL_TEXTURE_2D, t);
-   gl.tex_image_2d(GL_TEXTURE_2D, 0, 0x8058 /* RGBA8 */, width, height, 0, 0x1908 /* RGBA */,
-                   0x1401 /* UNSIGNED_BYTE */, NULL);
+   /* glca28b: a surface of our own, so that glca23 can make a second texture of it
+    * (a8gl-shadow "2": a plain Mesa texture, as glca28) */
+   if (shadow_on == 1)
+      shadow[k].sid = jackpotlte_eagl_new_surface(width, height, &shadow[k].ref);
+   if (shadow[k].sid == 0 || !jackpotlte_eagl_alias_texture(context, shadow[k].sid)) {
+      if (shadow[k].sid != 0)
+         say("glca28: surface %u cannot be a texture: a plain texture instead", shadow[k].sid);
+      jackpotlte_eagl_free_surface(shadow[k].ref);
+      shadow[k].ref = NULL;
+      shadow[k].sid = 0;
+      gl.tex_image_2d(GL_TEXTURE_2D, 0, 0x8058 /* RGBA8 */, width, height, 0, 0x1908 /* RGBA */,
+                      0x1401 /* UNSIGNED_BYTE */, NULL);
+   }
    gl.tex_parameteri(GL_TEXTURE_2D, 0x2801, filter[0]);
    gl.tex_parameteri(GL_TEXTURE_2D, 0x2800, filter[1]);
    gl.tex_parameteri(GL_TEXTURE_2D, 0x2802, filter[2]);
@@ -2463,6 +2514,9 @@ shadow_make(GLuint panel, uint32_t surface, int width, int height)
       if (t != 0)
          gl.delete_textures(1, &t);
       gl.delete_framebuffers(2, f);
+      jackpotlte_eagl_free_surface(shadow[k].ref);
+      shadow[k].ref = NULL;
+      shadow[k].sid = 0;
       shadow[k].failed = true;
       say("glca28: no shadow for panel buffer texture %u (surface %u): drawn as before", panel, surface);
       return k;
@@ -2472,7 +2526,8 @@ shadow_make(GLuint panel, uint32_t surface, int width, int height)
    shadow[k].panel_fbo = f[1];
    shadow_blit(f[1], f[0], width, height, true);   /* what the panel buffer holds now */
    say("glca28: panel buffer texture %u (surface %u, %dx%d) is drawn into shadow texture %u "
-       "(framebuffer %u) and copied at each frame's end", panel, surface, width, height, t, f[0]);
+       "(framebuffer %u, %s %u) and copied at each frame's end", panel, surface, width, height, t, f[0],
+       shadow[k].sid != 0 ? "its own surface" : "a Mesa texture", shadow[k].sid);
    return k;
 }
 
@@ -2517,7 +2572,7 @@ shadow_bind(void *context, GLenum target, GLuint framebuffer)
          if (!shadow_name(k, panel))
             return;
       } else {
-         k = shadow_make(panel, surface, width, height);
+         k = shadow_make(context, panel, surface, width, height);
          if (k < 0)
             return;
       }
@@ -2623,6 +2678,7 @@ shadow_forget(GLuint texture)
       gl.delete_framebuffers(1, &shadow[k].fbo);
       gl.delete_framebuffers(1, &shadow[k].panel_fbo);
    }
+   jackpotlte_eagl_free_surface(shadow[k].ref);
    memset(&shadow[k], 0, sizeof(shadow[k]));
    if (shadow_cur == k)
       shadow_cur = -1;
@@ -2678,6 +2734,12 @@ alias_bound_screen(void)
    GLint bound = 0;
 
    gl.get_integerv(GL_TEXTURE_BINDING_2D, &bound);
+   if (shadow_on) {
+      /* glca28b: the shadow is what is bound for a panel buffer's texture */
+      for (int k = 0; k < ALIAS_SCREENS; k++)
+         if (scr[k].texture != 0 && alias_bound_name(k) == (GLuint)bound)
+            return k;
+   }
    return alias_screen_of((GLuint)bound);
 }
 
@@ -2926,11 +2988,15 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
          if (f != NULL)
             fclose(f);
          f = fopen("/private/var/mobile/Library/a8gl-shadow", "r");        /* glca28 */
-         shadow_on = f != NULL && fgetc(f) == '1';
+         {
+            int c = f != NULL ? fgetc(f) : 0;
+
+            shadow_on = c == '1' ? 1 : c == '2' ? 2 : 0;
+         }
          if (f != NULL)
             fclose(f);
-         if (shadow_on)
-            alias_on = 0;              /* its second textures read the real panel buffer */
+         if (shadow_on == 2)
+            alias_on = 0;              /* glca28: Mesa texture shadows, no second textures */
          f = fopen("/private/var/mobile/Library/a8gl-zero", "r");          /* glca24 */
          zero_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
@@ -3016,6 +3082,7 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
       alias_on = 0;
       shadow_on = 0;
    }
-   say("glca28: panel shadows %s (a8gl-shadow \"1\" on)", shadow_on ? "ON" : "off");
+   say("glca28: panel shadows %s (a8gl-shadow \"1\" own surfaces + glca23 on them, \"2\" Mesa textures)",
+       shadow_on == 1 ? "ON, own surfaces" : shadow_on == 2 ? "ON, Mesa textures" : "off");
    say("glca24: triangle draws with no area are %s (a8gl-zero \"0\" keeps them)", zero_on ? "left out" : "kept");
 }

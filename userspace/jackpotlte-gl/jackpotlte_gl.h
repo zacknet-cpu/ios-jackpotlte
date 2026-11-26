@@ -78,6 +78,8 @@ int jackpotlte_gl_surface_texture(struct jackpotlte_gl *gl, uint32_t surface);
  * SURFACE's memory (1: done).
  */
 uint32_t jackpotlte_eagl_target_surface(void *context, unsigned texture, int *width, int *height);
+uint32_t jackpotlte_eagl_new_surface(int width, int height, void **ref);       /* glca28b */
+void jackpotlte_eagl_free_surface(void *ref);
 int jackpotlte_eagl_alias_texture(void *context, uint32_t surface);
 
 #endif
