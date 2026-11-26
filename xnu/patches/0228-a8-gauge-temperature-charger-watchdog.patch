@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
-index 7d66e22..3b6b70e 100644
+index 7d66e22..a098050 100644
 --- a/bsd/dev/jackpotlte_pmic.c
 +++ b/bsd/dev/jackpotlte_pmic.c
 @@ -454,6 +454,15 @@ jp_read_reg(vm_offset_t i2c, uint8_t addr8, uint8_t reg, uint8_t *buf,
@@ -18,14 +18,14 @@ index 7d66e22..3b6b70e 100644
  static void
  jp_charger(vm_offset_t chg)
  {
-@@ -569,8 +578,35 @@ struct jp_sample {
+@@ -569,7 +578,45 @@ struct jp_sample {
  	bool external;
  	bool charging;
  	bool full;
 +	int temp_deci;          /* 0228: gauge temperature, 0.1 C */
 +	bool temp_valid;
- };
- 
++};
++
 +/*
 + * 0228 (P18, P31).  The fuel gauge's monitor register MONOUT (0x0a) shows its
 + * temperature unless MONOUT_SEL was changed ("monitor register default setting
@@ -45,22 +45,47 @@ index 7d66e22..3b6b70e 100644
 + * PMIC writes; default 0: nothing is written.
 + */
 +#define JT_FG_MONOUT_TEMP_OK(d)	((d) >= -200 && (d) <= 800)
++#define JT_FG_MONOUT_SEL	0x0cu	/* what MONOUT shows (fuelgauge.h:41) */
++#define JT_FG_MONOUT_SEL_TEMP	0x10u	/* temperature (fuelgauge.c:646)   */
++#define JT_CHG_CTRL13		0x1du	/* EN_WDT[1] (charger.h:248-256)   */
++#define JT_CHG_EN_WDT		0x02u
 +#define JT_CHG_CTRL14		0x1eu	/* WDT_CLR[0] (charger.h:258-260)  */
 +#define JT_CHG_WDT_HOT_DECI	450
 +static int jp_wdt_mode = -1;
-+static uint64_t jp_wdt_kicks, jp_wdt_skipped_hot;
-+static bool jp_wdt_said;
-+
++static uint64_t jp_wdt_kicks;
++/* The kick's state, logged on every change (0228b) */
++enum jp_wdt_state {
++	JP_WDT_NONE, JP_WDT_KICKING, JP_WDT_HOT, JP_WDT_NO_TEMP, JP_WDT_OFF,
++	JP_WDT_ODD_BITS, JP_WDT_IO_FAILED,
+ };
++static enum jp_wdt_state jp_wdt_state = JP_WDT_NONE;
++static int jp_monout_sel = -1;          /* last MONOUT_SEL read, -1 none */
++static int jp_monout_sel_said = -2;
+ 
  /*
   * Decode matches the vendor's own get_charging_status()
-  * (drivers/battery_v2/s2mu004_charger.c:721-757) rather than a guessed
-@@ -627,6 +663,17 @@ jp_sample_read(struct jp_sample *s)
+@@ -627,6 +674,32 @@ jp_sample_read(struct jp_sample *s)
  		return false;
  	}
  	rsoc_centi = ((raw & 0x7fffu) * 10000u) / (1u << 14);
-+	/* 0228: the gauge's temperature (read only) */
++	/* 0228: the gauge's temperature (read only).  0228b: only while
++	 * MONOUT_SEL (0x0c) reads 0x10: the vendor points MONOUT at the average
++	 * current (0x26) or voltage (0x27) for a moment and back at 0x10; left
++	 * at 0x26, a 330 mA charge would read as -5.2 C and pass the 45.0 C
++	 * gate.  MONOUT_SEL is only read here, never written. */
 +	s->temp_valid = false;
-+	if (jp_read_reg(jp_fg, JT_FG_ADDR, JT_FG_MONOUT, b, 2)) {
++	jp_monout_sel = -1;
++	if (jp_read_reg(jp_fg, JT_FG_ADDR, JT_FG_MONOUT_SEL, b, 1)) {
++		jp_monout_sel = b[0];
++	}
++	if (jp_monout_sel != jp_monout_sel_said) {
++		printf("JACKPOTLTE BATTERY: gauge MONOUT_SEL %s%#04x (%s) (0228b)\n",
++		    jp_monout_sel < 0 ? "unread " : "", jp_monout_sel < 0 ? 0u : (unsigned)jp_monout_sel,
++		    jp_monout_sel == (int)JT_FG_MONOUT_SEL_TEMP ? "temperature" : "not the temperature: none read");
++		jp_monout_sel_said = jp_monout_sel;
++	}
++	if (jp_monout_sel == (int)JT_FG_MONOUT_SEL_TEMP &&
++	    jp_read_reg(jp_fg, JT_FG_ADDR, JT_FG_MONOUT, b, 2)) {
 +		int t = (int)(int16_t)(uint16_t)((unsigned)b[0] | ((unsigned)b[1] << 8));
 +
 +		t = ((t * 100) >> 8) / 10;
@@ -72,7 +97,7 @@ index 7d66e22..3b6b70e 100644
  
  	/* Reject a floating/absent battery or a gauge that has not sampled yet
  	 * instead of publishing 0 % (the donor does the same 2800..4600 mV
-@@ -672,6 +719,35 @@ jp_sample_read(struct jp_sample *s)
+@@ -672,6 +745,56 @@ jp_sample_read(struct jp_sample *s)
  		 * whatever CHGIN says; keep full so a finished charge stays full. */
  		s->charging = false;
  	}
@@ -87,28 +112,49 @@ index 7d66e22..3b6b70e 100644
 +		    on);
 +	}
 +	if (jp_wdt_mode && s->external) {
-+		if (s->temp_valid && s->temp_deci < JT_CHG_WDT_HOT_DECI) {
-+			uint8_t c14 = 0;
++		/* 0228b: as the vendor's s2mu004_wdt_clear, only while EN_WDT
++		 * (CTRL13 bit 1) is set, and only when CTRL14 reads 0x00 or 0x01
++		 * (bit 0 WDT_CLR is its only documented bit): then exactly 0x01 is
++		 * written, so a misread can never put other bits on the chip. */
++		enum jp_wdt_state st;
++		uint8_t c13 = 0, c14 = 0;
 +
-+			if (jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_CTRL14, &c14, 1) &&
-+			    jp_write_reg(jp_chg, JT_CHG_ADDR, JT_CHG_CTRL14, (uint8_t)(c14 | 0x01u))) {
-+				jp_wdt_kicks++;
-+				if (!jp_wdt_said) {
-+					printf("JACKPOTLTE BATTERY: charger watchdog kicked (CTRL14 %#04x), "
-+					    "fault %u, gauge %d.%d C\n", (unsigned)c14, fault,
-+					    s->temp_deci / 10, (s->temp_deci < 0 ? -s->temp_deci : s->temp_deci) % 10);
-+					jp_wdt_said = true;
-+				}
-+			}
-+		} else if (jp_wdt_skipped_hot++ == 0) {
-+			printf("JACKPOTLTE BATTERY: charger watchdog not kicked: gauge temperature %s\n",
-+			    s->temp_valid ? "45.0 C or more" : "unknown");
++		if (!s->temp_valid) {
++			st = JP_WDT_NO_TEMP;
++		} else if (s->temp_deci >= JT_CHG_WDT_HOT_DECI) {
++			st = JP_WDT_HOT;
++		} else if (!jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_CTRL13, &c13, 1) ||
++		    !jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_CTRL14, &c14, 1)) {
++			st = JP_WDT_IO_FAILED;
++		} else if (!(c13 & JT_CHG_EN_WDT)) {
++			st = JP_WDT_OFF;
++		} else if (c14 & 0xfeu) {
++			st = JP_WDT_ODD_BITS;
++		} else if (jp_write_reg(jp_chg, JT_CHG_ADDR, JT_CHG_CTRL14, 0x01u)) {
++			st = JP_WDT_KICKING;
++			jp_wdt_kicks++;
++		} else {
++			st = JP_WDT_IO_FAILED;
++		}
++		if (st != jp_wdt_state) {
++			static const char *const what[] = {
++				"none", "kicking (wrote CTRL14 0x01)", "not kicked: gauge 45.0 C or more",
++				"not kicked: gauge temperature unknown", "not kicked: EN_WDT is off",
++				"not kicked: CTRL14 has other bits set", "not kicked: charger read/write failed",
++			};
++			printf("JACKPOTLTE BATTERY: charger watchdog %s; CTRL13 %#04x CTRL14 %#04x "
++			    "fault %u gauge %s%d.%d C, kicks %llu (0228b)\n", what[st],
++			    (unsigned)c13, (unsigned)c14, fault, s->temp_valid ? "" : "unknown ",
++			    s->temp_valid ? s->temp_deci / 10 : 0,
++			    s->temp_valid ? (s->temp_deci < 0 ? -s->temp_deci : s->temp_deci) % 10 : 0,
++			    jp_wdt_kicks);
++			jp_wdt_state = st;
 +		}
 +	}
  	return true;
  }
  
-@@ -709,6 +785,9 @@ jp_chgin_name(unsigned chgin)
+@@ -709,6 +832,9 @@ jp_chgin_name(unsigned chgin)
  static void
  jp_log_sample(const struct jp_sample *s)
  {
@@ -118,7 +164,7 @@ index 7d66e22..3b6b70e 100644
  	printf("JACKPOTLTE BATTERY: chgin=%u(%s) st0=%#04x st1=%#04x "
  	    "st3=%#04x bat=%u en_chg=%u topoff=%umA vbat=%umV rsoc=%u%% "
  	    "cur=%dmA ext=%d chg=%d full=%d fault=%u\n",
-@@ -729,8 +808,25 @@ jp_log_sample(const struct jp_sample *s)
+@@ -729,8 +855,25 @@ jp_log_sample(const struct jp_sample *s)
   * never from an interrupt.  A NACK or timeout keeps the previous sample and is
   * logged once; the polled transfer bounds each byte to milliseconds, so a dead
   * bus costs the poll a bounded delay instead of a hang.  Nothing is written to
@@ -145,7 +191,7 @@ index 7d66e22..3b6b70e 100644
  int
  jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
      int *external, int *charging, int *full)
-@@ -758,7 +854,13 @@ jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+@@ -758,7 +901,13 @@ jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
  
  	ok = jp_sample_read(&s);
  	if (ok) {
