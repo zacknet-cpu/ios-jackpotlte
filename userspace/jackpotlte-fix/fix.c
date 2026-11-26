@@ -90,6 +90,9 @@
  * a8fix-sblog "1" logs each layout pass that moves or skips something, and
  * the bar's visual provider's methods once.
  *
+ * Backdrop scale (v17b, P3a): every CABackdropLayer captures at most 25%
+ * (they all captured at 100% here); a8fix-bdscale N or "1"; see bd_apply.
+ *
  * Sensor curtain (v14, user report 11-25): the expanded island's X button had
  * a pill-shaped bite: the sensor cover (_SBSystemApertureMagiciansCurtainView
  * in the aperture window that takes no touches) is drawn above the content,
@@ -1433,6 +1436,73 @@ shadow_set(id self, SEL cmd, float opacity)
 	shadow_set_orig(self, cmd, 0);
 }
 
+/* ---- v17: backdrop capture scale (P3a, Control Center's GPU time) ------ */
+
+/*
+ * v17: every material backdrop here captures at 100% (the view dump's "scale
+ * 100%"), so Control Center's full-screen material copies the whole home
+ * screen (1082x2222) every frame before blurring it.  -[CABackdropLayer
+ * setScale:] keeps a backdrop's scale at most 25% and every new backdrop
+ * layer starts there (11-26: Control Center 353-362 -> 446-450 frames a 10 s,
+ * build 19.6 -> 15.5 ms, the picture the same to the eye: a blur hides the
+ * capture's resolution).  /private/var/mobile/Library/a8fix-bdscale: another
+ * cap (0.05 to 0.99), or "1" for Apple's scales.
+ */
+#define BD_SCALE_SWITCH "/private/var/mobile/Library/a8fix-bdscale"
+
+static double bd_cap;
+static void (*bd_scale_orig)(id, SEL, double);
+static id (*bd_init_orig)(id, SEL);
+static int bd_done;
+
+static void
+bd_scale(id self, SEL cmd, double scale)
+{
+	if (bd_cap > 0 && scale > bd_cap)
+		scale = bd_cap;
+	bd_scale_orig(self, cmd, scale);
+}
+
+static id
+bd_init(id self, SEL cmd)
+{
+	self = bd_init_orig(self, cmd);
+	if (self != 0 && bd_cap > 0)
+		bd_scale_orig(self, sel_registerName("setScale:"), bd_cap);
+	return self;
+}
+
+static void
+bd_apply(void)
+{
+	Class c;
+	id text;
+	struct vline l;
+
+	if (bd_done || (c = objc_getClass("CABackdropLayer")) == 0)
+		return;
+	bd_done = 1;
+	text = fix_switch_text(BD_SCALE_SWITCH);
+	bd_cap = text != 0 ? ((double (*)(id, SEL))objc_msgSend)(text, sel_registerName("doubleValue")) : 0.25;
+	if (!(bd_cap >= 0.05 && bd_cap < 1)) {
+		bd_cap = 0;
+		fix_put("A8FIX backdrop scale: Apple's scales (a8fix-bdscale)\n");
+		return;
+	}
+	bd_scale_orig = (void (*)(id, SEL, double))own_method(c, "setScale:", (IMP)bd_scale, "v24@0:8d16");
+	if (bd_scale_orig == 0) {
+		bd_cap = 0;
+		fix_put("A8FIX backdrop scale: -[CABackdropLayer setScale:] not found\n");
+		return;
+	}
+	bd_init_orig = (id (*)(id, SEL))own_method(c, "init", (IMP)bd_init, "@16@0:8");
+	l.n = 0;
+	vl_str(&l, "A8FIX backdrop scale: at most ");
+	vl_num(&l, bd_cap * 100.0);
+	vl_str(&l, bd_init_orig ? "% (setScale: and new layers)\n" : "% (setScale: only)\n");
+	write(2, l.b, l.n);
+}
+
 /* ---- v14b: long CoreAnimation animations (P3, Live Activity cost) ------- */
 
 /*
@@ -1820,6 +1890,7 @@ fix_image_added(const void *mh, long slide)
 	layout_apply();
 	idle_apply();
 	anim_apply();
+	bd_apply();
 	if (fix_is_springboard)
 		curtain_apply();
 }
@@ -2721,6 +2792,7 @@ fix_init(void)
 	layout_apply();
 	idle_apply();
 	anim_apply();
+	bd_apply();
 	fix_is_springboard = fix_streq(getprogname(), "SpringBoard");
 	if (fix_is_springboard)
 		curtain_apply();
