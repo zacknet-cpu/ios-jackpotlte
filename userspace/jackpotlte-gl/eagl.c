@@ -2530,6 +2530,50 @@ union method_prototype {
    void (*dispose)(id, SEL);
 };
 
+/*
+ * glca27: CoreAnimation reads its CA_* debug and policy settings from the
+ * environment (QuartzCore has ~270: CA_LOG_TRIPLE_BUFFERING,
+ * CA_FORCE_DOUBLE_BUFFERING, CA_PRINT_FRAME_INFO, CA_VSYNC_OFF, ...).  This
+ * constructor runs in backboardd before its render server starts, so each
+ * "CA_NAME=VALUE" line of /private/var/mobile/Library/a8gl-caenv is put
+ * into the environment here.  Only names that start with CA_ are taken.
+ */
+static void
+ca_environment(void)
+{
+   char buf[2048];
+   int fd = open("/private/var/mobile/Library/a8gl-caenv", O_RDONLY | O_CLOEXEC);
+   ssize_t n;
+   char *line, *next;
+
+   if (fd < 0)
+      return;
+   n = read(fd, buf, sizeof(buf) - 1);
+   close(fd);
+   if (n <= 0)
+      return;
+   buf[n] = '\0';
+   for (line = buf; line != NULL && *line != '\0'; line = next) {
+      char *eq, *end;
+
+      next = strchr(line, '\n');
+      if (next != NULL)
+         *next++ = '\0';
+      end = line + strlen(line);
+      while (end > line && (end[-1] == '\r' || end[-1] == ' '))
+         *--end = '\0';
+      eq = strchr(line, '=');
+      if (strncmp(line, "CA_", 3) != 0 || eq == NULL || eq == line + 3) {
+         if (*line != '\0')
+            say("glca27: a8gl-caenv line \"%.60s\" left out (not CA_NAME=VALUE)", line);
+         continue;
+      }
+      *eq = '\0';
+      if (setenv(line, eq + 1, 1) == 0)
+         say("glca27: %s=%.60s set for CoreAnimation", line, eq + 1);
+   }
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -2572,6 +2616,7 @@ install(void)
    unsigned i, installed = 0;
 
    say("library loaded into the display server");
+   ca_environment();               /* glca27 */
    /* Bring-up aid: where this file and the OpenGL ES library beside it were
     * loaded.  The kernel's crash report prints the faulting pc but no image
     * base, so these numbers are what turn that pc into an offset into a file
