@@ -13,11 +13,11 @@ index 67a401d..a8c1125 100644
 +	 * before kernel_bootstrap() copies max_mem into machine_info (the
 +	 * commpage's memory size) and before bsd_init's memorystatus_init
 +	 * sizes jetsam's thresholds from max_mem; scale_setup() (zone and kmem
-+	 * sizes) ran before and keeps the upper bank's.  Boot-arg a8memsize=0:
-+	 * the old sizes.
++	 * sizes) ran before.  OFF by default: with it CC ran 4-5% slower (11-26);
++	 * boot-arg a8memsize=1 counts them.
 +	 */
 +	{
-+		int count = 1;
++		int count = 0;
 +
 +		(void)PE_parse_boot_argn("a8memsize", &count, sizeof(count));
 +		if (count != 0 && pages != 0) {
