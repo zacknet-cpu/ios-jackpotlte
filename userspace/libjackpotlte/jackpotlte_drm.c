@@ -80,11 +80,11 @@ static uint32_t next_syncobj = 1;
 #define BO_SEQ_BUSY             UINT64_MAX
 static uint64_t bo_seq[JT_MAPS];
 static uint64_t done_seq;
-/* 11-26: handles that came from a surface import (JT_SURFACE).  The kernel
- * gives a surface that is imported again the handle it already has (0154
- * surfaceBuffer), so such a buffer is closed at once, never queued: a
- * queued close would take the buffer away from the second import. */
-static uint8_t bo_surface[JT_MAPS];
+/* 11-26: the surface a handle came from (JT_SURFACE), 0 for none.  The
+ * kernel gives a surface that is imported again the handle it already has
+ * (0154 surfaceBuffer), so an import first takes back a queued close of
+ * that surface (close_cancel_surface). */
+static uint32_t bo_surface[JT_MAPS];
 
 static void
 note_done(uint64_t seq)
@@ -267,17 +267,20 @@ jackpotlte_drm_unmap(int fd, uint32_t handle, void *address)
  * with WAIT_BO (no lock held in the kernel) so that GEM_CLOSE does not wait
  * under the user client's lock.  The kernel keeps the handle taken until the
  * close really happens, so nothing can be given the same handle before,
- * except a surface imported again: those close at once (bo_surface).
+ * except a surface imported again: the import takes the queued close back
+ * first (close_cancel_surface) or waits for the one being done.
  * /private/var/mobile/Library/a8gl-closer "0": closes as before.
  */
 #define JT_CLOSE_QUEUE          2048
 static struct {
 	struct jt_gpu *g;
 	uint32_t handle;
+	uint32_t surface;               /* the surface it came from, 0 for none */
 	void *address;
 	uint64_t size;
 } close_q[JT_CLOSE_QUEUE];
 static unsigned close_head, close_count, close_busy;
+static uint32_t close_busy_surface;
 static pthread_mutex_t close_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t close_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t close_done = PTHREAD_COND_INITIALIZER;
@@ -301,6 +304,7 @@ closer_main(void *arg)
 		handle = close_q[close_head].handle;
 		address = close_q[close_head].address;
 		size = close_q[close_head].size;
+		close_busy_surface = close_q[close_head].surface;
 		close_head = (close_head + 1) % JT_CLOSE_QUEUE;
 		close_count--;
 		close_busy = 1;
@@ -315,6 +319,7 @@ closer_main(void *arg)
 		(void)jt_bo_release(g, handle);
 		pthread_mutex_lock(&close_lock);
 		close_busy = 0;
+		close_busy_surface = 0;
 		pthread_cond_broadcast(&close_done);
 		pthread_mutex_unlock(&close_lock);
 	}
@@ -334,7 +339,7 @@ jackpotlte_drm_close_drain(void)
 
 /* true when the close was queued (the caller is done) */
 static bool
-close_later(struct jt_gpu *g, uint32_t handle, void *address, uint64_t size)
+close_later(struct jt_gpu *g, uint32_t handle, uint32_t surface, void *address, uint64_t size)
 {
 	bool queued = false;
 
@@ -358,6 +363,7 @@ close_later(struct jt_gpu *g, uint32_t handle, void *address, uint64_t size)
 
 		close_q[at].g = g;
 		close_q[at].handle = handle;
+		close_q[at].surface = surface;
 		close_q[at].address = address;
 		close_q[at].size = size;
 		close_count++;
@@ -380,8 +386,8 @@ buffer_close(struct jt_gpu *g, uint32_t handle)
 	}
 	maps_forget(handle, &address, &size);
 	bo_seq_set(handle, 0);          /* a new buffer under this handle: no job yet */
-	if (!(handle < JT_MAPS && __atomic_exchange_n(&bo_surface[handle], 0, __ATOMIC_ACQ_REL)) &&
-	    close_later(g, handle, address, size)) {
+	if (close_later(g, handle, handle < JT_MAPS ? __atomic_exchange_n(&bo_surface[handle], 0, __ATOMIC_ACQ_REL) : 0,
+	    address, size)) {
 		return 0;
 	}
 	if (address != NULL) {
@@ -703,6 +709,50 @@ wait_seq(struct jt_gpu *g, void *arg, size_t size)
 	return wait_seq_noted(g, request->seq, request->timeout_ns);
 }
 
+/*
+ * Before a surface is imported: the kernel would hand this import the
+ * handle of a buffer of that surface whose close is still queued, so such a
+ * close is taken back (the buffer stays, and its CPU mapping goes back into
+ * maps[] for the next map), and one the closer thread is doing now is waited
+ * for (after it the kernel makes a new buffer).
+ */
+static void
+close_cancel_surface(uint32_t surface)
+{
+	unsigned kept = 0;
+
+	if (surface == 0) {
+		return;
+	}
+	pthread_mutex_lock(&close_lock);
+	while (close_busy && close_busy_surface == surface) {
+		pthread_cond_wait(&close_done, &close_lock);
+	}
+	for (unsigned i = 0; i < close_count; i++) {
+		unsigned at = (close_head + i) % JT_CLOSE_QUEUE;
+
+		if (close_q[at].surface == surface) {
+			uint32_t handle = close_q[at].handle;
+
+			if (close_q[at].address != NULL && handle < JT_MAPS) {
+				pthread_mutex_lock(&gpu_lock);
+				if (maps[handle].address == NULL) {
+					maps[handle].address = close_q[at].address;
+					maps[handle].size = close_q[at].size;
+				}
+				pthread_mutex_unlock(&gpu_lock);
+			}
+			continue;
+		}
+		if (kept != i) {
+			close_q[(close_head + kept) % JT_CLOSE_QUEUE] = close_q[at];
+		}
+		kept++;
+	}
+	close_count = kept;
+	pthread_mutex_unlock(&close_lock);
+}
+
 static int
 surface(struct jt_gpu *g, void *arg, size_t size)
 {
@@ -715,6 +765,9 @@ surface(struct jt_gpu *g, void *arg, size_t size)
 		return -EINVAL;
 	}
 	handle = request->handle;
+	if (request->handle != JACKPOTLTE_DRM_DESCRIBE) {
+		close_cancel_surface(request->surface);
+	}
 	ret = jt_surface_buffer(g, request->surface,
 	    request->handle == JACKPOTLTE_DRM_DESCRIBE ? NULL : &handle, &info);
 	if (ret != 0) {
@@ -722,7 +775,7 @@ surface(struct jt_gpu *g, void *arg, size_t size)
 	}
 	request->handle = info.handle;
 	if (info.handle != 0 && info.handle < JT_MAPS) {
-		__atomic_store_n(&bo_surface[info.handle], 1, __ATOMIC_RELEASE);
+		__atomic_store_n(&bo_surface[info.handle], request->surface, __ATOMIC_RELEASE);
 	}
 	request->size = info.size;
 	request->offset = info.offset;
