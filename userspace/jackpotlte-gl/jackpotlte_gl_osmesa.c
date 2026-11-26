@@ -476,6 +476,20 @@ open_library(void)
          }
       }
    }
+   /* glca25: Mesa without GL error checks (KHR_no_error, Mesa's documented
+    * MESA_NO_ERROR): every GL call CoreAnimation makes skips its validation.
+    * Switch a8gl-noerror "1" (read before Mesa is loaded, like the above). */
+   {
+      FILE *f = fopen("/private/var/mobile/Library/a8gl-noerror", "r");
+      int c = f != NULL ? fgetc(f) : EOF;
+
+      if (f != NULL)
+         fclose(f);
+      if (c == '1') {
+         setenv("MESA_NO_ERROR", "1", 1);
+         say("glca25: MESA_NO_ERROR=1 (a8gl-noerror \"1\")");
+      }
+   }
 
    wanted = getenv("JACKPOTLTE_GL_LIBRARY");
    if (wanted != NULL && wanted[0] != '\0') {

@@ -2016,9 +2016,14 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
           * draw into it) is made again twice a second for 20 s, in case its
           * writer fills it without moving the seed.
           */
-         uint64_t now = mach_absolute_time();
+         uint64_t now;
 
-         if (!copied[i].empty || copied[i].tries >= 40 || now < copied[i].next_try)
+         /* glca25: the time only for an empty copy (mach_absolute_time is a
+          * kernel trap here, ~2 us, and this runs at every bind) */
+         if (!copied[i].empty || copied[i].tries >= 40)
+            break;
+         now = mach_absolute_time();
+         if (now < copied[i].next_try)
             break;
          copied[i].tries++;
          copied[i].next_try = now + 12000000ull;   /* 0.5 s of 24 MHz ticks */
