@@ -1064,6 +1064,7 @@ static void alias_reset(void);
 static int shadow_on;
 static int shadow_cur = -1;             /* the shadow CoreAnimation draws into now, or -1 */
 static void shadow_drawn(void);
+static void shadow_damage(int k, const GLint *box);
 static void shadow_bind(void *context, GLenum target, GLuint framebuffer);
 static void shadow_unredirect(void);
 static void shadow_copy_all(void);
@@ -1928,6 +1929,8 @@ alias_drawn(int k, const GLint *box)
 {
    if (k < 0)
       return;
+   if (shadow_on)
+      shadow_damage(k, box);                   /* glca28d */
    for (unsigned i = 0; i < npend; i++) {
       if (pend[i].screen == k && (box == NULL || alias_overlap(box, pend[i].box))) {
          alias_flush_now();
@@ -2350,7 +2353,12 @@ static struct {
    void *ref;
    bool dirty;                          /* drawn since the last copy */
    bool failed;
+   GLint dmg[4];                        /* glca28d: x0, y0, x1, y1 drawn since the last copy */
+   bool dmg_any, dmg_full;
+   int full_why;                        /* 1 no glca23, 2 no screen index, 3 other context, 4 no box */
 } shadow[SHADOWS];
+static unsigned long shadow_partial;
+static int shadow_log;                  /* a8gl-shadow "1l": a copy's damage every 100 copies */
 static void *shadow_ctx;
 static GLuint shadow_redirected;        /* the shadow framebuffer bound instead of CoreAnimation's, or 0 */
 static unsigned long shadow_copies, shadow_binds, shadow_texbinds;
@@ -2426,7 +2434,7 @@ shadow_name(int k, GLuint panel)
 
 /* READ -> DRAW, the whole buffer, nothing in the way (scissor, colour mask) */
 static void
-shadow_blit(GLuint from, GLuint to, int width, int height, bool discard)
+shadow_blit_box(GLuint from, GLuint to, const GLint box[4], bool discard)
 {
    GLint draw = 0, read = 0;
    GLboolean scissor = gl.is_enabled(0x0C11 /* SCISSOR_TEST */), mask[4];
@@ -2444,13 +2452,21 @@ shadow_blit(GLuint from, GLuint to, int width, int height, bool discard)
    if (scissor)
       gl.disable(0x0C11);
    gl.color_mask(1, 1, 1, 1);
-   gl.blit_framebuffer(0, 0, width, height, 0, 0, width, height, 0x4000 /* COLOR_BUFFER_BIT */,
-                       0x2600 /* NEAREST */);
+   gl.blit_framebuffer(box[0], box[1], box[2], box[3], box[0], box[1], box[2], box[3],
+                       0x4000 /* COLOR_BUFFER_BIT */, 0x2600 /* NEAREST */);
    gl.color_mask(mask[0], mask[1], mask[2], mask[3]);
    if (scissor)
       gl.enable(0x0C11);
    gl.bind_framebuffer(0x8CA8, (GLuint)read);
    gl.bind_framebuffer(0x8CA9, (GLuint)draw);
+}
+
+static void
+shadow_blit(GLuint from, GLuint to, int width, int height, bool discard)
+{
+   const GLint all[4] = { 0, 0, width, height };
+
+   shadow_blit_box(from, to, all, discard);
 }
 
 /* a shadow for the panel buffer texture PANEL (SURFACE, WIDTHxHEIGHT), with its content */
@@ -2591,8 +2607,40 @@ shadow_bind(void *context, GLenum target, GLuint framebuffer)
 static void
 shadow_drawn(void)
 {
-   if (shadow_cur >= 0)
+   if (shadow_cur >= 0) {
       shadow[shadow_cur].dirty = true;
+      /* glca28d: glca23 reports each draw's box (shadow_damage); without it, all of it */
+      if (!alias_on || cur_scr < 0 || alias_ctx != shadow_ctx) {
+         shadow[shadow_cur].dmg_full = true;
+         shadow[shadow_cur].full_why = !alias_on ? 1 : cur_scr < 0 ? 2 : 3;
+      }
+   }
+}
+
+/* glca28d: screen K (glca23's index) drawn over BOX (NULL: all of it) */
+static void
+shadow_damage(int k, const GLint *box)
+{
+   int s = shadow_of(scr[k].texture);
+
+   if (s < 0 || shadow[s].failed)
+      return;
+   if (box == NULL) {
+      shadow[s].dmg_full = true;
+      shadow[s].full_why = 4;
+      return;
+   }
+   if (box[2] <= box[0] || box[3] <= box[1])
+      return;
+   if (!shadow[s].dmg_any) {
+      memcpy(shadow[s].dmg, box, sizeof(shadow[s].dmg));
+      shadow[s].dmg_any = true;
+      return;
+   }
+   shadow[s].dmg[0] = box[0] < shadow[s].dmg[0] ? box[0] : shadow[s].dmg[0];
+   shadow[s].dmg[1] = box[1] < shadow[s].dmg[1] ? box[1] : shadow[s].dmg[1];
+   shadow[s].dmg[2] = box[2] > shadow[s].dmg[2] ? box[2] : shadow[s].dmg[2];
+   shadow[s].dmg[3] = box[3] > shadow[s].dmg[3] ? box[3] : shadow[s].dmg[3];
 }
 
 /* before a call that changes the bound framebuffer itself: CoreAnimation's own, not the shadow's */
@@ -2613,11 +2661,26 @@ shadow_copy_all(void)
    for (int k = 0; k < SHADOWS; k++) {
       if (shadow[k].panel == 0 || shadow[k].failed || !shadow[k].dirty)
          continue;
-      shadow_blit(shadow[k].fbo, shadow[k].panel_fbo, shadow[k].width, shadow[k].height, true);
+      if ((shadow_copies % 100) == 50 && shadow_log)
+         say("glca28d: copy %lu of shadow %d: damage %s (why %d) %d,%d-%d,%d", shadow_copies, k,
+             shadow[k].dmg_full ? "FULL" : shadow[k].dmg_any ? "box" : "none", shadow[k].full_why,
+             shadow[k].dmg[0], shadow[k].dmg[1], shadow[k].dmg[2], shadow[k].dmg[3]);
+      if (shadow[k].dmg_any && !shadow[k].dmg_full &&
+          (int64_t)(shadow[k].dmg[2] - shadow[k].dmg[0]) * (shadow[k].dmg[3] - shadow[k].dmg[1]) <
+          (int64_t)shadow[k].width * shadow[k].height * 3 / 4) {
+         /* glca28d: only what was drawn since its last copy (the rest is the same in both) */
+         shadow_blit_box(shadow[k].fbo, shadow[k].panel_fbo, shadow[k].dmg, false);
+         shadow_partial++;
+      } else {
+         shadow_blit(shadow[k].fbo, shadow[k].panel_fbo, shadow[k].width, shadow[k].height, true);
+      }
       shadow[k].dirty = false;
+      shadow[k].dmg_any = false;
+      shadow[k].dmg_full = false;
+      shadow[k].full_why = 0;
       if (++shadow_copies <= 4 || shadow_copies % 3000 == 0)
-         say("glca28: %lu shadow copies, %lu framebuffer binds and %lu texture binds sent to a shadow",
-             shadow_copies, shadow_binds, shadow_texbinds);
+         say("glca28: %lu shadow copies (%lu of only the part drawn), %lu framebuffer binds and %lu "
+             "texture binds sent to a shadow", shadow_copies, shadow_partial, shadow_binds, shadow_texbinds);
    }
    /* the shadow stays bound for CoreAnimation: shadow_blit put the bindings back */
 }
@@ -2992,6 +3055,7 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
             int c = f != NULL ? fgetc(f) : 0;
 
             shadow_on = c == '1' ? 1 : c == '2' ? 2 : 0;
+            shadow_log = f != NULL && fgetc(f) == 'l';
          }
          if (f != NULL)
             fclose(f);
