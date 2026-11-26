@@ -1604,6 +1604,7 @@ struct bounds_state {
    GLint program;          /* glca23: the program, -1 when not asked */
    bool known;             /* glca23: drawn is the draw's box on a screen-sized target */
    GLint drawn[4];         /* x0, y0, x1, y1 */
+   bool empty;             /* glca24: its vertices have no width or no height */
 };
 
 static bool
@@ -1635,6 +1636,7 @@ bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struc
    state->active = false;
    state->program = -1;
    state->known = false;
+   state->empty = false;
    if (!bounds_on || count <= 0 || count > 4096 || gl.get_uniformfv == NULL ||
        gl.get_attrib_location == NULL || gl.scissor == NULL)
       return false;
@@ -1677,11 +1679,6 @@ bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struc
    }
    gl.get_uniformfv((GLuint)program, matrix, m);
    gl.get_integerv(0x0BA2 /* VIEWPORT */, vp);
-   /* glca21c: screen-sized targets only (the panel's buffers, CoreAnimation's
-    * full-screen offscreen); small offscreen passes are small already, and
-    * glca21 cut the Dynamic Island in one of them */
-   if (vp[2] < 1000 || vp[3] < 2000)
-      goto left;
    for (GLsizei i = 0; i < count; i++) {
       GLuint index;
       float x, y;
@@ -1701,6 +1698,14 @@ bounds_begin(GLint first, GLsizei count, GLenum type, const void *indices, struc
       miny = y < miny ? y : miny;
       maxy = y > maxy ? y : maxy;
    }
+   /* glca24: every vertex on one line (the Dynamic Island's capsules draw
+    * their straight middle part with no height when they are round) */
+   state->empty = count >= 3 && (maxx - minx == 0.f || maxy - miny == 0.f);
+   /* glca21c: screen-sized targets only (the panel's buffers, CoreAnimation's
+    * full-screen offscreen); small offscreen passes are small already, and
+    * glca21 cut the Dynamic Island in one of them */
+   if (vp[2] < 1000 || vp[3] < 2000)
+      goto left;
    {
       GLint x0 = (GLint)__builtin_floorf(minx) - 2, y0 = (GLint)__builtin_floorf(miny) - 2;
       GLint x1 = (GLint)__builtin_ceilf(maxx) + 2, y1 = (GLint)__builtin_ceilf(maxy) + 2;
@@ -2390,6 +2395,29 @@ my_glDrawElementsInstanced(void *context, GLenum mode, GLsizei count, GLenum typ
    next_draw_elements_instanced(context, mode, count, type, indices, instances);
 }
 
+
+/*
+ * glca24: a triangle draw whose vertices all lie on one line covers no pixel,
+ * yet costs a Mesa draw (state, descriptors, a job entry): the Dynamic
+ * Island's capsules draw 7 of their ~41 draws a frame like that (prog 9, the
+ * straight middle part, no height when the capsule is round).  Such a draw
+ * is left out after any held clear is done; switch a8gl-zero "0".
+ */
+static int zero_on = 1;
+static unsigned long zero_skipped;
+
+static bool
+zero_skip(bool ours, GLenum mode, struct bounds_state *bounds, bool cut)
+{
+   if (!zero_on || ours || !bounds->empty || (mode != 4 && mode != 5 && mode != 6))
+      return false;
+   zero_skipped++;
+   if (cut)
+      bounds_end(bounds);
+   if ((zero_skipped & 4095) == 1)
+      say("glca24: %lu draws with no area left out", zero_skipped);
+   return true;
+}
 static void
 my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 {
@@ -2410,6 +2438,8 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
    if (held.active)
       held_clear_now();
    cut = bounds_begin(first, count, 0, NULL, &bounds);
+   if (zero_skip(ours, mode, &bounds, cut))
+      return;           /* glca24 */
    alias_begin(context, first, count, 0, NULL, &bounds, &as);   /* glca23 */
    next_draw_arrays(context, mode, first, count);
    alias_end(&as);
@@ -2442,6 +2472,8 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
    if (held.active)
       held_clear_now();
    cut = bounds_begin(0, count, type, indices, &bounds);
+   if (zero_skip(ours, mode, &bounds, cut))
+      return;           /* glca24 */
    alias_begin(context, 0, count, type, indices, &bounds, &as);  /* glca23 */
    next_draw_elements(context, mode, count, type, indices);
    alias_end(&as);
@@ -2513,6 +2545,10 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
             fclose(f);
          f = fopen("/private/var/mobile/Library/a8gl-alias", "r");         /* glca23 */
          alias_on = !(f != NULL && fgetc(f) == '0');
+         if (f != NULL)
+            fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-zero", "r");          /* glca24 */
+         zero_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
             fclose(f);
          f = fopen("/private/var/mobile/Library/a8gl-alt", "r");            /* glca22 */
@@ -2593,4 +2629,5 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
    } else {
       alias_on = 0;
    }
+   say("glca24: triangle draws with no area are %s (a8gl-zero \"0\" keeps them)", zero_on ? "left out" : "kept");
 }
