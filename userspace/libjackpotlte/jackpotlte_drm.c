@@ -104,6 +104,53 @@ bo_seq_set(uint32_t handle, uint64_t seq)
 	}
 }
 
+/*
+ * xnu 0225: the kernel's last finished job, live, from the done page
+ * (jt_done_page), so "idle" needs no call and, for a look (timeout 0),
+ * neither does "busy": jobs finish in order, and bo_seq[] is the same
+ * record of each buffer's last job the kernel keeps (0154).  Without the
+ * page (an older kernel, or /private/var/mobile/Library/a8gl-donepage "0")
+ * done_seq is what kernel waits reported, and only "idle" is answered here.
+ */
+static int donepage_mode = -1;                  /* -1 not read yet, 0 off, 1 on */
+
+static const volatile uint64_t *
+done_page(struct jt_gpu *g)
+{
+	if (donepage_mode < 0) {
+		char c = '1';
+		int fd = open("/private/var/mobile/Library/a8gl-donepage", O_RDONLY | O_CLOEXEC);
+
+		if (fd >= 0) {
+			if (read(fd, &c, 1) != 1) {
+				c = '1';
+			}
+			close(fd);
+		}
+		donepage_mode = c == '0' ? 0 : 1;
+	}
+	return donepage_mode > 0 ? jt_done_page(g) : NULL;
+}
+
+/* The highest job known to be finished; *live: it came from the page. */
+static uint64_t
+done_now(struct jt_gpu *g, bool *live)
+{
+	const volatile uint64_t *page = done_page(g);
+	uint64_t done = __atomic_load_n(&done_seq, __ATOMIC_ACQUIRE);
+
+	*live = page != NULL;
+	if (page != NULL) {
+		uint64_t now = __atomic_load_n(&page[0], __ATOMIC_ACQUIRE);
+
+		if (now > done) {
+			note_done(now);
+			done = now;
+		}
+	}
+	return done;
+}
+
 /* A kernel wait for job `seq`; a success says every job up to it is done. */
 static void held_flush(struct jt_gpu *g);     /* 0218 */
 
@@ -113,6 +160,16 @@ wait_seq_noted(struct jt_gpu *g, uint64_t seq, int64_t timeout_ns)
 	int ret;
 
 	held_flush(g);                  /* 0218: never wait behind a held submit */
+	{
+		bool live;
+
+		if (seq <= done_now(g, &live)) {
+			return 0;               /* done: no call (0225 page, or an earlier wait) */
+		}
+		if (live && timeout_ns == 0) {
+			return -ETIMEDOUT;      /* a look, and the page says not yet */
+		}
+	}
 	ret = jt_wait_seq(g, seq, timeout_ns);
 
 	if (ret == 0) {
@@ -278,6 +335,7 @@ static struct {
 	uint32_t surface;               /* the surface it came from, 0 for none */
 	void *address;
 	uint64_t size;
+	uint64_t seq;                   /* its bo_seq[] before the close, put back if taken back */
 } close_q[JT_CLOSE_QUEUE];
 static unsigned close_head, close_count, close_busy;
 static uint32_t close_busy_surface;
@@ -339,7 +397,8 @@ jackpotlte_drm_close_drain(void)
 
 /* true when the close was queued (the caller is done) */
 static bool
-close_later(struct jt_gpu *g, uint32_t handle, uint32_t surface, void *address, uint64_t size)
+close_later(struct jt_gpu *g, uint32_t handle, uint32_t surface, void *address, uint64_t size,
+    uint64_t seq)
 {
 	bool queued = false;
 
@@ -366,6 +425,7 @@ close_later(struct jt_gpu *g, uint32_t handle, uint32_t surface, void *address, 
 		close_q[at].surface = surface;
 		close_q[at].address = address;
 		close_q[at].size = size;
+		close_q[at].seq = seq;
 		close_count++;
 		queued = true;
 		pthread_cond_signal(&close_cond);
@@ -380,14 +440,17 @@ buffer_close(struct jt_gpu *g, uint32_t handle)
 {
 	void *address = NULL;
 	uint64_t size = 0;
+	uint64_t last;
 
 	if (handle == 0) {
 		return -EINVAL;
 	}
+	last = handle < JT_MAPS ? __atomic_load_n(&bo_seq[handle], __ATOMIC_ACQUIRE) : BO_SEQ_BUSY;
+
 	maps_forget(handle, &address, &size);
 	bo_seq_set(handle, 0);          /* a new buffer under this handle: no job yet */
 	if (close_later(g, handle, handle < JT_MAPS ? __atomic_exchange_n(&bo_surface[handle], 0, __ATOMIC_ACQ_REL) : 0,
-	    address, size)) {
+	    address, size, last)) {
 		return 0;
 	}
 	if (address != NULL) {
@@ -599,8 +662,15 @@ wait_bo(struct jt_gpu *g, void *arg, size_t size)
 	}
 	if (request->handle < JT_MAPS) {
 		seq = __atomic_load_n(&bo_seq[request->handle], __ATOMIC_ACQUIRE);
-		if (seq != BO_SEQ_BUSY && seq <= __atomic_load_n(&done_seq, __ATOMIC_ACQUIRE)) {
-			return 0;       /* its last job is done: idle, no round trip */
+		if (seq != BO_SEQ_BUSY) {
+			bool live;
+
+			if (seq <= done_now(g, &live)) {
+				return 0;       /* its last job is done: idle, no round trip */
+			}
+			if (live && request->timeout_ns == 0) {
+				return -ETIMEDOUT;      /* 0225: a look, and its job is not done yet */
+			}
 		}
 	}
 	ret = jt_wait_bo(g, request->handle, request->timeout_ns);
@@ -734,6 +804,9 @@ close_cancel_surface(uint32_t surface)
 		if (close_q[at].surface == surface) {
 			uint32_t handle = close_q[at].handle;
 
+			/* the buffer stays, with the job it was last in (the
+			 * kernel's record still names it): not "idle" until then */
+			bo_seq_set(handle, close_q[at].seq);
 			if (close_q[at].address != NULL && handle < JT_MAPS) {
 				pthread_mutex_lock(&gpu_lock);
 				if (maps[handle].address == NULL) {

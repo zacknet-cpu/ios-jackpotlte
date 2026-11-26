@@ -15,6 +15,8 @@
 struct jt_gpu {
 	const struct jt_backend *backend;
 	void                    *ctx;
+	void                    *done_page;     /* xnu 0225, NULL without it */
+	uint64_t                 done_size;
 };
 
 /*
@@ -59,8 +61,32 @@ jt_gpu_open(struct jt_gpu **out, const struct jt_backend *backend, void *ctx)
 	}
 	g->backend = backend;
 	g->ctx = ctx;
+	{
+		/* xnu 0225: the done page.  An older kernel refuses the type
+		 * (no such buffer); a mapping without the magic is let go. */
+		void *page = NULL;
+		uint64_t size = 0;
+
+		if (backend->map(ctx, JT_DONE_PAGE_TYPE, &page, &size) == JT_IORETURN_SUCCESS &&
+		    page != NULL) {
+			if (size >= 3 * sizeof(uint64_t) &&
+			    __atomic_load_n(&((const volatile uint64_t *) page)[1], __ATOMIC_ACQUIRE) ==
+			    JT_DONE_PAGE_MAGIC) {
+				g->done_page = page;
+				g->done_size = size;
+			} else {
+				backend->unmap(ctx, JT_DONE_PAGE_TYPE, page, size);
+			}
+		}
+	}
 	*out = g;
 	return 0;
+}
+
+const volatile uint64_t *
+jt_done_page(struct jt_gpu *g)
+{
+	return g != NULL ? (const volatile uint64_t *) g->done_page : NULL;
 }
 
 void
@@ -68,6 +94,10 @@ jt_gpu_close(struct jt_gpu *g)
 {
 	if (g == NULL) {
 		return;
+	}
+	if (g->done_page != NULL) {
+		g->backend->unmap(g->ctx, JT_DONE_PAGE_TYPE, g->done_page, g->done_size);
+		g->done_page = NULL;
 	}
 	g->backend->close(g->ctx);
 	free(g);

@@ -139,8 +139,49 @@ open_with(struct fake **fp)
 	G.kr = JT_IORETURN_SUCCESS;
 	G.map_kr = JT_IORETURN_SUCCESS;
 	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	/* the open's own look for the done page (xnu 0225) is not what the
+	 * tests count */
+	G.maps = 0;
+	G.unmaps = 0;
+	G.selector = 0;
+	G.unmap_handle = 0;
 	*fp = &G;
 	return g;
+}
+
+/* xnu 0225: the done page is mapped at open, kept only with its magic, and
+ * let go at close; an older kernel's refusal leaves none. */
+static void
+test_done_page(void)
+{
+	static uint64_t page[4] = { 5, JT_DONE_PAGE_MAGIC, 9, 0 };
+	struct jt_gpu *g = NULL;
+
+	memset(&G, 0, sizeof(G));
+	G.kr = JT_IORETURN_SUCCESS;
+	G.map_address = page;
+	G.map_size = sizeof(page);
+	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	CHECK(G.maps == 1 && G.selector == JT_DONE_PAGE_TYPE, "the done page was not asked for");
+	CHECK(jt_done_page(g) == page && jt_done_page(g)[0] == 5, "the done page was not kept");
+	jt_gpu_close(g);
+	CHECK(G.unmaps == 1 && G.unmap_handle == JT_DONE_PAGE_TYPE, "the done page was not let go");
+
+	page[1] = 0;
+	memset(&G, 0, sizeof(G));
+	G.map_address = page;
+	G.map_size = sizeof(page);
+	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	CHECK(jt_done_page(g) == NULL && G.unmaps == 1, "a page without the magic was kept");
+	jt_gpu_close(g);
+	page[1] = JT_DONE_PAGE_MAGIC;
+
+	memset(&G, 0, sizeof(G));
+	G.map_kr = JT_IORETURN_BAD_ARGUMENT;
+	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	CHECK(jt_done_page(g) == NULL && G.unmaps == 0, "an older kernel's refusal left a page");
+	jt_gpu_close(g);
+	CHECK(G.unmaps == 0, "close let go of a page that was never there");
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -644,6 +685,7 @@ main(void)
 	test_open();
 	test_create_bo();
 	test_map();
+	test_done_page();
 	test_submit();
 	test_waits();
 	test_param_and_release();

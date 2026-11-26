@@ -193,6 +193,16 @@ uint64_t jt_submit(struct jt_gpu *g, uint64_t chain, bool fragment,
 int  jt_wait_bo(struct jt_gpu *g, uint32_t handle, int64_t timeout_ns);
 int  jt_wait_seq(struct jt_gpu *g, uint64_t seq, int64_t timeout_ns);
 
+/*
+ * xnu 0225: the last finished job's number, live, in a page the kernel maps
+ * read-only (client memory type JT_DONE_PAGE_TYPE): [0] the last finished
+ * job, [1] JT_DONE_PAGE_MAGIC, [2] the last queued one.  NULL with an older
+ * kernel.  Mapped once when the connection opens.
+ */
+#define JT_DONE_PAGE_TYPE        0x7fff0000u
+#define JT_DONE_PAGE_MAGIC       0x31454e4f44384141ull  /* "AA8DONE1" */
+const volatile uint64_t *jt_done_page(struct jt_gpu *g);
+
 int  jt_surface_buffer(struct jt_gpu *g, uint32_t surface, uint32_t *handle,
     struct jt_surface_req *info);
 
