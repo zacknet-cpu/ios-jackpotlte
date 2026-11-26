@@ -105,6 +105,14 @@ static struct {
    void (*get_tex_parameteriv)(GLenum, GLenum, GLint *);
    void (*get_uniformiv)(GLuint, GLint, GLint *);
    void (*real_flush)(void);
+   void (*gen_framebuffers)(GLsizei, GLuint *);             /* glca28 */
+   void (*delete_framebuffers)(GLsizei, const GLuint *);
+   void (*bind_framebuffer)(GLenum, GLuint);
+   void (*framebuffer_texture_2d)(GLenum, GLenum, GLenum, GLuint, GLint);
+   GLenum (*check_framebuffer_status)(GLenum);
+   void (*tex_image_2d)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+   void (*blit_framebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+   void (*invalidate_framebuffer)(GLenum, GLsizei, const GLenum *);
    int loaded;
 } gl;
 
@@ -196,6 +204,14 @@ load(void)
    PROC(get_tex_parameteriv, "glGetTexParameteriv");
    PROC(get_uniformiv, "glGetUniformiv");
    PROC(real_flush, "glFlush");
+   PROC(gen_framebuffers, "glGenFramebuffers");                    /* glca28 */
+   PROC(delete_framebuffers, "glDeleteFramebuffers");
+   PROC(bind_framebuffer, "glBindFramebuffer");
+   PROC(framebuffer_texture_2d, "glFramebufferTexture2D");
+   PROC(check_framebuffer_status, "glCheckFramebufferStatus");
+   PROC(tex_image_2d, "glTexImage2D");
+   PROC(blit_framebuffer, "glBlitFramebuffer");
+   PROC(invalidate_framebuffer, "glInvalidateFramebuffer");
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -1044,6 +1060,13 @@ static int cur_scr = -1;
 static void alias_drawn(int k, const GLint *box);
 static void alias_target(void *context);
 static void alias_reset(void);
+/* glca28 (below) */
+static int shadow_on;
+static int shadow_cur = -1;             /* the shadow CoreAnimation draws into now, or -1 */
+static void shadow_drawn(void);
+static void shadow_bind(void *context, GLenum target, GLuint framebuffer);
+static void shadow_unredirect(void);
+static void shadow_copy_all(void);
 static void (*next_clear)(void *, GLbitfield);
 static void (*next_bind_framebuffer)(void *, GLenum, GLuint);
 static void (*next_framebuffer_texture_2d)(void *, GLenum, GLenum, GLenum, GLuint, GLint);
@@ -1096,6 +1119,7 @@ held_procs(void)
 static void
 my_glClear(void *context, GLbitfield mask)
 {
+   shadow_drawn();                             /* glca28 */
    jackpotlte_gl_use(context);
    load();
    if (held.active)
@@ -1131,6 +1155,8 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
       load();
       alias_target(context);                   /* glca23 */
    }
+   if (shadow_on)
+      shadow_bind(context, target, framebuffer);       /* glca28 */
 }
 
 static void
@@ -1140,6 +1166,8 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
    jackpotlte_gl_use(context);
    if (held.active)
       held_clear_now();
+   if (shadow_on)
+      shadow_unredirect();                     /* glca28: the attach is for CoreAnimation's framebuffer */
    next_framebuffer_texture_2d(context, target, attachment, textarget, texture, level);
    if (attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */) {
       if (cur_fb < FB_NAMES)
@@ -1150,6 +1178,8 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
       load();
       alias_target(context);                   /* glca23 */
    }
+   if (shadow_on)
+      shadow_bind(context, target == 0x8CA8 /* READ_FRAMEBUFFER */ ? target : 0x8CA9, cur_fb);  /* glca28 */
 }
 
 static void
@@ -1169,6 +1199,10 @@ my_glFlush(void *context)
       jackpotlte_gl_use(context);
       held_clear_now();
    }
+   if (shadow_on) {
+      jackpotlte_gl_use(context);
+      shadow_copy_all();                       /* glca28 */
+   }
    next_flush(context);
    alias_reset();                              /* glca23 */
 }
@@ -1180,6 +1214,10 @@ my_glFinish(void *context)
       jackpotlte_gl_use(context);
       held_clear_now();
    }
+   if (shadow_on) {
+      jackpotlte_gl_use(context);
+      shadow_copy_all();                       /* glca28 */
+   }
    next_finish(context);
    alias_reset();                              /* glca23 */
 }
@@ -1190,6 +1228,10 @@ my_glFenceSync(void *context, GLenum condition, GLbitfield flags)
    if (held.active) {
       jackpotlte_gl_use(context);
       held_clear_now();
+   }
+   if (shadow_on) {
+      jackpotlte_gl_use(context);
+      shadow_copy_all();                       /* glca28 */
    }
    {
       GLsync fence = next_fence_sync(context, condition, flags);
@@ -2265,6 +2307,327 @@ my_glActiveTexture(void *context, GLenum unit)
       active_unit = (GLint)(unit - GL_TEXTURE0) < ALIAS_UNITS ? (GLint)(unit - GL_TEXTURE0) : 0;
 }
 
+/*
+ * glca28: panel shadows (a8gl-shadow "1").  Every pass into a panel buffer
+ * (the panel's own memory and the second scan-out buffer) was a fragment
+ * job the kernel holds until the panel took the last flip, and each one
+ * preloads and writes back the whole 9.6 MB buffer: 11 of pages' ~14
+ * fragment jobs a frame name a panel buffer (11-26; GPU 13 ms a frame), and
+ * with the hold switched off pages ran 6% and Control Center 12% faster.
+ * So CoreAnimation draws into a shadow texture of each panel buffer instead
+ * (made by Mesa, so compressed (AFBC), and not a scan-out buffer: never
+ * held), every bind of the panel buffer's texture binds the shadow (so its
+ * backdrop copies read what it drew), and at the end of the frame (the
+ * glFlush, glFinish or glFenceSync before SwapEnd) the shadow is copied into
+ * the panel buffer in one pass with its old contents thrown away: the only
+ * job the panel holds.  One shadow per panel buffer keeps its content from
+ * frame to frame, as CoreAnimation's partial redraws expect.  glca23's second
+ * textures read the real buffer, so they are off with this.
+ */
+#define SHADOWS 4
+#define SHADOW_NAMES 4
+static struct {
+   GLuint panel;                        /* CoreAnimation's first texture of the panel buffer (the copy's target) */
+   GLuint names[SHADOW_NAMES];          /* all its textures of that surface (11-26: two of surface 1) */
+   uint32_t surface;
+   int width, height;
+   GLuint tex, fbo;                     /* the shadow and its framebuffer */
+   GLuint panel_fbo;                    /* ours, with the panel buffer in it: the copy's target */
+   bool dirty;                          /* drawn since the last copy */
+   bool failed;
+} shadow[SHADOWS];
+static void *shadow_ctx;
+static GLuint shadow_redirected;        /* the shadow framebuffer bound instead of CoreAnimation's, or 0 */
+static unsigned long shadow_copies, shadow_binds, shadow_texbinds;
+
+static bool
+shadow_procs(void)
+{
+   return gl.gen_framebuffers && gl.delete_framebuffers && gl.bind_framebuffer && gl.framebuffer_texture_2d &&
+          gl.check_framebuffer_status && gl.tex_image_2d && gl.blit_framebuffer && gl.bind_texture &&
+          gl.gen_textures && gl.delete_textures && gl.tex_parameteri && gl.get_tex_parameteriv &&
+          gl.get_integerv && gl.is_enabled && gl.enable && gl.disable && gl.get_booleanv && gl.color_mask;
+}
+
+static int
+shadow_of(GLuint panel)
+{
+   if (panel == 0)
+      return -1;
+   for (int k = 0; k < SHADOWS; k++)
+      for (int n = 0; n < SHADOW_NAMES; n++)
+         if (shadow[k].names[n] == panel)
+            return k;
+   return -1;
+}
+
+static int
+shadow_of_surface(uint32_t surface)
+{
+   for (int k = 0; k < SHADOWS; k++)
+      if (shadow[k].panel != 0 && shadow[k].surface == surface)
+         return k;
+   return -1;
+}
+
+/* PANEL is one more texture of shadow K's surface */
+static bool
+shadow_name(int k, GLuint panel)
+{
+   for (int n = 0; n < SHADOW_NAMES; n++)
+      if (shadow[k].names[n] == 0) {
+         shadow[k].names[n] = panel;
+         say("glca28: texture %u is another texture of surface %u: same shadow %u", panel,
+             shadow[k].surface, shadow[k].tex);
+         return true;
+      }
+   return false;
+}
+
+/* READ -> DRAW, the whole buffer, nothing in the way (scissor, colour mask) */
+static void
+shadow_blit(GLuint from, GLuint to, int width, int height, bool discard)
+{
+   GLint draw = 0, read = 0;
+   GLboolean scissor = gl.is_enabled(0x0C11 /* SCISSOR_TEST */), mask[4];
+
+   gl.get_integerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &draw);
+   gl.get_integerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &read);
+   gl.get_booleanv(0x0C23 /* COLOR_WRITEMASK */, mask);
+   gl.bind_framebuffer(0x8CA8 /* READ_FRAMEBUFFER */, from);
+   gl.bind_framebuffer(0x8CA9 /* DRAW_FRAMEBUFFER */, to);
+   if (discard && gl.invalidate_framebuffer != NULL) {
+      GLenum colour = 0x8CE0;           /* COLOR_ATTACHMENT0 */
+
+      gl.invalidate_framebuffer(0x8CA9, 1, &colour);
+   }
+   if (scissor)
+      gl.disable(0x0C11);
+   gl.color_mask(1, 1, 1, 1);
+   gl.blit_framebuffer(0, 0, width, height, 0, 0, width, height, 0x4000 /* COLOR_BUFFER_BIT */,
+                       0x2600 /* NEAREST */);
+   gl.color_mask(mask[0], mask[1], mask[2], mask[3]);
+   if (scissor)
+      gl.enable(0x0C11);
+   gl.bind_framebuffer(0x8CA8, (GLuint)read);
+   gl.bind_framebuffer(0x8CA9, (GLuint)draw);
+}
+
+/* a shadow for the panel buffer texture PANEL (SURFACE, WIDTHxHEIGHT), with its content */
+static int
+shadow_make(GLuint panel, uint32_t surface, int width, int height)
+{
+   GLint tex = 0, draw = 0, read = 0, filter[4];
+   GLuint t = 0, f[2] = { 0, 0 };
+   int k;
+   bool good;
+
+   for (k = 0; k < SHADOWS && shadow[k].panel != 0; k++)
+      ;
+   if (k == SHADOWS)
+      return -1;
+   memset(&shadow[k], 0, sizeof(shadow[k]));
+   shadow[k].panel = panel;
+   shadow[k].names[0] = panel;
+   shadow[k].surface = surface;
+   shadow[k].width = width;
+   shadow[k].height = height;
+   gl.get_integerv(GL_TEXTURE_BINDING_2D, &tex);
+   gl.get_integerv(0x8CA6, &draw);
+   gl.get_integerv(0x8CAA, &read);
+   gl.bind_texture(GL_TEXTURE_2D, panel);
+   gl.get_tex_parameteriv(GL_TEXTURE_2D, 0x2801 /* MIN_FILTER */, &filter[0]);
+   gl.get_tex_parameteriv(GL_TEXTURE_2D, 0x2800 /* MAG_FILTER */, &filter[1]);
+   gl.get_tex_parameteriv(GL_TEXTURE_2D, 0x2802 /* WRAP_S */, &filter[2]);
+   gl.get_tex_parameteriv(GL_TEXTURE_2D, 0x2803 /* WRAP_T */, &filter[3]);
+   gl.gen_textures(1, &t);
+   gl.bind_texture(GL_TEXTURE_2D, t);
+   gl.tex_image_2d(GL_TEXTURE_2D, 0, 0x8058 /* RGBA8 */, width, height, 0, 0x1908 /* RGBA */,
+                   0x1401 /* UNSIGNED_BYTE */, NULL);
+   gl.tex_parameteri(GL_TEXTURE_2D, 0x2801, filter[0]);
+   gl.tex_parameteri(GL_TEXTURE_2D, 0x2800, filter[1]);
+   gl.tex_parameteri(GL_TEXTURE_2D, 0x2802, filter[2]);
+   gl.tex_parameteri(GL_TEXTURE_2D, 0x2803, filter[3]);
+   gl.gen_framebuffers(2, f);
+   gl.bind_framebuffer(0x8CA9, f[0]);
+   gl.framebuffer_texture_2d(0x8CA9, 0x8CE0, GL_TEXTURE_2D, t, 0);
+   gl.bind_framebuffer(0x8CA8, f[1]);
+   gl.framebuffer_texture_2d(0x8CA8, 0x8CE0, GL_TEXTURE_2D, panel, 0);
+   good = t != 0 && f[0] != 0 && f[1] != 0 &&
+          gl.check_framebuffer_status(0x8CA9) == 0x8CD5 /* FRAMEBUFFER_COMPLETE */ &&
+          gl.check_framebuffer_status(0x8CA8) == 0x8CD5;
+   gl.bind_texture(GL_TEXTURE_2D, (GLuint)tex);
+   gl.bind_framebuffer(0x8CA8, (GLuint)read);
+   gl.bind_framebuffer(0x8CA9, (GLuint)draw);
+   if (!good) {
+      if (t != 0)
+         gl.delete_textures(1, &t);
+      gl.delete_framebuffers(2, f);
+      shadow[k].failed = true;
+      say("glca28: no shadow for panel buffer texture %u (surface %u): drawn as before", panel, surface);
+      return k;
+   }
+   shadow[k].tex = t;
+   shadow[k].fbo = f[0];
+   shadow[k].panel_fbo = f[1];
+   shadow_blit(f[1], f[0], width, height, true);   /* what the panel buffer holds now */
+   say("glca28: panel buffer texture %u (surface %u, %dx%d) is drawn into shadow texture %u "
+       "(framebuffer %u) and copied at each frame's end", panel, surface, width, height, t, f[0]);
+   return k;
+}
+
+/* CoreAnimation bound FRAMEBUFFER to TARGET: its panel buffer's shadow instead */
+static void shadow_forget(GLuint texture);
+
+static void
+shadow_bind(void *context, GLenum target, GLuint framebuffer)
+{
+   GLuint panel = framebuffer < FB_NAMES ? fb_tex[framebuffer] : 0;
+   int k, width = 0, height = 0;
+   uint32_t surface;
+
+   if (target == 0x8D40 || target == 0x8CA9) {
+      shadow_redirected = 0;
+      shadow_cur = -1;
+   }
+   if (panel == 0 || (shadow_ctx != NULL && context != shadow_ctx))
+      return;
+   k = shadow_of(panel);
+   if (k >= 0 && !shadow[k].failed) {
+      surface = jackpotlte_eagl_target_surface(context, panel, &width, &height);
+      if (surface != shadow[k].surface) {
+         /* that texture shows another surface now */
+         shadow_forget(panel);
+         k = -1;
+      }
+   }
+   if (k < 0) {
+      surface = jackpotlte_eagl_target_surface(context, panel, &width, &height);
+      if (surface == 0 || width < 1000 || height < 2000)
+         return;
+      if (!shadow_procs()) {
+         shadow_on = 0;
+         say("glca28: the library lacks a function it needs: off");
+         return;
+      }
+      if (shadow_ctx == NULL)
+         shadow_ctx = context;
+      k = shadow_of_surface(surface);
+      if (k >= 0) {
+         if (!shadow_name(k, panel))
+            return;
+      } else {
+         k = shadow_make(panel, surface, width, height);
+         if (k < 0)
+            return;
+      }
+   }
+   if (shadow[k].failed)
+      return;
+   gl.bind_framebuffer(target, shadow[k].fbo);
+   shadow_binds++;
+   if (target == 0x8D40 || target == 0x8CA9) {
+      shadow_redirected = shadow[k].fbo;
+      shadow_cur = k;
+   }
+}
+
+/* a draw, clear or copy into the bound framebuffer */
+static void
+shadow_drawn(void)
+{
+   if (shadow_cur >= 0)
+      shadow[shadow_cur].dirty = true;
+}
+
+/* before a call that changes the bound framebuffer itself: CoreAnimation's own, not the shadow's */
+static void
+shadow_unredirect(void)
+{
+   if (shadow_redirected != 0) {
+      gl.bind_framebuffer(0x8CA9, cur_fb);
+      shadow_redirected = 0;
+      shadow_cur = -1;
+   }
+}
+
+/* the frame's end: each shadow drawn since its last copy into its panel buffer */
+static void
+shadow_copy_all(void)
+{
+   for (int k = 0; k < SHADOWS; k++) {
+      if (shadow[k].panel == 0 || shadow[k].failed || !shadow[k].dirty)
+         continue;
+      shadow_blit(shadow[k].fbo, shadow[k].panel_fbo, shadow[k].width, shadow[k].height, true);
+      shadow[k].dirty = false;
+      if (++shadow_copies <= 4 || shadow_copies % 3000 == 0)
+         say("glca28: %lu shadow copies, %lu framebuffer binds and %lu texture binds sent to a shadow",
+             shadow_copies, shadow_binds, shadow_texbinds);
+   }
+   /* the shadow stays bound for CoreAnimation: shadow_blit put the bindings back */
+}
+
+/* a bind of a panel buffer's texture: its shadow */
+static void
+shadow_bind_texture(void *context, GLenum target, GLuint texture)
+{
+   int k;
+
+   if (target != GL_TEXTURE_2D || context != shadow_ctx)
+      return;
+   k = shadow_of(texture);
+   if (k >= 0 && !shadow[k].failed && shadow[k].tex != 0) {
+      gl.bind_texture(GL_TEXTURE_2D, shadow[k].tex);
+      shadow_texbinds++;
+   }
+}
+
+/* a texture of a panel buffer is deleted (or shows another surface): the
+ * shadow goes with the last of them */
+static void
+shadow_forget(GLuint texture)
+{
+   int k = shadow_of(texture), left = 0;
+
+   if (k < 0)
+      return;
+   for (int n = 0; n < SHADOW_NAMES; n++) {
+      if (shadow[k].names[n] == texture)
+         shadow[k].names[n] = 0;
+      else if (shadow[k].names[n] != 0)
+         left++;
+   }
+   if (left > 0) {
+      if (shadow[k].panel == texture) {
+         /* the copy's target texture goes: another one of the same memory takes it */
+         GLint read = 0;
+
+         for (int n = 0; n < SHADOW_NAMES; n++)
+            if (shadow[k].names[n] != 0) {
+               shadow[k].panel = shadow[k].names[n];
+               break;
+            }
+         if (shadow[k].panel_fbo != 0) {
+            gl.get_integerv(0x8CAA, &read);
+            gl.bind_framebuffer(0x8CA8, shadow[k].panel_fbo);
+            gl.framebuffer_texture_2d(0x8CA8, 0x8CE0, GL_TEXTURE_2D, shadow[k].panel, 0);
+            gl.bind_framebuffer(0x8CA8, (GLuint)read);
+         }
+      }
+      return;
+   }
+   if (shadow[k].tex != 0) {
+      if (shadow_redirected == shadow[k].fbo)
+         shadow_unredirect();
+      gl.delete_textures(1, &shadow[k].tex);
+      gl.delete_framebuffers(1, &shadow[k].fbo);
+      gl.delete_framebuffers(1, &shadow[k].panel_fbo);
+   }
+   memset(&shadow[k], 0, sizeof(shadow[k]));
+   if (shadow_cur == k)
+      shadow_cur = -1;
+}
+
 static void
 my_glBindTexture(void *context, GLenum target, GLuint texture)
 {
@@ -2272,11 +2635,19 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
    if (target == GL_TEXTURE_2D && (context == alias_ctx || alias_ctx == NULL) && active_unit >= 0 &&
        active_unit < ALIAS_UNITS)
       unit_tex[active_unit] = (GLint)texture;
+   if (shadow_on)
+      shadow_bind_texture(context, target, texture);       /* glca28 */
 }
 
 static void
 my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 {
+   if (shadow_on && context == shadow_ctx && textures != NULL) {
+      jackpotlte_gl_use(context);
+      load();
+      for (GLsizei i = 0; i < n; i++)
+         shadow_forget(textures[i]);           /* glca28 */
+   }
    if (context == alias_ctx && textures != NULL) {
       jackpotlte_gl_use(context);
       load();
@@ -2314,6 +2685,7 @@ static void
 my_glBlitFramebuffer(void *context, GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0,
                      GLint dx1, GLint dy1, GLbitfield mask, GLenum filter)
 {
+   shadow_drawn();                             /* glca28 */
    if (context == alias_ctx) {
       jackpotlte_gl_use(context);
       alias_drawn(cur_scr, NULL);
@@ -2325,6 +2697,7 @@ static void
 my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x,
                        GLint y, GLsizei width, GLsizei height)
 {
+   shadow_drawn();                             /* glca28 */
    if (context == alias_ctx) {
       jackpotlte_gl_use(context);
       load();
@@ -2361,6 +2734,7 @@ static void
 my_glDrawRangeElements(void *context, GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
                        const void *indices)
 {
+   shadow_drawn();                             /* glca28 */
    if (context == alias_ctx) {
       jackpotlte_gl_use(context);
       if (npend > 0)
@@ -2373,6 +2747,7 @@ my_glDrawRangeElements(void *context, GLenum mode, GLuint start, GLuint end, GLs
 static void
 my_glDrawArraysInstanced(void *context, GLenum mode, GLint first, GLsizei count, GLsizei instances)
 {
+   shadow_drawn();                             /* glca28 */
    if (context == alias_ctx) {
       jackpotlte_gl_use(context);
       if (npend > 0)
@@ -2386,6 +2761,7 @@ static void
 my_glDrawElementsInstanced(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices,
                            GLsizei instances)
 {
+   shadow_drawn();                             /* glca28 */
    if (context == alias_ctx) {
       jackpotlte_gl_use(context);
       if (npend > 0)
@@ -2421,6 +2797,7 @@ zero_skip(bool ours, GLenum mode, struct bounds_state *bounds, bool cut)
 static void
 my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 {
+   shadow_drawn();                             /* glca28 */
    struct plain_state state;
    struct bounds_state bounds;
    struct alias_state as;
@@ -2455,6 +2832,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 static void
 my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
+   shadow_drawn();                             /* glca28 */
    struct plain_state state;
    struct bounds_state bounds;
    struct alias_state as;
@@ -2547,6 +2925,12 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
          alias_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
             fclose(f);
+         f = fopen("/private/var/mobile/Library/a8gl-shadow", "r");        /* glca28 */
+         shadow_on = f != NULL && fgetc(f) == '1';
+         if (f != NULL)
+            fclose(f);
+         if (shadow_on)
+            alias_on = 0;              /* its second textures read the real panel buffer */
          f = fopen("/private/var/mobile/Library/a8gl-zero", "r");          /* glca24 */
          zero_on = !(f != NULL && fgetc(f) == '0');
          if (f != NULL)
@@ -2598,6 +2982,7 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
       table_entries[0x30c] = (void *)my_glFenceSync;             /* 0x1860 */
    } else {
       deferclear_on = 0;
+      shadow_on = 0;                   /* glca28 needs those hooks */
    }
 
    /* glca23: texture units, and the writes into a panel buffer it cannot box */
@@ -2611,7 +2996,7 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
    memcpy(&next_draw_range_elements, &table_entries[0x196], sizeof(next_draw_range_elements));
    memcpy(&next_draw_arrays_instanced, &table_entries[0x2fb], sizeof(next_draw_arrays_instanced));
    memcpy(&next_draw_elements_instanced, &table_entries[0x2fc], sizeof(next_draw_elements_instanced));
-   if (alias_on && deferclear_on && next_active_texture && next_bind_texture &&
+   if ((alias_on || shadow_on) && deferclear_on && next_active_texture && next_bind_texture &&
        next_delete_textures && next_blit_framebuffer && next_copy_tex_sub_image_2d && next_copy_tex_image_2d &&
        next_tex_sub_image_2d && next_draw_range_elements && next_draw_arrays_instanced &&
        next_draw_elements_instanced) {
@@ -2625,9 +3010,12 @@ ca_fixes_install(void *table_entries[JACKPOTLTE_GL_SLOTS])
       table_entries[0x196] = (void *)my_glDrawRangeElements;      /* 0x0cb0 */
       table_entries[0x2fb] = (void *)my_glDrawArraysInstanced;    /* 0x17d8 */
       table_entries[0x2fc] = (void *)my_glDrawElementsInstanced;  /* 0x17e0 */
-      say("glca23: backdrop copies may read a second texture of a panel buffer (a8gl-alias \"0\" off)");
+      if (alias_on)
+         say("glca23: backdrop copies may read a second texture of a panel buffer (a8gl-alias \"0\" off)");
    } else {
       alias_on = 0;
+      shadow_on = 0;
    }
+   say("glca28: panel shadows %s (a8gl-shadow \"1\" on)", shadow_on ? "ON" : "off");
    say("glca24: triangle draws with no area are %s (a8gl-zero \"0\" keeps them)", zero_on ? "left out" : "kept");
 }
