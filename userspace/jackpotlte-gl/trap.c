@@ -133,6 +133,119 @@ emit(const char *label, int index, uintptr_t address)
    }
 }
 
+/*
+ * glca29 (P14 Always-On Display, 11-27): CoreAnimation's flipbook renders the
+ * AOD frames off-screen through a CA::OGL::Context whose GL state cache (the
+ * pointer at context+16: bound texture target per unit at +144, texture at
+ * +176) was never set, because Apple ships the flipbook only with Metal.  The
+ * first texture made for an IOSurface then stores through NULL (QuartzCore
+ * 16.7 +0x182fb8: ldr x10,[x21,#16]; ...; strh w8,[x10,#144]) and backboardd
+ * dies at every lock.  Here such a fault is mended once per context: the
+ * faulting instruction's base register is NULL, one of the six instructions
+ * before it loaded that register from [Xc,#16] (LDR Xt,[Xn,#16]), and Xc
+ * looks like a CA::OGL::Context (the GL function table at +2040 is set): the
+ * context gets a zeroed state block (a fresh GL context has nothing bound),
+ * the register is pointed at it and the instruction runs again.  At most
+ * STATE_BLOCKS contexts; anything else goes the usual way.
+ */
+#define STATE_BLOCKS 16
+#define STATE_BYTES 4096
+static uint8_t state_blocks[STATE_BLOCKS][STATE_BYTES] __attribute__((aligned(64)));
+static unsigned state_used;
+
+static const struct image *
+image_named(const char *leafname)
+{
+   unsigned i;
+
+   for (i = 0; i < nimages; i++) {
+      const char *leaf = strrchr(images[i].name, '/');
+
+      leaf = leaf != NULL ? leaf + 1 : images[i].name;
+      if (strcmp(leaf, leafname) == 0) {
+         return &images[i];
+      }
+   }
+   return NULL;
+}
+
+static int
+mend_gl_state(siginfo_t *info, ucontext_t *uc)
+{
+   const struct image *qc = image_named("QuartzCore");
+   uint64_t pc, far, *regs;
+   uint32_t insn, base;
+   int back;
+
+   if (uc == NULL || info == NULL || qc == NULL || state_used >= STATE_BLOCKS) {
+      return 0;
+   }
+   pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+   far = (uint64_t)(uintptr_t)info->si_addr;
+   if (far >= 0x1000 || pc < qc->text || pc + 4 > qc->end || (pc & 3) != 0) {
+      return 0;
+   }
+   regs = (uint64_t *)uc->uc_mcontext->__ss.__x;
+   insn = *(const uint32_t *)(uintptr_t)pc;
+   /* load/store, unsigned immediate offset: bits 29-27 = 111, bit 24 = 1 */
+   if ((insn & 0x3b000000) != 0x39000000) {
+      return 0;
+   }
+   base = (insn >> 5) & 31;
+   if (base >= 29 || regs[base] != 0) {
+      return 0;
+   }
+   for (back = 1; back <= 6; back++) {
+      uint64_t at = pc - 4u * (unsigned)back;
+      uint32_t prev, rn;
+      uint64_t ctx;
+
+      if (at < qc->text) {
+         break;
+      }
+      prev = *(const uint32_t *)(uintptr_t)at;
+      /* LDR Xt, [Xn, #16]: 0xF9400000 | imm12 2 << 10 | Rn << 5 | Rt */
+      if ((prev & 0xfffffc1f) != (0xf9400800u | base)) {
+         continue;
+      }
+      rn = (prev >> 5) & 31;
+      ctx = rn < 29 ? regs[rn] : 0;
+      if (ctx < 0x100000000ull || (ctx & 7) != 0 ||
+          ((const uint64_t *)(uintptr_t)ctx)[2] != 0 ||
+          ((const uint64_t *)(uintptr_t)ctx)[2040 / 8] == 0) {
+         return 0;
+      }
+      /* +16 is the state CA wants, +24 the state last given to GL (the
+       * texture-unit bind at QuartzCore +0x23293c compares the two); both
+       * are unset in this context, and a fresh one has nothing bound */
+      if (state_used + 2 > STATE_BLOCKS) {
+         return 0;
+      }
+      ((uint64_t *)(uintptr_t)ctx)[2] = (uint64_t)(uintptr_t)state_blocks[state_used];
+      regs[base] = (uint64_t)(uintptr_t)state_blocks[state_used];
+      state_used++;
+      if (((const uint64_t *)(uintptr_t)ctx)[3] == 0) {
+         ((uint64_t *)(uintptr_t)ctx)[3] = (uint64_t)(uintptr_t)state_blocks[state_used];
+         state_used++;
+      }
+      {
+         char line[160];
+         int length = snprintf(line, sizeof(line),
+             "JTFIX glca29: QuartzCore + %#llx: GL state of context %#llx was NULL, gave it blocks (+16/+24), %u used\n",
+             (unsigned long long)(pc - qc->base), (unsigned long long)ctx, state_used);
+         if (length > 0) {
+            ssize_t wrote = write(2, line,
+                (size_t)(length < (int)sizeof(line) ? length : (int)sizeof(line) - 1));
+            (void)wrote;
+         }
+      }
+      return 1;
+   }
+   return 0;
+}
+
+static void install_handlers(void);
+
 static void
 trap(int sig, siginfo_t *info, void *context)
 {
@@ -141,6 +254,12 @@ trap(int sig, siginfo_t *info, void *context)
    char line[96];
    int length, frame;
 
+   if (sig == SIGSEGV || sig == SIGBUS) {
+      if (mend_gl_state(info, uc)) {
+         install_handlers();    /* SA_RESETHAND took ours off */
+         return;                /* the instruction runs again, now with a state block */
+      }
+   }
    if (uc != NULL) {
       pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
       fp = (uint64_t)uc->uc_mcontext->__ss.__fp;
@@ -186,21 +305,12 @@ trap(int sig, siginfo_t *info, void *context)
     * what jt60 showed. */
 }
 
-__attribute__((constructor)) static void
-install_trap(void)
+static void
+install_handlers(void)
 {
-   static char alternate[64 * 1024];
-   stack_t stack;
    struct sigaction action;
    int signals[] = { SIGSEGV, SIGBUS, SIGILL };
    unsigned i;
-
-   read_images();
-
-   stack.ss_sp = alternate;
-   stack.ss_size = sizeof(alternate);
-   stack.ss_flags = 0;
-   (void)sigaltstack(&stack, NULL);
 
    memset(&action, 0, sizeof(action));
    action.sa_sigaction = trap;
@@ -209,4 +319,19 @@ install_trap(void)
    for (i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
       (void)sigaction(signals[i], &action, NULL);
    }
+}
+
+__attribute__((constructor)) static void
+install_trap(void)
+{
+   static char alternate[64 * 1024];
+   stack_t stack;
+
+   read_images();
+
+   stack.ss_sp = alternate;
+   stack.ss_size = sizeof(alternate);
+   stack.ss_flags = 0;
+   (void)sigaltstack(&stack, NULL);
+   install_handlers();
 }
