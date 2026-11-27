@@ -62,6 +62,7 @@
  */
 #include "jackpotlte_gl.h"
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
@@ -2698,6 +2699,92 @@ blank_later(void *context)
    free(r);
 }
 
+/*
+ * glca31 (P14 AOD experiment, switch a8gl-aodlive "1", read when backboardd
+ * starts): CoreAnimation is never blanked.  setBlanked:YES only lowers the
+ * panel through kern.a8_brightness (to 24, or the level if lower) and
+ * setBlanked:NO puts the level back, so whatever SpringBoard still draws on
+ * the lock screen (clock, battery) keeps reaching the panel.  The kernel's
+ * own dim lock screen (xnu 0232) is not entered (no display off reaches it).
+ */
+static int aod_live;
+static int live_saved = -1;
+static bool live_dim;
+
+static int
+live_level(int set)
+{
+   int level = -1;
+   size_t len = sizeof(level);
+
+   if (set >= 0)
+      return sysctlbyname("kern.a8_brightness", NULL, NULL, &set, sizeof(set)) == 0 ? set : -1;
+   return sysctlbyname("kern.a8_brightness", &level, &len, NULL, 0) == 0 ? level : -1;
+}
+
+/* glca31b: the framebuffer's own power request, as CoreAnimation makes it
+ * when it blanks (selector 12): the kernel then enters its dim lock screen
+ * (xnu 0232: flips go on, panel level down, HLPM if "aodlp" is set) and the
+ * display-off state is what iOS's tap-to-wake looks at (glca31 alone: power
+ * key wakes, a tap does not).  Falls back to kern.a8_brightness. */
+static int
+live_power(int on)
+{
+   static int (*get_main)(void **);
+   static int (*power)(void *, int);
+   static void *fb;
+   static bool looked;
+
+   if (!looked) {
+      looked = true;
+      get_main = (int (*)(void **))(uintptr_t)dlsym(RTLD_DEFAULT, "IOMobileFramebufferGetMainDisplay");
+      power = (int (*)(void *, int))(uintptr_t)dlsym(RTLD_DEFAULT, "IOMobileFramebufferRequestPowerChange");
+      if (get_main != NULL && get_main(&fb) != 0)
+         fb = NULL;
+      say("glca31b: IOMobileFramebufferGetMainDisplay %s, RequestPowerChange %s, display %p",
+          get_main != NULL ? "found" : "missing", power != NULL ? "found" : "missing", fb);
+   }
+   if (power == NULL || fb == NULL)
+      return -1;
+   return power(fb, on);
+}
+
+static bool
+live_blank(BOOL blanked)
+{
+   if (!aod_live)
+      return false;
+   if (blanked && !live_dim) {
+      int r = live_power(0);
+
+      live_dim = true;
+      if (r != 0) {
+         int level = live_level(-1), dim = 24;
+
+         if (level >= 0 && level < dim)
+            dim = level;
+         live_saved = level;
+         (void)live_level(dim);
+         say("glca31: setBlanked:1 -> CoreAnimation stays on, panel level %d -> %d (power request %d)",
+             level, dim, r);
+      } else {
+         live_saved = -2;
+         say("glca31b: setBlanked:1 -> CoreAnimation stays on, framebuffer asked for display off");
+      }
+   } else if (!blanked && live_dim) {
+      live_dim = false;
+      if (live_saved == -2) {
+         say("glca31b: setBlanked:0 -> framebuffer asked for display on (%d)", live_power(1));
+      } else {
+         int level = live_saved >= 0 ? live_saved : 160;
+
+         (void)live_level(level);
+         say("glca31: setBlanked:0 -> panel level back to %d", level);
+      }
+   }
+   return true;
+}
+
 static void
 my_set_blanked(id display, SEL cmd, BOOL blanked)
 {
@@ -2705,6 +2792,10 @@ my_set_blanked(id display, SEL cmd, BOOL blanked)
 
    pthread_mutex_lock(&blank_lock);
    blank_gen++;
+   if (live_blank(blanked)) {
+      pthread_mutex_unlock(&blank_lock);
+      return;
+   }
    if (!blanked || blank_delay_ms == 0 ||
        (r = malloc(sizeof(*r))) == NULL) {
       orig_set_blanked(display, cmd, blanked);
@@ -2737,13 +2828,22 @@ blank_delay_install(void)
    }
    if (blank_delay_ms > 3000)
       blank_delay_ms = 3000;
+   fd = open("/private/var/mobile/Library/a8gl-aodlive", O_RDONLY | O_CLOEXEC);
+   if (fd >= 0) {
+      char c = 0;
+
+      if (read(fd, &c, 1) == 1 && c == '1')
+         aod_live = 1;
+      close(fd);
+   }
    method = display != NULL ? class_getInstanceMethod(display, sel_registerName("setBlanked:")) : NULL;
    if (method == NULL) {
       say("glca30: no -[CAWindowServerDisplay setBlanked:]");
       return;
    }
    orig_set_blanked = (void (*)(id, SEL, BOOL))method_setImplementation(method, (IMP)my_set_blanked);
-   say("glca30: setBlanked:YES held %u ms (a8gl-blankdelay)", blank_delay_ms);
+   say("glca30: setBlanked:YES held %u ms (a8gl-blankdelay)%s", blank_delay_ms,
+       aod_live ? "; glca31 live dim lock screen on (a8gl-aodlive)" : "");
 }
 
 __attribute__((constructor)) static void
