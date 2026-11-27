@@ -201,9 +201,13 @@ def build():
         # boot (0228c-p17traits) removed CoreUI's faults and drew apps and
         # icons right, but Control Center ran ~1.5-2% slower (483-490 vs
         # 490-495, A/B in one session); A8_PRODUCT_TRAITS=1 adds them.
-        if os.environ.get('A8_PRODUCT_TRAITS', '0') == '1':
+        # "gamut" or "featureset" adds just one of the two (the 11-26 split
+        # test of which one costs Control Center its frames).
+        traits = os.environ.get('A8_PRODUCT_TRAITS', '0')
+        if traits in ('1', 'gamut'):
+            props += [('artwork-display-gamut', mkadt.cstr('sRGB'))]
+        if traits in ('1', 'featureset'):
             props += [
-                ('artwork-display-gamut', mkadt.cstr('sRGB')),
                 ('graphics-featureset-class', mkadt.cstr('APPLE4')),
                 ('graphics-featureset-fallbacks',
                  mkadt.cstr('APPLE3:APPLE3v1:APPLE2:APPLE1:GLES2,0')),
