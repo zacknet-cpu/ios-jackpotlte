@@ -1,0 +1,99 @@
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+index 6625ee9..cb681e1 100644
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -1619,6 +1619,7 @@ jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns)
+ /* 0211: the console "flip" report's GPU line. */
+ extern void jackpotlte_mali_uc_stats(uint64_t *submits, uint64_t *ns, uint64_t *enqueue_ns);  /* JackpotlteMali.cpp, 0213 */
+ extern uint64_t jackpotlte_mali_uc_pairs(void);    /* JackpotlteMali.cpp, 0218 */
++extern void jackpotlte_mali_uc_batches(uint64_t *calls, uint64_t *jobs);      /* JackpotlteMali.cpp, 0230 */
+ extern void jackpotlte_mali_uc_frees(uint64_t *frees, uint64_t *ns, uint64_t *takes,
+     uint64_t *wait_ns, uint64_t *wait_max_ns);    /* JackpotlteMali.cpp, 0226 */
+ 
+@@ -1636,6 +1637,13 @@ jackpotlte_mali_report(void)
+ 	    jt_started ? jt_start_ns / jt_started / 1000 : 0, jt_started, jt_idle_caught, jt_idle_slept,
+ 	    jt_spin_us, submits, submits ? submit_ns / submits / 1000 : 0,
+ 	    submits ? enqueue_ns / submits / 1000 : 0, jackpotlte_mali_uc_pairs());
++	{
++		uint64_t calls = 0, jobs = 0;
++
++		jackpotlte_mali_uc_batches(&calls, &jobs);
++		printf("A8 GPU: %llu calls brought several (%llu submits, avg %llu.%llu a call) (0230)\n",
++		    calls, jobs, calls ? jobs / calls : 0, calls ? (jobs * 10 / calls) % 10 : 0);
++	}
+ 	printf("A8 GPU: queue of %u: deepest %u; full %llu times, %llu us asleep in all (0224)\n",
+ 	    (unsigned)JT_MALI_QUEUE, jt_queue_deepest, jt_full_waits, jt_full_ns / 1000);
+ 	{
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+index adf6c7b..98bc74d 100644
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -108,6 +108,7 @@ enum {
+ 	kPanfrostGetParam       = 0x44,
+ 	kPanfrostGetBOOffset    = 0x45,
+ 	kPanfrostMadvise        = 0x48,
++	kJackpotlteSubmitN      = 0x7c,         /* ours (0230): up to 16 submits in one call */
+ 	kJackpotlteWait         = 0x7d,         /* ours: wait for a job by its number */
+ 	kJackpotlteSurface      = 0x7e,         /* ours: a surface's memory as a buffer */
+ 	kJackpotlteSubmit2      = 0x7f,         /* ours (0218): two submits in one call */
+@@ -224,6 +225,8 @@ static IOLock * gMaliLock;
+ static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed;
+ static uint64_t gMaliSubmitNs, gMaliEnqueueNs, gMaliTimedSubmits;     /* 0213 */
+ static uint64_t gMaliPairs;                                    /* 0218: kJackpotlteSubmit2 calls */
++static uint64_t gMaliBatches, gMaliBatchJobs;                  /* 0230: kJackpotlteSubmitN calls, their submits */
++#define JACKPOTLTE_SUBMITN_MAX  16                              /* 0230: 8 passes (vertex/tiler + fragment) */
+ static IOBufferMemoryDescriptor * gMaliDonePage;                /* 0225 */
+ static uint32_t gMaliDoneMaps;                                  /* 0225 */
+ 
+@@ -236,6 +239,16 @@ jackpotlte_mali_uc_pairs(void)
+ 	return gMaliPairs;
+ }
+ 
++/* 0230: kJackpotlteSubmitN calls and the submits they brought, for the flip report */
++extern "C" void jackpotlte_mali_uc_batches(uint64_t * calls, uint64_t * jobs);
++
++void
++jackpotlte_mali_uc_batches(uint64_t * calls, uint64_t * jobs)
++{
++	*calls = gMaliBatches;
++	*jobs = gMaliBatchJobs;
++}
++
+ /* 0226: frees done outside gMaliLock and their time, and how long requests
+  * waited for gMaliLock, for the flip report */
+ extern "C" void jackpotlte_mali_uc_frees(uint64_t * frees, uint64_t * ns, uint64_t * takes,
+@@ -699,6 +712,7 @@ JackpotlteMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
+ 		struct drm_gem_close close;
+ 		struct drm_panfrost_submit submit;
+ 		struct drm_panfrost_submit submit2[2];  /* 0218 */
++		struct drm_panfrost_submit submitn[JACKPOTLTE_SUBMITN_MAX];    /* 0230 */
+ 		struct drm_panfrost_wait_bo wait;
+ 		struct drm_panfrost_create_bo create;
+ 		struct drm_panfrost_mmap_bo mmap;
+@@ -808,6 +822,26 @@ JackpotlteMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
+ 		}
+ 		gMaliPairs++;
+ 		break;
++	case kJackpotlteSubmitN: {
++		/* 0230: several passes' submits in one call (libjackpotlte holds them
++		 * until a wait, a close, a sync object or the frame's end needs them),
++		 * queued in order exactly as one call each would have; each gets its
++		 * own number back in its jc (0: not queued). */
++		size_t n = size / sizeof(r.submitn[0]);
++
++		if (n == 0 || n > JACKPOTLTE_SUBMITN_MAX || size != n * sizeof(r.submitn[0])) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		for (size_t k = 0; k < n; k++) {
++			if (r.submitn[k].jc != 0) {
++				(void)submitOne(&r.submitn[k]);
++			}
++		}
++		gMaliBatches++;
++		gMaliBatchJobs += n;
++		break;
++	}
+ 	case kJackpotlteSurface:
+ 		ret = surfaceBuffer(&r.surface);
+ 		break;
