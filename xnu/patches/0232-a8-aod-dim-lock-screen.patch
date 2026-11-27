@@ -1,0 +1,129 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 3e6b05e..7c687e2 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1664,6 +1664,7 @@ extern void a8f_date(const char *args);
+ extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
+ extern int sweet_fb_cahz_set(int hz);          /* SweetFramebuffer.cpp, 0217 */
+ extern int sweet_fb_trace_set(int count);       /* SweetFramebuffer.cpp, 0231 */
++extern int sweet_fb_aod_set(int value);         /* SweetFramebuffer.cpp, 0232 */
+ extern int sweet_fb_out_set(uint32_t sel, int32_t off, uint64_t value, int list);
+ extern int sweet_fb_prop_set(const char *key, const char *value);
+ extern void a8_noexec_set(const char *names);   /* mem.c, 0219 */
+@@ -1739,7 +1740,7 @@ a8s_command(const char *line)
+ 		printf("A8SH: fixinto NAME,NAME|- (the fix library into those too) | "
+ 		    "bl [0-255] (panel brightness by AOR; sysctl kern.a8_brightness)\n");
+ 		printf("A8SH: framebuffer (0231): fbtrace N | fbout SEL OFF|sN VALUE, fbout clear | "
+-		    "fbprop NAME [N|true|false]\n");
++		    "fbprop NAME [N|true|false] | aod [0|1|LEVEL] (0232 dim lock screen)\n");
+ 		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
+ 		    "(writes the slot that is not the default) | tryb (boot it once) | "
+ 		    "tryok | promote\n");
+@@ -1963,6 +1964,21 @@ a8s_command(const char *line)
+ 		    *rest == 'g' ? 4 : *rest == 'n' ? 5 : *rest == 'd' ? 6 : *rest == 'w' ? 7 :
+ 		    *rest == 'o' ? 8 : *rest == 'e' ? 9 : *rest == 'k' ? 10 : *rest == 'u' ? 11 : -1;
+ 		printf("A8SH: flip %s\n", sweet_fb_flip_set(on) ? "on" : "off");
++	} else if (a8s_word(line, "aod", &rest)) {
++		/* 0232: "aod 0" black at display off, "aod 1" dim lock screen,
++		 * "aod N" (2-255) dim at panel level N, "aod" reports */
++		int v = -1;
++
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest >= '0' && *rest <= '9') {
++			v = 0;
++			while (*rest >= '0' && *rest <= '9' && v < 1000) {
++				v = v * 10 + (*rest++ - '0');
++			}
++		}
++		(void)sweet_fb_aod_set(v);
+ 	} else if (a8s_word(line, "fbtrace", &rest)) {
+ 		/* 0231: "fbtrace N" logs the next N framebuffer user-client calls */
+ 		int n = -1;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2da328f..363e058 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -286,6 +286,30 @@ sweet_fb_blanked(void)
+ 	return sweet_fb_blank_state != 0;
+ }
+ 
++/*
++ * 0232 (P14, the user's choice of 11-27): a dim lock screen instead of black.
++ * When iOS asks for display off, the panel keeps the last frame CoreAnimation
++ * presented -- SpringBoard draws its dimmed always-on lock screen right
++ * before (dark wallpaper, white clock) -- and the panel brightness drops to
++ * sweet_fb_aod_level (0231's AOR command, the values Samsung's driver
++ * sends; no new panel command). Flips go on as with the display on (CA stops
++ * drawing by itself once it has the display off, and a blocked flip is what
++ * made 0230's frozen frame tear), so the picture is the last one, frozen:
++ * clock and battery stay as they were at lock (iOS's own live always-on
++ * frames need its Metal flipbook). Display on puts the user's level back.
++ * Tap to wake still works (sweet_fb_requested_off). Console "aod 0" goes
++ * back to black, "aod 1" dim again, "aod N" (2-255) dim at level N.
++ */
++static int sweet_fb_aod = 1;                    /* 0: black at display off (0231) */
++static int sweet_fb_aod_level = 24;             /* kern.a8_brightness scale */
++static volatile int sweet_fb_aod_active;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++static int sweet_fb_aod_saved = -1;             /* user level before the dim */
++extern "C" uint32_t a8_panel_brightness(unsigned int level);    /* a5xelte_panel.c, 0199 */
++extern "C" int a8_panel_brightness_get(void);
++#define SWEET_FB_AOD_WAKE_DEFAULT 160           /* when no level was set since boot */
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -1669,6 +1693,21 @@ sweet_fb_trace_call(uint32_t selector, IOExternalMethodArguments *args, IOReturn
+ 	}
+ }
+ 
++/* 0232: console "aod": -1 report, 0 off (black), 1 on, 2-255 on at that level */
++extern "C" int
++sweet_fb_aod_set(int value)
++{
++	if (value == 0 || value == 1) {
++		sweet_fb_aod = value;
++	} else if (value >= 2 && value <= 255) {
++		sweet_fb_aod = 1;
++		sweet_fb_aod_level = value;
++	}
++	printf("A8SH: aod %s, level %d%s\n", sweet_fb_aod ? "on (dim lock screen)" : "off (black)",
++	    sweet_fb_aod_level, sweet_fb_aod_active ? ", showing now" : "");
++	return sweet_fb_aod;
++}
++
+ extern "C" int
+ sweet_fb_trace_set(int count)
+ {
+@@ -1842,6 +1881,28 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
+ 				break;
+ 			}
++#endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++			/* 0232: dim lock screen (see sweet_fb_aod) */
++			if (off && sweet_fb_aod && !sweet_fb_aod_active) {
++				int level = a8_panel_brightness_get();
++				sweet_fb_aod_saved = level;
++				sweet_fb_aod_active = 1;
++				if (level < 0 || level > sweet_fb_aod_level) {
++					(void)a8_panel_brightness((unsigned int)sweet_fb_aod_level);
++				}
++				IOLog("SWEET FB: display off as a dim lock screen (0232): level %d -> %d\n",
++				    level, sweet_fb_aod_level);
++				break;
++			}
++			if (!off && sweet_fb_aod_active) {
++				int level = sweet_fb_aod_saved >= 0 ? sweet_fb_aod_saved : SWEET_FB_AOD_WAKE_DEFAULT;
++				sweet_fb_aod_active = 0;
++				if (a8_panel_brightness_get() != level) {
++					(void)a8_panel_brightness((unsigned int)level);
++				}
++				IOLog("SWEET FB: dim lock screen ends (0232): level back to %d\n", level);
++			}
+ #endif
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
