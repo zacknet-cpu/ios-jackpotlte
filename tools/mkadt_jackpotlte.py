@@ -149,12 +149,21 @@ def build():
     # panel is the s6e3fa7 at 1080x2220 (Eureka exynos7885-display-lcd.dtsi:
     # 173-193); IOMobileFramebuffer reads canvas-width/height from this node,
     # so the canvas is the panel.
-    arm_io.children.append(mkadt.node('disp0', [
+    disp0_props = [
         ('device_type', mkadt.cstr('display-subsystem')),
         ('compatible', mkadt.cstr('samsung,a5xelte-display')),
         ('canvas-width', mkadt.u32(FB_W)),
         ('canvas-height', mkadt.u32(FB_H)),
-    ]))
+    ]
+    # P14 Always-On Display (11-27): libMobileGestalt answers
+    # DeviceSupportsAlwaysOnTime ("j8/Omm6s1lsmTDFsXjsBfA") true when
+    # IODeviceTree:/arm-io/disp0 has a property "always-on-time" (presence
+    # only; MobileGestalt hashes both names). That turns on CoreAnimation's
+    # flipbook (timestamped AOD frames), which needs kernel support (0232+),
+    # so it is opt-in: A8_AOT=1.
+    if os.environ.get('A8_AOT', '0') == '1':
+        disp0_props.append(('always-on-time', mkadt.u32(1)))
+    arm_io.children.append(mkadt.node('disp0', disp0_props))
     # The framebuffer is confirmed live: after the DECON trigger the loader's
     # banner appears at 0xec000000 (phone screen, 2026-11-08). The A5XELTE
     # serial driver looks for "a5xelte-fbcon" with reg/width/height/stride.
