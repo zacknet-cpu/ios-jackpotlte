@@ -100,8 +100,9 @@
  *
  * Dim lock screen (v18e, P14 AOD): the cover sheet's darkening effect view is
  * made clear when SpringBoard blanks the screen, so the frame the kernel keeps
- * has the wallpaper (a8wall-aodfx = percent kept, "100" = off); see
- * aod_wall_apply.
+ * has the wallpaper (a8wall-aodfx = percent kept, "100" = off); with the GL
+ * shim's live dim (a8gl-aodlive "1") the lock screen clock keeps running
+ * (v18g); see aod_wall_apply.
  *
  * Sensor curtain (v14, user report 11-25): the expanded island's X button had
  * a pill-shaped bite: the sensor cover (_SBSystemApertureMagiciansCurtainView
@@ -2913,6 +2914,35 @@ aod_blank_changed(void)
 	}
 }
 
+/* v18g (P14 AOD, with the GL shim's live dim lock screen, glca31 switch
+ * a8gl-aodlive "1"): SpringBoard stops the lock screen clock at blank
+ * (-[SBFLockScreenDateViewController setScreenOff:YES] -> _stopUpdateTimer;
+ * seen 11-27: battery in the status bar went on updating, the clock did
+ * not).  With the switch on, the clock is told the screen stays on, so its
+ * minute timer keeps running and CoreAnimation (not blanked in that mode)
+ * draws each new minute. */
+static void (*date_screen_off_orig)(id, SEL, signed char);
+static int date_said;
+
+static int
+aod_live_on(void)
+{
+	id text = fix_switch_text("/private/var/mobile/Library/a8gl-aodlive");
+
+	return text != 0 && ((int (*)(id, SEL))objc_msgSend)(text, sel_registerName("intValue")) == 1;
+}
+
+static void
+date_screen_off(id self, SEL cmd, signed char off)
+{
+	if (off && aod_live_on()) {
+		if (date_said++ < 3)
+			fix_put("A8FIX aod: lock screen clock kept running at blank (live dim, v18g)\n");
+		off = 0;
+	}
+	date_screen_off_orig(self, cmd, off);
+}
+
 static void
 aod_wall_apply(void)
 {
@@ -2922,6 +2952,16 @@ aod_wall_apply(void)
 		aod_blank_changed();
 	});
 	fix_put("A8FIX aod: wallpaper kept on the dim lock screen (v18e)\n");
+	{
+		Class k = objc_getClass("SBFLockScreenDateViewController");
+		Method m = k != 0 ? class_getInstanceMethod(k, sel_registerName("setScreenOff:")) : 0;
+
+		if (m != 0)
+			date_screen_off_orig = (void (*)(id, SEL, signed char))method_setImplementation(m,
+			    (IMP)date_screen_off);
+		else
+			fix_put("A8FIX aod: no -[SBFLockScreenDateViewController setScreenOff:]\n");
+	}
 }
 
 /*
