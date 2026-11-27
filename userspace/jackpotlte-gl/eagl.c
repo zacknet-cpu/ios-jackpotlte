@@ -2659,6 +2659,93 @@ ca_environment(void)
    }
 }
 
+/*
+ * glca30 (P14 AOD): a lock-button press blanks the display before SpringBoard
+ * has drawn the lock screen, so the kernel's dim lock screen (xnu 0232) kept
+ * the picture that was on screen then (the home screen or an app).  Here
+ * -[CAWindowServerDisplay setBlanked:YES] is held back a moment, so
+ * CoreAnimation draws the lock screen first; a setBlanked:NO in that time
+ * cancels it.  Switch file /private/var/mobile/Library/a8gl-blankdelay: the
+ * delay in ms (default 700, "0" = off), read when backboardd starts.
+ */
+#include <dispatch/dispatch.h>
+
+static void (*orig_set_blanked)(id, SEL, BOOL);
+static unsigned blank_delay_ms = 700;
+static uint32_t blank_gen;
+static pthread_mutex_t blank_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct blank_request {
+   id display;
+   SEL cmd;
+   uint32_t gen;
+   uint64_t asked;
+};
+
+static void
+blank_later(void *context)
+{
+   struct blank_request *r = context;
+   bool now;
+
+   pthread_mutex_lock(&blank_lock);
+   now = r->gen == blank_gen;
+   if (now)
+      orig_set_blanked(r->display, r->cmd, YES);
+   pthread_mutex_unlock(&blank_lock);
+   say("glca30: blank %s after %llu ms", now ? "done" : "cancelled (woken)",
+       (unsigned long long)(ticks_us(mach_continuous_time() - r->asked) / 1000));
+   free(r);
+}
+
+static void
+my_set_blanked(id display, SEL cmd, BOOL blanked)
+{
+   struct blank_request *r;
+
+   pthread_mutex_lock(&blank_lock);
+   blank_gen++;
+   if (!blanked || blank_delay_ms == 0 ||
+       (r = malloc(sizeof(*r))) == NULL) {
+      orig_set_blanked(display, cmd, blanked);
+      pthread_mutex_unlock(&blank_lock);
+      say("glca30: setBlanked:%d now", (int)blanked);
+      return;
+   }
+   r->display = display;
+   r->cmd = cmd;
+   r->gen = blank_gen;
+   r->asked = mach_continuous_time();
+   pthread_mutex_unlock(&blank_lock);
+   say("glca30: setBlanked:1 held %u ms (lock screen first)", blank_delay_ms);
+   dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)blank_delay_ms * 1000000),
+                    dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), r, blank_later);
+}
+
+static void
+blank_delay_install(void)
+{
+   Class display = (Class)objc_getClass("CAWindowServerDisplay");
+   Method method;
+   char buf[16] = { 0 };
+   int fd = open("/private/var/mobile/Library/a8gl-blankdelay", O_RDONLY | O_CLOEXEC);
+
+   if (fd >= 0) {
+      if (read(fd, buf, sizeof(buf) - 1) > 0)
+         blank_delay_ms = (unsigned)strtoul(buf, NULL, 10);
+      close(fd);
+   }
+   if (blank_delay_ms > 3000)
+      blank_delay_ms = 3000;
+   method = display != NULL ? class_getInstanceMethod(display, sel_registerName("setBlanked:")) : NULL;
+   if (method == NULL) {
+      say("glca30: no -[CAWindowServerDisplay setBlanked:]");
+      return;
+   }
+   orig_set_blanked = (void (*)(id, SEL, BOOL))method_setImplementation(method, (IMP)my_set_blanked);
+   say("glca30: setBlanked:YES held %u ms (a8gl-blankdelay)", blank_delay_ms);
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -2702,6 +2789,7 @@ install(void)
 
    say("library loaded into the display server");
    ca_environment();               /* glca27 */
+   blank_delay_install();          /* glca30 */
    /* Bring-up aid: where this file and the OpenGL ES library beside it were
     * loaded.  The kernel's crash report prints the faulting pc but no image
     * base, so these numbers are what turn that pc into an offset into a file
