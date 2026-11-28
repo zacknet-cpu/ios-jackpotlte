@@ -7,11 +7,9 @@
 #   tools/mesa-air/mk-mesa-air.sh [--with-osmesa] [WORKDIR]
 #
 # --with-osmesa also builds libOSMesa.8.dylib (Mesa's default targets) into
-# out/, for the mesa.yml checks: on branch a8-p13-air, mesa.yml (the a8-phase2
-# version, which uploads an artifact and pushes nothing) runs this through
-# tools/mesa-jackpotlte/mk-mesa-jackpotlte.sh, because the CI login cannot add
-# a workflow file (no `workflow` scope). That artifact carries libOSMesa and
-# the logs only; build.log ends with every AIR product's size and sha256.
+# out/ (used 11-28 while the CI login had no `workflow` scope; the branch's
+# mesa.yml now calls this script directly, without it). build.log ends with
+# every product's size and sha256.
 #
 # Same tarball, same drm face and same 0001-0007 series as
 # tools/mesa-jackpotlte/mk-mesa-jackpotlte.sh; then tools/mesa-air/air is
