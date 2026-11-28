@@ -6,12 +6,14 @@ redwood contributors; see tools/mesa-air/NOTICE.md). The differences:
   is already compiled into libpankmod_lib by 0001-darwin-drm-standin.patch,
   which driver_panfrost links, so drmOpenWithType resolves from there;
 - the install name is /jackpotlte/lib/libredwoodair.dylib (our prefix);
-- air_run also gets air_jackpotlte.c (redwood_drm_counts: this port has no
-  fault counters in the drm face, so it answers "not known").
+- air_run and libredwoodair also get air_jackpotlte.c: redwood_drm_counts
+  (no fault counters in our drm face: "not known") and redwood_bo_cache_stats
+  (Jesvi's panfrost-retain.patch counters; we have no retain cache: zeros);
+  air_run gets air_jackpotlte.h with -include for the prototype.
 
 --- a/src/gallium/drivers/panfrost/meson.build
 +++ b/src/gallium/drivers/panfrost/meson.build
-@@ -84,3 +84,48 @@
+@@ -84,3 +84,49 @@
    compile_args : compile_args_panfrost,
    link_with : [libpanfrost, libpanfrostwinsys, libpanfrost_shared, libpanfrost_midgard, libpanfrost_bifrost, libpanfrost_decode, libpanfrost_lib],
  )
@@ -29,6 +31,7 @@ redwood contributors; see tools/mesa-air/NOTICE.md). The differences:
 +air_run = executable(
 +  'air_run',
 +  files('../../../compiler/air/air_run.c', '../../../compiler/air/air_jackpotlte.c'),
++  c_args : ['-include', meson.current_source_dir() / '../../../compiler/air/air_jackpotlte.h'],
 +  include_directories : air_panfrost_includes,
 +  dependencies : air_panfrost_deps,
 +  link_with : [libgallium, libgalliumvl_stub, libws_null],
@@ -43,7 +46,7 @@ redwood contributors; see tools/mesa-air/NOTICE.md). The differences:
 +
 +libredwoodair = shared_library(
 +  'redwoodair',
-+  files('../../../compiler/air/air_metal.c'),
++  files('../../../compiler/air/air_metal.c', '../../../compiler/air/air_jackpotlte.c'),
 +  include_directories : air_panfrost_includes,
 +  dependencies : air_panfrost_deps,
 +  link_with : [libgallium, libgalliumvl_stub, libws_null],
