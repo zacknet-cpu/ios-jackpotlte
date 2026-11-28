@@ -52,6 +52,11 @@ struct fake {
 	 * bytes into a request of a different size. */
 	void (*reply)(struct fake *f, unsigned char *data, size_t size);
 	uint32_t reply_selector;
+
+	uint32_t refuse;                /* 0230: a selector answered "unsupported" */
+	uint32_t log[64];               /* 0230: the selectors called, in order */
+	unsigned nlog;
+	uint64_t log_jc[64];            /* the first request's chain of each call */
 };
 
 static uint32_t
@@ -60,6 +65,14 @@ fake_call(void *ctx, uint32_t selector, void *data, size_t size)
 	struct fake *f = ctx;
 
 	f->calls++;
+	if (f->nlog < 64) {
+		f->log_jc[f->nlog] = size >= sizeof(struct jt_submit_req) ?
+		    ((struct jt_submit_req *)data)->jc : 0;
+		f->log[f->nlog++] = selector;
+	}
+	if (f->refuse != 0 && selector == f->refuse) {
+		return 0xe00002c7;      /* kIOReturnUnsupported */
+	}
 	f->selector = selector;
 	f->size = size;
 	if (size <= sizeof(f->sent)) {
@@ -74,6 +87,13 @@ fake_call(void *ctx, uint32_t selector, void *data, size_t size)
 		 * "not queued" rather than the chain it sent. */
 		if (f->selector == JT_PANFROST_SUBMIT && size >= sizeof(struct jt_submit_req)) {
 			((struct jt_submit_req *)data)->jc = f->job_seq;
+		}
+		/* 0218/0230: several in one call, numbered in order */
+		if ((f->selector == JT_SUBMIT2 || f->selector == JT_SUBMITN) &&
+		    size % sizeof(struct jt_submit_req) == 0) {
+			for (size_t k = 0; k < size / sizeof(struct jt_submit_req); k++) {
+				((struct jt_submit_req *)data)[k].jc = f->job_seq++;
+			}
 		}
 	}
 	return f->kr;
@@ -139,8 +159,49 @@ open_with(struct fake **fp)
 	G.kr = JT_IORETURN_SUCCESS;
 	G.map_kr = JT_IORETURN_SUCCESS;
 	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	/* the open's own look for the done page (xnu 0225) is not what the
+	 * tests count */
+	G.maps = 0;
+	G.unmaps = 0;
+	G.selector = 0;
+	G.unmap_handle = 0;
 	*fp = &G;
 	return g;
+}
+
+/* xnu 0225: the done page is mapped at open, kept only with its magic, and
+ * let go at close; an older kernel's refusal leaves none. */
+static void
+test_done_page(void)
+{
+	static uint64_t page[4] = { 5, JT_DONE_PAGE_MAGIC, 9, 0 };
+	struct jt_gpu *g = NULL;
+
+	memset(&G, 0, sizeof(G));
+	G.kr = JT_IORETURN_SUCCESS;
+	G.map_address = page;
+	G.map_size = sizeof(page);
+	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	CHECK(G.maps == 1 && G.selector == JT_DONE_PAGE_TYPE, "the done page was not asked for");
+	CHECK(jt_done_page(g) == page && jt_done_page(g)[0] == 5, "the done page was not kept");
+	jt_gpu_close(g);
+	CHECK(G.unmaps == 1 && G.unmap_handle == JT_DONE_PAGE_TYPE, "the done page was not let go");
+
+	page[1] = 0;
+	memset(&G, 0, sizeof(G));
+	G.map_address = page;
+	G.map_size = sizeof(page);
+	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	CHECK(jt_done_page(g) == NULL && G.unmaps == 1, "a page without the magic was kept");
+	jt_gpu_close(g);
+	page[1] = JT_DONE_PAGE_MAGIC;
+
+	memset(&G, 0, sizeof(G));
+	G.map_kr = JT_IORETURN_BAD_ARGUMENT;
+	CHECK(jt_gpu_open(&g, &fake_backend, &G) == 0, "open failed");
+	CHECK(jt_done_page(g) == NULL && G.unmaps == 0, "an older kernel's refusal left a page");
+	jt_gpu_close(g);
+	CHECK(G.unmaps == 0, "close let go of a page that was never there");
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -481,7 +542,9 @@ test_drm_ioctl(void)
 	CHECK(madvise.retained == 1, "retained was not written back");
 
 	/* The submit: the kernel's number comes back in `jc`, and the sync
-	 * object the caller named is given that number. */
+	 * object the caller named is given that number.  (Before panfrost_flush
+	 * has called jackpotlte_drm_flush_end, 0230 behaves as 0218: a lone
+	 * fragment submit goes at once.) */
 	memset(&submit, 0, sizeof(submit));
 	submit.jc = 0x01000000;
 	submit.out_sync = 3;
@@ -502,6 +565,38 @@ test_drm_ioctl(void)
 	memcpy(&waited, f->sent, sizeof(waited));
 	CHECK(f->selector == JT_WAIT, "selector %#x", f->selector);
 	CHECK(waited.seq == 42, "waited for job %llu", (unsigned long long)waited.seq);
+
+	/* A WAIT_BO for a buffer whose last job is known done (job 42, just
+	 * waited for) or that no job used is answered without the kernel; one
+	 * for a buffer a later job names goes to the kernel. */
+	{
+		struct jt_wait_bo_req bo;
+		uint32_t again[1] = { 7 };
+
+		memset(&bo, 0, sizeof(bo));
+		bo.handle = 7;
+		f->selector = 0;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+		    &bo, sizeof(bo)) == 0, "wait_bo for a done buffer failed");
+		CHECK(f->selector == 0, "a done buffer's wait_bo went to the kernel (%#x)", f->selector);
+		bo.handle = 9;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+		    &bo, sizeof(bo)) == 0, "wait_bo for an unused buffer failed");
+		CHECK(f->selector == 0, "an unused buffer's wait_bo went to the kernel (%#x)", f->selector);
+
+		memset(&submit, 0, sizeof(submit));
+		submit.jc = 0x01000000;
+		submit.bo_handles = (uint64_t)(uintptr_t)again;
+		submit.bo_handle_count = 1;
+		f->job_seq = 43;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_SUBMIT, sizeof(submit)),
+		    &submit, sizeof(submit)) == 0, "second submit failed");
+		bo.handle = 7;
+		f->selector = 0;
+		CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+		    &bo, sizeof(bo)) == 0, "wait_bo for a busy buffer failed");
+		CHECK(f->selector == JT_PANFROST_WAIT_BO, "a busy buffer's wait_bo did not reach the kernel");
+	}
 
 	/* A surface: described, and then made.  The field names differ from the
 	 * kernel's; the structure that travels is the kernel's. */
@@ -542,6 +637,7 @@ test_drm_ioctl(void)
 		jackpotlte_drm_unmap(-1, 5, memory);
 		CHECK(f->unmaps == 0, "unmap did not keep the mapping");
 		CHECK(drmCloseBufferHandle(-1, 5) == 0, "close failed");
+		jackpotlte_drm_close_drain();   /* 11-26: closes run on a thread of their own */
 		CHECK(f->unmaps == 1 && f->unmap_handle == 5, "the mapping was not unmapped");
 		CHECK(f->selector == JT_DRM_GEM_CLOSE, "selector %#x", f->selector);
 	}
@@ -605,12 +701,156 @@ test_errno_table(void)
 	CHECK(jt_errno(JT_IORETURN_TIMEOUT) == -ETIMEDOUT, "timeout");
 }
 
+/* 0230: whole passes are held and sent together, in order, when there are
+ * a8gl-batch's number of them (4 here: no switch file on a build machine) or
+ * something must see them run; a kernel that refuses 0x7c gets pairs. */
+static void
+submit_pass(struct jt_gpu *g, uint64_t chain, uint32_t *handle, uint32_t out_sync)
+{
+	struct jt_submit_req r;
+
+	memset(&r, 0, sizeof(r));
+	r.jc = chain;                   /* vertex/tiler */
+	r.bo_handles = (uint64_t)(uintptr_t)handle;
+	r.bo_handle_count = 1;
+	CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_SUBMIT, sizeof(r)),
+	    &r, sizeof(r)) == 0, "vertex submit failed");
+	r.jc = chain + 1;               /* fragment */
+	r.requirements = JT_JD_REQ_FS;
+	r.out_sync = out_sync;
+	CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_SUBMIT, sizeof(r)),
+	    &r, sizeof(r)) == 0, "fragment submit failed");
+}
+
+static void
+test_batch(void)
+{
+	struct fake *f;
+	struct jt_gpu *g = open_with(&f);
+	uint32_t h[8] = { 11, 12, 13, 14, 15, 16, 17, 18 };
+	struct jt_wait_bo_req bo;
+	uint32_t sync = 0;
+
+	jackpotlte_drm_attach(g);
+	f->job_seq = 100;
+	f->nlog = 0;
+
+	/* before panfrost_flush's end was seen: 0218, one call a pass */
+	submit_pass(g, 0x0f00, &h[7], 0);
+	CHECK(f->nlog == 1 && f->log[0] == JT_SUBMIT2, "without the flush end a pass was not one "
+	    "pair (%u calls, first %#x)", f->nlog, f->nlog ? f->log[0] : 0);
+	jackpotlte_drm_flush_end();     /* what tools/mesa-jackpotlte/0007 calls */
+	CHECK(f->nlog == 1, "the flush end sent something with nothing held");
+	f->job_seq = 100;
+	f->nlog = 0;
+
+	/* four passes: one call, eight submits, in order */
+	for (unsigned p = 0; p < 3; p++) {
+		submit_pass(g, 0x1000 + 0x10 * p, &h[p], 0);
+	}
+	CHECK(f->nlog == 0, "three passes were sent (%u calls)", f->nlog);
+	submit_pass(g, 0x1030, &h[3], 0);
+	CHECK(f->nlog == 1 && f->log[0] == JT_SUBMITN, "four passes: %u calls, first %#x", f->nlog,
+	    f->nlog ? f->log[0] : 0);
+	CHECK(f->size == 8 * sizeof(struct jt_submit_req), "the batch was %zu bytes", f->size);
+	CHECK(f->log_jc[0] == 0x1000, "the batch did not start with the first pass's vertex chain");
+	CHECK(jackpotlte_drm_last_seq() == 107, "last_seq %llu after the batch",
+	    (unsigned long long)jackpotlte_drm_last_seq());
+	CHECK(f->nlog == 1, "the frame-end look sent something with nothing held");
+
+	/* a panfrost_flush that ends a frame with two passes held: sent at its end */
+	submit_pass(g, 0x1800, &h[6], 0);
+	submit_pass(g, 0x1810, &h[7], 0);
+	CHECK(f->nlog == 1, "two passes were sent before the flush end");
+	jackpotlte_drm_flush_end();
+	CHECK(f->nlog == 2 && f->log[1] == JT_SUBMITN && f->log_jc[1] == 0x1800,
+	    "the flush end did not send the two held passes in one call (%u calls)", f->nlog);
+	f->job_seq = 108;
+
+	/* each buffer has its own pass's number: the fourth pass's (106, 107) */
+	memset(&bo, 0, sizeof(bo));
+	bo.handle = 14;
+	bo.timeout_ns = 1000000;
+	f->nlog = 0;
+	CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+	    &bo, sizeof(bo)) == 0, "wait_bo after the batch failed");
+	CHECK(f->nlog == 1 && f->log[0] == JT_PANFROST_WAIT_BO, "the wait was not one WAIT_BO");
+
+	/* a held pass: a look is busy without a call; GEM_CLOSE sends it first */
+	submit_pass(g, 0x2000, &h[4], 0);
+	f->nlog = 0;
+	bo.handle = 15;
+	bo.timeout_ns = 0;
+	CHECK(jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_WAIT_BO, sizeof(bo)),
+	    &bo, sizeof(bo)) == -ETIMEDOUT, "a look at a held pass's buffer was not busy");
+	CHECK(f->nlog == 0, "a look at a held pass's buffer called the kernel");
+	{
+		struct jt_madvise_req m;
+
+		memset(&m, 0, sizeof(m));
+		m.handle = 15;
+		(void)jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_PANFROST_MADVISE, sizeof(m)),
+		    &m, sizeof(m));
+		CHECK(f->nlog == 0, "MADVISE (answered here) sent the held pass (%u calls)", f->nlog);
+	}
+	{
+		struct jt_gem_close c;
+
+		memset(&c, 0, sizeof(c));
+		c.handle = 99;
+		f->nlog = 0;
+		(void)jackpotlte_drm_ioctl(g, JACKPOTLTE_DRM_REQUEST(JT_DRM_GEM_CLOSE, sizeof(c)),
+		    &c, sizeof(c));
+		jackpotlte_drm_close_drain();
+		CHECK(f->nlog >= 1 && f->log[0] == JT_SUBMIT2, "GEM_CLOSE did not send the held pass first "
+		    "(%u calls, first %#x)", f->nlog, f->nlog ? f->log[0] : 0);
+	}
+
+	/* a held pass that signals a sync object: waiting on it sends it first,
+	 * and the wait is for its fragment job */
+	CHECK(drmSyncobjCreate(-1, 0, &sync) == 0, "syncobj create failed");
+	f->job_seq = 200;
+	submit_pass(g, 0x3000, &h[5], sync);
+	f->nlog = 0;
+	CHECK(drmSyncobjWait(-1, &sync, 1, 1000000, 0, NULL) == 0, "syncobj wait failed");
+	CHECK(f->nlog == 2 && f->log[0] == JT_SUBMIT2 && f->log[1] == JT_WAIT,
+	    "syncobj wait: %u calls (%#x, %#x)", f->nlog, f->log[0], f->log[1]);
+	{
+		struct jt_wait_req w;
+
+		memcpy(&w, f->sent, sizeof(w));
+		CHECK(w.seq == 201, "the sync object waited for job %llu, not the fragment's 201",
+		    (unsigned long long)w.seq);
+	}
+
+	/* a kernel older than 0230: the four passes go as four pairs, in order */
+	f->refuse = JT_SUBMITN;
+	f->nlog = 0;
+	f->job_seq = 300;
+	for (unsigned p = 0; p < 4; p++) {
+		submit_pass(g, 0x4000 + 0x10 * p, &h[p], 0);
+	}
+	CHECK(f->nlog == 5 && f->log[0] == JT_SUBMITN && f->log[1] == JT_SUBMIT2 &&
+	    f->log[4] == JT_SUBMIT2 && f->log_jc[1] == 0x4000 && f->log_jc[4] == 0x4030,
+	    "refused batch: %u calls", f->nlog);
+	f->nlog = 0;
+	for (unsigned p = 0; p < 4; p++) {
+		submit_pass(g, 0x5000 + 0x10 * p, &h[p], 0);
+	}
+	CHECK(f->nlog == 4 && f->log[0] == JT_SUBMIT2, "after a refusal 0x7c was asked again "
+	    "(%u calls, first %#x)", f->nlog, f->nlog ? f->log[0] : 0);
+	f->refuse = 0;
+	jackpotlte_drm_attach(NULL);
+	jt_gpu_close(g);
+}
+
 int
 main(void)
 {
 	test_open();
 	test_create_bo();
 	test_map();
+	test_done_page();
 	test_submit();
 	test_waits();
 	test_param_and_release();
@@ -618,6 +858,7 @@ main(void)
 	test_surface();
 	test_drm_ioctl();
 	test_drm_misc();
+	test_batch();
 	test_errno_table();
 
 	if (failures != 0) {

@@ -1,0 +1,62 @@
+Build the AIR (Metal) programs against panfrost v6, for the Galaxy S8's Mali-G71.
+
+Adapted from Jesvi-iOS tools/mesa/air-panfrost.patch (MIT, HakiOS / Darwin on
+redwood contributors; see tools/mesa-air/NOTICE.md). The differences:
+- no src/redwood-drm source: this port's libdrm stand-in (src/jackpotlte-drm)
+  is already compiled into libpankmod_lib by 0001-darwin-drm-standin.patch,
+  which driver_panfrost links, so drmOpenWithType resolves from there;
+- the install name is /jackpotlte/lib/libredwoodair.dylib (our prefix);
+- air_run also gets air_jackpotlte.c (redwood_drm_counts: this port has no
+  fault counters in the drm face, so it answers "not known").
+
+--- a/src/gallium/drivers/panfrost/meson.build
++++ b/src/gallium/drivers/panfrost/meson.build
+@@ -84,3 +84,48 @@
+   compile_args : compile_args_panfrost,
+   link_with : [libpanfrost, libpanfrostwinsys, libpanfrost_shared, libpanfrost_midgard, libpanfrost_bifrost, libpanfrost_decode, libpanfrost_lib],
+ )
++
++# The AIR frontend's consumers on the Mali (P13 route A): air_run, libredwoodair
++# and air_metal_test, as in Jesvi-iOS air-panfrost.patch. The screen they open is
++# chosen in their sources by GALLIUM_PANFROST; the drm face is the one
++# driver_panfrost already carries (src/jackpotlte-drm in libpankmod_lib).
++air_panfrost_includes = [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
++                         inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
++                         include_directories('../../drivers')]
++air_panfrost_deps = [dep_m, idep_air, idep_mesautil, idep_xmlconfig, driver_softpipe,
++                     driver_panfrost, dep_libdrm]
++
++air_run = executable(
++  'air_run',
++  files('../../../compiler/air/air_run.c', '../../../compiler/air/air_jackpotlte.c'),
++  include_directories : air_panfrost_includes,
++  dependencies : air_panfrost_deps,
++  link_with : [libgallium, libgalliumvl_stub, libws_null],
++  build_by_default : false,
++  install : false,
++)
++
++redwoodair_link_args = []
++if host_machine.system() == 'darwin'
++  redwoodair_link_args += '-Wl,-install_name,/jackpotlte/lib/libredwoodair.dylib'
++endif
++
++libredwoodair = shared_library(
++  'redwoodair',
++  files('../../../compiler/air/air_metal.c'),
++  include_directories : air_panfrost_includes,
++  dependencies : air_panfrost_deps,
++  link_with : [libgallium, libgalliumvl_stub, libws_null],
++  link_args : redwoodair_link_args,
++  build_by_default : false,
++  install : false,
++)
++
++air_metal_test = executable(
++  'air_metal_test',
++  files('../../../compiler/air/air_metal_test.c'),
++  include_directories : include_directories('../../../compiler/air'),
++  link_with : [libredwoodair],
++  build_by_default : false,
++  install : false,
++)

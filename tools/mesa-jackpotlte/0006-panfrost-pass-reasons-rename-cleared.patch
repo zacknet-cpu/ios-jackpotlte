@@ -1,0 +1,176 @@
+diff -ru a/src/gallium/drivers/panfrost/pan_context.c b/src/gallium/drivers/panfrost/pan_context.c
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -27,6 +27,8 @@
+ 
+ #include <errno.h>
+ #include <poll.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "pan_bo.h"
+ #include "pan_context.h"
+@@ -55,6 +57,91 @@
+ #include "pan_screen.h"
+ #include "pan_util.h"
+ 
++/*
++ * jackpotlte (11-25): a colour buffer that is about to be cleared whole, at the
++ * start of a batch, keeps none of its pixels, yet open batches that still read
++ * it (an earlier offscreen pass sampled into the frame) would be submitted by
++ * panfrost_batch_update_access() as soon as the new batch writes it, splitting
++ * the frame (CoreAnimation reuses its offscreen buffers within a frame).  Give
++ * it a fresh BO instead, as panfrost_ptr_map() does for a CPU write that
++ * discards the whole resource; the readers keep the old BO through their own
++ * references.  PAN_MESA_DEBUG containing "a8norename" turns this off.
++ */
++static int a8_rename = -1;
++
++static bool
++a8_rename_on(void)
++{
++   if (a8_rename < 0) {
++      const char *flags = getenv("PAN_MESA_DEBUG");
++
++      a8_rename = !(flags && strstr(flags, "a8norename"));
++   }
++   return a8_rename > 0;
++}
++
++/* panfrost_resource_init_afbc_headers() (pan_resource.c, static there):
++ * zeroed AFBC headers, a valid (black) surface until the clear lands. */
++static int
++a8_init_afbc_headers(struct panfrost_resource *pres)
++{
++   if (panfrost_bo_mmap(pres->bo))
++      return -1;
++
++   unsigned nr_samples = MAX2(pres->base.nr_samples, 1);
++
++   for (unsigned i = 0; i < pres->base.array_size; ++i) {
++      for (unsigned l = 0; l <= pres->base.last_level; ++l) {
++         struct pan_image_slice_layout *slice = &pres->image.layout.slices[l];
++
++         for (unsigned s = 0; s < nr_samples; ++s) {
++            void *ptr = pres->bo->ptr.cpu +
++                        (i * pres->image.layout.array_stride) + slice->offset +
++                        (s * slice->afbc.surface_stride);
++
++            memset(ptr, 0, slice->afbc.header_size);
++         }
++      }
++   }
++   return 0;
++}
++
++static void
++a8_rename_cleared(struct panfrost_context *ctx, struct pipe_surface *surf)
++{
++   struct panfrost_device *dev = pan_device(ctx->base.screen);
++   struct panfrost_resource *rsrc = pan_resource(surf->texture);
++   struct panfrost_bo *bo = rsrc->bo, *newbo;
++
++   if (!bo || (bo->flags & PAN_BO_SHARED) || rsrc->separate_stencil ||
++       rsrc->shadow_image || rsrc->base.target != PIPE_TEXTURE_2D ||
++       rsrc->base.last_level != 0 || rsrc->base.array_size != 1 ||
++       rsrc->base.nr_samples > 1 || surf->u.tex.level != 0 ||
++       surf->u.tex.first_layer != 0 || surf->width != rsrc->base.width0 ||
++       surf->height != rsrc->base.height0 ||
++       ctx->pipe_framebuffer.width < rsrc->base.width0 ||
++       ctx->pipe_framebuffer.height < rsrc->base.height0 ||
++       panfrost_any_batch_writes_rsrc(ctx, rsrc) ||
++       !panfrost_any_batch_reads_rsrc(ctx, rsrc))
++      return;
++
++   newbo = panfrost_bo_create(dev, panfrost_bo_size(bo), bo->flags, bo->label);
++   if (!newbo)
++      return;
++
++   panfrost_bo_unreference(rsrc->bo);
++   rsrc->bo = newbo;
++   rsrc->image.data.base = newbo->ptr.gpu;
++   rsrc->valid.crc = false;
++   if (drm_is_afbc(rsrc->image.layout.modifier))
++      (void)a8_init_afbc_headers(rsrc);
++   panfrost_dirty_state_all(ctx);
++   if (unlikely(dev->debug & PAN_DBG_PERF))
++      mesa_logw("A8PASS renamed %ux%u %s instead of submitting its readers",
++                (unsigned)rsrc->base.width0, (unsigned)rsrc->base.height0,
++                util_format_short_name(rsrc->base.format));
++}
++
+ static void
+ panfrost_clear(struct pipe_context *pipe, unsigned buffers,
+                const struct pipe_scissor_state *scissor_state,
+@@ -68,6 +155,16 @@
+     * cause the batch to be flushed.
+     */
+    struct panfrost_context *ctx = pan_context(pipe);
++
++   if (ctx->batch == NULL && a8_rename_on()) {
++      for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
++         struct pipe_surface *surf = ctx->pipe_framebuffer.cbufs[i];
++
++         if (surf && (buffers & (PIPE_CLEAR_COLOR0 << i)))
++            a8_rename_cleared(ctx, surf);
++      }
++   }
++
+    struct panfrost_batch *batch = panfrost_get_batch_for_fbo(ctx);
+    if (!batch)
+       return;
+diff -ru a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost/pan_job.c
+--- a/src/gallium/drivers/panfrost/pan_job.c
++++ b/src/gallium/drivers/panfrost/pan_job.c
+@@ -252,6 +252,27 @@
+ static bool panfrost_batch_uses_resource(struct panfrost_batch *batch,
+                                          struct panfrost_resource *rsrc);
+ 
++/* jackpotlte (11-25): CoreAnimation's frames reach the GPU as 14-39 passes
++ * (fragment jobs) a frame.  With PAN_MESA_DEBUG=perf every submit forced by a
++ * resource access is logged: what was accessed and the batch it submits. */
++static void
++a8_log_submit(struct panfrost_context *ctx, const char *access,
++              struct panfrost_resource *rsrc, struct panfrost_batch *victim,
++              const char *who)
++{
++   if (likely(!(pan_device(ctx->base.screen)->debug & PAN_DBG_PERF)))
++      return;
++   mesa_logw("A8PASS %s of %ux%u %s (%s%s) submits %s: %ux%u, %u draws%s, area %u,%u-%u,%u",
++             access, (unsigned)rsrc->base.width0, (unsigned)rsrc->base.height0,
++             util_format_short_name(rsrc->base.format),
++             (rsrc->bo->flags & PAN_BO_SHARED) ? "shared" : "own",
++             drm_is_afbc(rsrc->image.layout.modifier) ? ", afbc" : "", who,
++             (unsigned)victim->key.width, (unsigned)victim->key.height,
++             (unsigned)victim->draw_count, victim->clear ? ", cleared" : "",
++             (unsigned)victim->minx, (unsigned)victim->miny,
++             (unsigned)victim->maxx, (unsigned)victim->maxy);
++}
++
+ static void
+ panfrost_batch_update_access(struct panfrost_batch *batch,
+                              struct panfrost_resource *rsrc, bool writes)
+@@ -273,8 +294,10 @@
+    struct panfrost_batch *writer = entry ? entry->data : NULL;
+ 
+    /* Both reads and writes flush the existing writer */
+-   if (writer != NULL && writer != batch)
++   if (writer != NULL && writer != batch) {
++      a8_log_submit(ctx, writes ? "write" : "read", rsrc, writer, "its writer");
+       panfrost_batch_submit(ctx, writer);
++   }
+ 
+    /* Writes (only) flush readers too */
+    if (writes) {
+@@ -287,8 +310,10 @@
+             continue;
+ 
+          /* Submit if it's a user */
+-         if (panfrost_batch_uses_resource(batch, rsrc))
++         if (panfrost_batch_uses_resource(batch, rsrc)) {
++            a8_log_submit(ctx, "write", rsrc, batch, "a reader");
+             panfrost_batch_submit(ctx, batch);
++         }
+       }
+    }
+ }
