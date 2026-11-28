@@ -3060,6 +3060,244 @@ bluetool_serve(void)
 		pause();
 }
 
+/*
+ * v18h (P13 phase 2 test runner; built 11-28, NOT deployed yet): lets the PC
+ * start a test program on the phone without a new kernel.  The PC puts
+ * /private/var/mobile/Library/a8run/request with one line
+ *     ID [NAME=VALUE ...] PROGRAM [ARG ...]
+ * PROGRAM must be under /private/var/mobile/Library/a8air/ (no "..").  Every
+ * 2 s SpringBoard looks; a request is moved to a8run/request.taken, PROGRAM is
+ * started (posix_spawn, as mobile, unsandboxed like every process on this
+ * port) with stdout and stderr in a8run/out.ID.txt and only the NAME=VALUE
+ * variables plus HOME/TMPDIR/PATH in its environment, killed after
+ * A8RUN_TIMEOUT seconds (default 120, at most 600), and a8run/status.ID.txt
+ * gets "A8RUN ID pid P exit E signal S seconds T" (written to a .tmp file and
+ * renamed, so the PC never reads half a status).  One program at a time.
+ * Nothing runs unless the PC writes a request: the switch is the file itself.
+ */
+extern int open(const char *path, int flags, ...);
+extern int close(int fd);
+extern long read(int fd, void *buf, unsigned long n);
+extern int rename(const char *from, const char *to);
+extern int mkdir(const char *path, unsigned short mode);
+extern int usleep(unsigned int usec);
+extern int kill(int pid, int sig);
+extern int waitpid(int pid, int *status, int options);
+extern int posix_spawn(int *pid, const char *path, void *const *file_actions, const void *attr,
+    char *const argv[], char *const envp[]);
+extern int posix_spawn_file_actions_init(void **file_actions);
+extern int posix_spawn_file_actions_adddup2(void **file_actions, int fd, int newfd);
+extern int posix_spawn_file_actions_destroy(void **file_actions);
+#define RUN_DIR "/private/var/mobile/Library/a8run/"
+#define RUN_BIN "/private/var/mobile/Library/a8air/"
+#define RUN_O_WRONLY 0x0001
+#define RUN_O_CREAT  0x0200
+#define RUN_O_TRUNC  0x0400
+static int run_busy;
+
+static unsigned long
+run_len(const char *s)
+{
+	unsigned long n = 0;
+
+	while (s[n] != 0)
+		n++;
+	return n;
+}
+
+/* out = a + b + c, at most cap - 1 characters */
+static void
+run_join(char *out, unsigned long cap, const char *a, const char *b, const char *c)
+{
+	const char *parts[3] = { a, b, c };
+	unsigned long n = 0;
+
+	for (int k = 0; k < 3; k++)
+		for (const char *p = parts[k]; p != 0 && *p != 0 && n + 1 < cap; p++)
+			out[n++] = *p;
+	out[n] = 0;
+}
+
+static int
+run_starts(const char *s, const char *prefix)
+{
+	while (*prefix != 0)
+		if (*s++ != *prefix++)
+			return 0;
+	return 1;
+}
+
+static int
+run_has(const char *s, const char *needle)
+{
+	for (; *s != 0; s++)
+		if (run_starts(s, needle))
+			return 1;
+	return 0;
+}
+
+static void
+run_write(const char *path, const char *text)
+{
+	int fd = open(path, RUN_O_WRONLY | RUN_O_CREAT | RUN_O_TRUNC, 0644);
+
+	if (fd >= 0) {
+		write(fd, text, run_len(text));
+		close(fd);
+	}
+}
+
+static void run_poll(void *context);
+
+static void
+run_again(void)
+{
+	dispatch_after_f(dispatch_time(0, 2000000000LL), dispatch_get_global_queue(0, 0), 0, run_poll);
+}
+
+static void
+run_one(char *line)
+{
+	char *tok[32];
+	char *argv[20], *envp[16];
+	char out[256], status[256], tmp[256], num[24], text[256];
+	int ntok = 0, nenv = 0, nargv = 0, i, prog = -1, fd, pid = 0, st = 0;
+	long timeout = 120, tenths = 0;
+	void *fa = 0;
+
+	for (char *p = line; *p != 0 && ntok < 32;) {
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+			*p++ = 0;
+		if (*p == 0)
+			break;
+		tok[ntok++] = p;
+		while (*p != 0 && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+			p++;
+	}
+	if (ntok < 2 || run_len(tok[0]) > 24) {
+		fix_put("A8RUN: request needs ID PROGRAM\n");
+		return;
+	}
+	for (const char *c = tok[0]; *c != 0; c++)
+		if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') ||
+		    *c == '-' || *c == '_')) {
+			fix_put("A8RUN: an ID is letters, digits, - and _ only\n");
+			return;
+		}
+	envp[nenv++] = "HOME=/private/var/mobile";
+	envp[nenv++] = "TMPDIR=" RUN_DIR;
+	envp[nenv++] = "PATH=/usr/bin:/bin";
+	for (i = 1; i < ntok; i++) {
+		if (run_has(tok[i], "=") && !run_starts(tok[i], "/")) {
+			if (run_starts(tok[i], "A8RUN_TIMEOUT=")) {
+				timeout = 0;
+				for (const char *c = tok[i] + 14; *c >= '0' && *c <= '9'; c++)
+					timeout = timeout * 10 + (*c - '0');
+				if (timeout < 1 || timeout > 600)
+					timeout = 120;
+			} else if (nenv < 15) {
+				envp[nenv++] = tok[i];
+			}
+			continue;
+		}
+		prog = i;
+		break;
+	}
+	envp[nenv] = 0;
+	if (prog < 0 || !run_starts(tok[prog], RUN_BIN) || run_has(tok[prog], "/..") ||
+	    run_has(tok[prog], "/./")) {
+		fix_put("A8RUN: PROGRAM must be under " RUN_BIN "\n");
+		return;
+	}
+	for (i = prog; i < ntok && nargv < 19; i++)
+		argv[nargv++] = tok[i];
+	argv[nargv] = 0;
+	run_join(out, sizeof(out), RUN_DIR "out.", tok[0], ".txt");
+	run_join(status, sizeof(status), RUN_DIR "status.", tok[0], ".txt");
+	run_join(tmp, sizeof(tmp), RUN_DIR "status.", tok[0], ".tmp");
+	fd = open(out, RUN_O_WRONLY | RUN_O_CREAT | RUN_O_TRUNC, 0644);
+	if (fd < 0) {
+		fix_put("A8RUN: cannot open the output file\n");
+		return;
+	}
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fd, 1);
+	posix_spawn_file_actions_adddup2(&fa, fd, 2);
+	st = posix_spawn(&pid, argv[0], &fa, 0, argv, envp);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fd);
+	fix_put("A8RUN: ");
+	fix_put(tok[0]);
+	fix_put(st == 0 ? " started " : " could not start ");
+	fix_put(argv[0]);
+	fix_put("\n");
+	if (st != 0) {
+		fix_itoa(st, num);
+		run_join(text, sizeof(text), "A8RUN spawn-error ", num, "\n");
+		run_write(tmp, text);
+		rename(tmp, status);
+		return;
+	}
+	st = 0;
+	while (waitpid(pid, &st, 1 /* WNOHANG */) == 0) {
+		if (tenths >= timeout * 10) {
+			kill(pid, 9);
+			waitpid(pid, &st, 0);
+			fix_put("A8RUN: killed at the timeout\n");
+			break;
+		}
+		usleep(100000);
+		tenths++;
+	}
+	{
+		char a[160], b[24], c[24];
+		int sig = st & 0x7f, code = (st >> 8) & 0xff;
+
+		fix_itoa(pid, num);
+		run_join(a, sizeof(a), "A8RUN ", tok[0], " pid ");
+		run_join(text, sizeof(text), a, num, " exit ");
+		fix_itoa(sig == 0 ? code : -1, b);
+		run_join(a, sizeof(a), text, b, " signal ");
+		fix_itoa(sig, c);
+		run_join(text, sizeof(text), a, c, " seconds ");
+		fix_itoa(tenths / 10, b);
+		run_join(a, sizeof(a), text, b, "\n");
+		run_write(tmp, a);
+		rename(tmp, status);
+		fix_put(a);
+	}
+}
+
+static void
+run_poll(void *context)
+{
+	char line[1024];
+	long n;
+	int fd;
+
+	(void)context;
+	if (!run_busy && (fd = open(RUN_DIR "request", 0)) >= 0) {
+		n = read(fd, line, sizeof(line) - 1);
+		close(fd);
+		rename(RUN_DIR "request", RUN_DIR "request.taken");
+		if (n > 0) {
+			line[n] = 0;
+			run_busy = 1;
+			run_one(line);
+			run_busy = 0;
+		}
+	}
+	run_again();
+}
+
+static void
+run_apply(void)
+{
+	mkdir(RUN_DIR, 0755);
+	fix_put("A8FIX run: test runner waits for " RUN_DIR "request (v18h)\n");
+	run_again();
+}
+
 __attribute__((constructor)) static void
 fix_init(void)
 {
@@ -3082,6 +3320,7 @@ fix_init(void)
 	if (fix_is_springboard) {
 		curtain_apply();
 		aod_wall_apply();
+		run_apply();
 	}
 	/* (Control Center's module is a bundle loaded later: keep looking) */
 	_dyld_register_func_for_add_image(fix_image_added);
