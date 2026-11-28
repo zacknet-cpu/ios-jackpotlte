@@ -3298,6 +3298,148 @@ run_apply(void)
 	run_again();
 }
 
+/*
+ * v18i (P13 phase 3 DRAFT; built 11-28, NOT deployed): Metal in listed processes only.
+ * jtmetal stays 0, so the kernel's IOAcceleratorES "sgx" names no Metal plug-in and Metal
+ * registers no device in any process.  In a process whose name is a line of
+ * /private/var/mobile/Library/a8metal/processes, this library registers JackpotlteMetal's
+ * device itself, once, as the process starts:
+ *   1. MTLCreateSystemDefaultDevice(): Metal's own one-time registration runs (and finds
+ *      nothing, as everywhere) and its device array exists.  On 16.7 that function reads
+ *      the array on every call (count 0: nil; 1: that device; read from Metal's own code).
+ *   2. NSBundle .../a8metal/JackpotlteMetal.bundle, class JackpotlteMetalDevice,
+ *      -initWithAcceleratorPort: with the "sgx" service (the class opens JackpotlteMali
+ *      itself, as Jesvi's RedwoodMetalDevice opens its GPU service).
+ *   3. MTLAddDevice(device): Metal's exported registration call (it asserts MTLDevice and
+ *      MTLDeviceSPI conformance, runs initLimits for featureProfile 1, adds the device).
+ * Later MTLCreateSystemDefaultDevice() calls in that process return our device; no other
+ * process changes.  No list file = nothing happens (the file is the switch).  The UI's
+ * own processes are refused whatever the list says: backboardd (CoreAnimation would pick
+ * Metal for the screen), SpringBoard, and mediaserverd (with Jesvi's driver on, every new
+ * mediaserverd aborted, 2026-11-12).  Nothing here interposes a C function (dyld on this
+ * port has AMFI flags 0 outside jtexecinject; Jesvi's metalon interposed the IORegistry
+ * reads instead).
+ */
+#define METAL_DIR    "/private/var/mobile/Library/a8metal/"
+#define METAL_LIST   METAL_DIR "processes"
+#define METAL_BUNDLE METAL_DIR "JackpotlteMetal.bundle"
+#define METAL_RTLD_NOW 0x2
+extern void *dlopen(const char *path, int mode);
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *pool);
+
+/* NAME is a line of the list (at most 4 KB read; lines starting with # are notes) */
+static int
+metal_listed(const char *name)
+{
+	char buf[4096];
+	long n, i, at = 0;
+	int fd = open(METAL_LIST, 0);
+
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = 0;
+	for (i = 0; i <= n; i++) {
+		if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == 0) {
+			buf[i] = 0;
+			if (buf[at] != '#' && buf[at] != 0 && fix_streq(buf + at, name))
+				return 1;
+			at = i + 1;
+		}
+	}
+	return 0;
+}
+
+static void
+metal_attach(const char *name)
+{
+	typedef id (*create_fn)(void);
+	typedef void (*add_fn)(id);
+	typedef void *(*matching_fn)(const char *);
+	typedef unsigned int (*service_fn)(unsigned int, void *);
+	id (*msg_s)(id, SEL, const char *) = (id (*)(id, SEL, const char *))objc_msgSend;
+	id (*msg_o)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+	id (*msg_u)(id, SEL, unsigned int) = (id (*)(id, SEL, unsigned int))objc_msgSend;
+	id (*msg_0)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	signed char (*msg_b)(id, SEL) = (signed char (*)(id, SEL))objc_msgSend;
+	void *metal, *iokit, *pool;
+	create_fn create;
+	add_fn add;
+	matching_fn matching;
+	service_fn get_service;
+	id dev, path, bundle, cls_name, cls;
+	unsigned int sgx;
+
+	metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", METAL_RTLD_NOW);
+	iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", METAL_RTLD_NOW);
+	create = metal ? (create_fn)dlsym(metal, "MTLCreateSystemDefaultDevice") : 0;
+	add = metal ? (add_fn)dlsym(metal, "MTLAddDevice") : 0;
+	matching = iokit ? (matching_fn)dlsym(iokit, "IOServiceMatching") : 0;
+	get_service = iokit ? (service_fn)dlsym(iokit, "IOServiceGetMatchingService") : 0;
+	if (!create || !add || !matching || !get_service) {
+		fix_put("A8FIX metal: Metal or IOKit is missing a call; nothing added\n");
+		return;
+	}
+	pool = objc_autoreleasePoolPush();
+	dev = create();
+	if (dev != 0) {
+		fix_put("A8FIX metal: this process already has a Metal device; nothing added\n");
+		msg_0(dev, sel_registerName("release"));
+		objc_autoreleasePoolPop(pool);
+		return;
+	}
+	path = msg_s((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"),
+	    METAL_BUNDLE);
+	bundle = msg_o((id)objc_getClass("NSBundle"), sel_registerName("bundleWithPath:"), path);
+	if (bundle == 0 || !msg_b(bundle, sel_registerName("load"))) {
+		fix_put("A8FIX metal: " METAL_BUNDLE " did not load; nothing added\n");
+		objc_autoreleasePoolPop(pool);
+		return;
+	}
+	cls_name = msg_s((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"),
+	    "JackpotlteMetalDevice");
+	cls = msg_o(bundle, sel_registerName("classNamed:"), cls_name);
+	sgx = get_service(0, matching("IOAcceleratorES"));
+	dev = cls ? msg_u(msg_0(cls, sel_registerName("alloc")),
+	    sel_registerName("initWithAcceleratorPort:"), sgx) : 0;
+	if (dev == 0) {
+		fix_put("A8FIX metal: no JackpotlteMetalDevice came out of the bundle; nothing added\n");
+		objc_autoreleasePoolPop(pool);
+		return;
+	}
+	add(dev);
+	msg_0(dev, sel_registerName("release"));
+	dev = create();
+	fix_put("A8FIX metal: JackpotlteMetal registered in ");
+	fix_put(name);
+	fix_put(dev != 0 ? "; MTLCreateSystemDefaultDevice answers it (v18i)\n" :
+	    "; MTLCreateSystemDefaultDevice still answers nil (v18i)\n");
+	if (dev != 0)
+		msg_0(dev, sel_registerName("release"));
+	objc_autoreleasePoolPop(pool);
+}
+
+static void
+metal_apply(void)
+{
+	const char *name = getprogname();
+
+	if (name == 0 || !metal_listed(name))
+		return;
+	if (fix_streq(name, "backboardd") || fix_streq(name, "SpringBoard") ||
+	    fix_streq(name, "mediaserverd")) {
+		fix_put("A8FIX metal: ");
+		fix_put(name);
+		fix_put(" is listed but never gets Metal from this library\n");
+		return;
+	}
+	metal_attach(name);
+}
+
 __attribute__((constructor)) static void
 fix_init(void)
 {
@@ -3316,6 +3458,7 @@ fix_init(void)
 	anim_apply();
 	bd_apply();
 	ci_apply();
+	metal_apply();          /* v18i draft: only processes in a8metal/processes */
 	fix_is_springboard = fix_streq(getprogname(), "SpringBoard");
 	if (fix_is_springboard) {
 		curtain_apply();
