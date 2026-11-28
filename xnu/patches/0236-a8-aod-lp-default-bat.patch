@@ -1,0 +1,170 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 9204d7e..4091dba 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1667,6 +1667,8 @@ extern int sweet_fb_trace_set(int count);       /* SweetFramebuffer.cpp, 0231 */
+ extern int sweet_fb_aod_set(int value);         /* SweetFramebuffer.cpp, 0232 */
+ extern int sweet_fb_aodlp_set(int lp, int stop);  /* SweetFramebuffer.cpp, 0233 */
+ extern int a8_panel_hlpm(int mode);             /* a5xelte_panel.c, 0233 */
++extern int jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full);   /* jackpotlte_pmic.c; 0236 "bat" */
+ extern int sweet_fb_out_set(uint32_t sel, int32_t off, uint64_t value, int list);
+ extern int sweet_fb_prop_set(const char *key, const char *value);
+ extern void a8_noexec_set(const char *names);   /* mem.c, 0219 */
+@@ -1745,7 +1747,7 @@ a8s_command(const char *line)
+ 		    "fbprop NAME [N|true|false] | aod [0|1|LEVEL] (0232 dim lock screen)\n");
+ 		printf("A8SH: dim lock screen power (0233, try with the user watching): aodlp [0|1|2] "
+ 		    "(AOR dim | HLPM 2 nit | HLPM 60 nit) | aodstop [0|1] (DECON trigger masked) | "
+-		    "hlpm [0|1|2] (now)\n");
++		    "hlpm [0|1|2] (now) | bat (gauge now, 0236)\n");
+ 		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
+ 		    "(writes the slot that is not the default) | tryb (boot it once) | "
+ 		    "tryok | promote\n");
+@@ -1984,6 +1986,16 @@ a8s_command(const char *line)
+ 			}
+ 		}
+ 		(void)sweet_fb_aod_set(v);
++	} else if (a8s_word(line, "bat", &rest)) {
++		/* 0236: one fresh charger / fuel gauge sample (drain measurements) */
++		unsigned pct = 0, mv = 0;
++		int ma = 0, ext = 0, chg = 0, full = 0;
++
++		if (jackpotlte_battery_read(&pct, &mv, &ma, &ext, &chg, &full) == 0) {
++			printf("A8SH: bat %u%% %u mV %d mA ext=%d chg=%d full=%d\n", pct, mv, ma, ext, chg, full);
++		} else {
++			printf("A8SH: bat: no reading\n");
++		}
+ 	} else if (a8s_word(line, "aodlp", &rest) || a8s_word(line, "aodstop", &rest) ||
+ 	    a8s_word(line, "hlpm", &rest)) {
+ 		/* 0233: "aodlp N", "aodstop N", "hlpm N" (no N: report) */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 020e61f..01f85f0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <kern/clock.h>
++#include <kern/thread_call.h>
+ #include <sys/proc.h>
+ #include <libkern/OSAtomic.h>
+ #include <string.h>
+@@ -321,7 +322,10 @@ extern "C" int a8_panel_brightness_get(void);
+  * memory, while DECON otherwise sends it the same frame on every TE (seen
+  * 11-27: frame-done keeps coming with no flip; masked, it stops).  Display on
+  * arms the trigger first, then leaves HLPM, then puts the level back.
+- * Boot-args a8aodlp=N, a8aodstop=1; console "aodlp N", "aodstop 0|1".
++ * Boot-args a8aodlp=N, a8aodstop=0|1; console "aodlp N", "aodstop 0|1".
++ * 0236: both ON by default (HLPM 2 nit + trigger masked, with 0235 letting
++ * each flip through), judged with the user watching on 11-28: the live clock
++ * updates, the picture is right, wake is normal.
+  */
+ static int sweet_fb_aod_lp = -1;                /* -1: boot-arg not read yet */
+ static int sweet_fb_aod_stop = -1;
+@@ -855,6 +859,58 @@ sweet_fb_gpu_gate_worker(uint64_t seq, uint64_t done)
+ 	a8_gpu_gate_us += us;
+ }
+ 
++/*
++ * 0235 (P14 AOD): a flip while DECON's trigger is masked for the dim lock
++ * screen (0233 aodstop) would never reach the panel -- with the live dim
++ * lock screen (GL shim glca31b) CoreAnimation draws each new minute.  The
++ * flip arms the trigger, and 50 ms later (three TE periods; the update has
++ * gone by then, or it waits another 50 ms) it is masked again while the
++ * screen is still dim.
++ */
++static uint32_t a8_decon_trigger(bool on);
++static thread_call_t a8_remask_call;
++static uint32_t a8_aod_frames_let;
++
++static void
++a8_remask(thread_call_param_t p0, thread_call_param_t p1)
++{
++#pragma unused(p0, p1)
++	bool again = false;
++
++	if (a8_scan_lock == NULL) {
++		return;
++	}
++	IOSimpleLockLock(a8_scan_lock);
++	if (sweet_fb_aod_stopped) {
++		if (a8_scan_pending()) {
++			again = true;
++		} else {
++			(void)a8_decon_trigger(false);
++		}
++	}
++	IOSimpleLockUnlock(a8_scan_lock);
++	if (again) {
++		uint64_t deadline;
++
++		clock_interval_to_deadline(50, kMillisecondScale, &deadline);
++		thread_call_enter_delayed(a8_remask_call, deadline);
++	}
++}
++
++static void
++a8_aod_let_frame(void)
++{
++	uint64_t deadline;
++
++	if (a8_remask_call == NULL) {
++		return;
++	}
++	(void)a8_decon_trigger(true);
++	a8_aod_frames_let++;
++	clock_interval_to_deadline(50, kMillisecondScale, &deadline);
++	thread_call_enter_delayed(a8_remask_call, deadline);
++}
++
+ /* Point DPP0 at a buffer and ask for the update (0191); a8_scan_lock held. */
+ static void
+ a8_scan_program(uint32_t height, uint32_t addr, uint32_t width)
+@@ -865,6 +921,9 @@ a8_scan_program(uint32_t height, uint32_t addr, uint32_t width)
+ 	a8_shown_addr = addr;
+ 	a8_shown_width = width;
+ 	a8_flips++;
++	if (sweet_fb_aod_stopped) {             /* 0235 */
++		a8_aod_let_frame();
++	}
+ }
+ 
+ /* 0233: DECON's hardware trigger (HW_SW_TRIG_CONTROL): on = HW_TRIG_EN,
+@@ -1764,6 +1823,9 @@ sweet_fb_aodlp_set(int lp, int stop)
+ 	    sweet_fb_aod_lp == 1 ? "HLPM 2 nit" : sweet_fb_aod_lp == 2 ? "HLPM 60 nit" :
+ 	    sweet_fb_aod_lp == 0 ? "AOR dim" : "boot-arg not read yet", sweet_fb_aod_stop,
+ 	    sweet_fb_aod_active ? "; dim now" : "", sweet_fb_aod_stopped ? ", DECON trigger masked" : "");
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	printf("A8SH: frames let through the masked trigger (0235): %u\n", a8_aod_frames_let);
++#endif
+ 	return sweet_fb_aod_lp;
+ }
+ 
+@@ -1949,18 +2011,23 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				sweet_fb_aod_saved = level;
+ 				sweet_fb_aod_active = 1;
+ 				if (sweet_fb_aod_lp < 0) {         /* 0233 boot-args, once each */
+-					int v = 0;
+-					sweet_fb_aod_lp = PE_parse_boot_argn("a8aodlp", &v, sizeof(v)) && v >= 1 && v <= 2 ? v : 0;
++					int v = 1;                  /* 0236: HLPM 2 nit by default (user, 11-28) */
++					(void)PE_parse_boot_argn("a8aodlp", &v, sizeof(v));
++					sweet_fb_aod_lp = v >= 0 && v <= 2 ? v : 1;
+ 				}
+ 				if (sweet_fb_aod_stop < 0) {
+-					int v = 0;
+-					sweet_fb_aod_stop = PE_parse_boot_argn("a8aodstop", &v, sizeof(v)) && v != 0 ? 1 : 0;
++					int v = 1;                  /* 0236: DECON trigger masked by default */
++					(void)PE_parse_boot_argn("a8aodstop", &v, sizeof(v));
++					sweet_fb_aod_stop = v != 0 ? 1 : 0;
+ 				}
+ 				lp = sweet_fb_aod_lp > 0 ? a8_panel_hlpm(sweet_fb_aod_lp) : 0;
+ 				if (lp <= 0 && (level < 0 || level > sweet_fb_aod_level)) {
+ 					(void)a8_panel_brightness((unsigned int)sweet_fb_aod_level);
+ 				}
+ 				if (sweet_fb_aod_stop > 0) {
++					if (a8_remask_call == NULL) {   /* 0235 */
++						a8_remask_call = thread_call_allocate(a8_remask, NULL);
++					}
+ 					sweet_fb_aod_stopped = 1;
+ 					IOLog("SWEET FB: DECON trigger masked while dim (0233): 0x%x\n", a8_decon_trigger(false));
+ 				}
