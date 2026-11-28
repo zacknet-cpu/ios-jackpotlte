@@ -1,0 +1,274 @@
+diff --git a/bsd/dev/a8_acpm.c b/bsd/dev/a8_acpm.c
+index 63bcbcf..4fe8c99 100644
+--- a/bsd/dev/a8_acpm.c
++++ b/bsd/dev/a8_acpm.c
+@@ -948,6 +948,52 @@ a8t_hottest(int *celsius, int *cpu, int *g3d)
+ 	return true;
+ }
+ 
++/*
++ * 0241 (P16): one TMU probe for SweetThermal's HID temperature services
++ * (iokit/Kernel/arm/hid/SweetHID.cpp), in hundredths of a degree C.
++ * which 0 = the CPU block (exynos7885.dtsi BIG@10070000 and LITTLE@10070000
++ * both read its one probe, sensors = <1>), 1 = G3D@10074000.  Never waits:
++ * while a8a_lock is held (ACPM IPC, a DVFS change, the firmware load) the
++ * last good reading of that probe is given, if it is under 10 s old.
++ * 0, or -1 when there is no reading.
++ */
++int a8_tmu_centi(int which, int *centi);
++int
++a8_tmu_centi(int which, int *centi)
++{
++	static int last[2];
++	static uint64_t last_at[2];
++	uint32_t raw[4], esr;
++	uint64_t now, age;
++	int celsius = 0;
++	bool ok;
++
++	if (which < 0 || which > 1 || centi == NULL) {
++		return -1;
++	}
++	now = mach_absolute_time();
++	if (!lck_mtx_try_lock(&a8a_lock)) {
++		nanoseconds_to_absolutetime(10ULL * NSEC_PER_SEC, &age);
++		if (last_at[which] != 0 && now - last_at[which] < age) {
++			*centi = last[which];
++			return 0;
++		}
++		return -1;
++	}
++	a8t_map();
++	ok = a8t_read(which == 0 ? a8a.tmu_cpu : a8a.tmu_g3d, &celsius, raw, &esr);
++	if (ok) {
++		last[which] = celsius * 100;
++		last_at[which] = now;
++	}
++	lck_mtx_unlock(&a8a_lock);
++	if (!ok) {
++		return -1;
++	}
++	*centi = celsius * 100;
++	return 0;
++}
++
+ /* ---- DVFS ---- */
+ static bool
+ a8a_fvp_attached(void)
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 13fa8b3..5f702f9 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -722,3 +722,196 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * 0241 (P16): temperature services for thermalmonitord (boot-arg a8thermal=1;
++ * default 0 = none are published, as before).
++ *
++ * thermalmonitord on iOS 16.7 (D22AP-Info.plist) matches HID services with
++ * PrimaryUsagePage 0xff00 / PrimaryUsage 5 (Apple vendor temperature sensor),
++ * binds each to a Sensors entry by Product == matchName, or for a
++ * four-character matchName by LocationID == that four-char code, and reads
++ * IOHIDServiceClientCopyEvent(service, 15 = kIOHIDEventTypeTemperature):
++ * the temperature level, degrees C (it keeps hundredths).  Here every one of
++ * those services answers copyEvent from the A8's own sensors:
++ *   - the Exynos 7885 TMU has two probes (a8_acpm.c, a8_tmu_centi): the CPU
++ *     block's one probe (the vendor BIG and LITTLE zones both read it) and
++ *     the G3D block's.  "PMGR SOC Die Temp Sensor0/1" (lsSensorType
++ *     coreTypeP) and the CPU cluster's "ACC Temp Sensor0..2" take the CPU
++ *     probe, "PMGR SOC Die Temp Sensor2/3" (coreTypeG) the G3D probe; the
++ *     "Avg: " and "Max: " names are the same reading (one probe each: its
++ *     average and maximum are itself).
++ *   - TG0B (battery, LocationID 'TG0B') and TG0V (the gauge's second entry,
++ *     taken as the same battery reading) are the s2mu004 fuel gauge's
++ *     battery temperature (jackpotlte_pmic.c, sampled with the battery poll).
++ * Not published (no source on this board yet): PMU tdev1..5 / tcal / tjunc
++ * (PMIC board thermistors; the A8's are on the AP's ADC), NAND CH0 temp,
++ * mic1/mic2, Tarc.  The synthesised skins come from these in thermalmonitord.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++extern "C" int a8_tmu_centi(int which, int *centi);              /* a8_acpm.c */
++extern "C" int jackpotlte_battery_temperature(int *deci);        /* jackpotlte_pmic.c */
++#endif
++
++enum { kSweetTempCPU = 0, kSweetTempG3D = 1, kSweetTempBattery = 2 };
++
++static const struct {
++	const char *product;
++	UInt32      location;       /* LocationID: the four-char code for 4-character names */
++	int         source;
++} kSweetTempSensors[] = {
++	{ "TG0B", 0x54473042, kSweetTempBattery },     /* 'TG0B' */
++	{ "TG0V", 0x54473056, kSweetTempBattery },     /* 'TG0V' */
++	{ "PMGR SOC Die Temp Sensor0", 0, kSweetTempCPU },
++	{ "Avg: PMGR SOC Die Temp Sensor0", 0, kSweetTempCPU },
++	{ "Max: PMGR SOC Die Temp Sensor0", 0, kSweetTempCPU },
++	{ "PMGR SOC Die Temp Sensor1", 0, kSweetTempCPU },
++	{ "Avg: PMGR SOC Die Temp Sensor1", 0, kSweetTempCPU },
++	{ "Max: PMGR SOC Die Temp Sensor1", 0, kSweetTempCPU },
++	{ "PMGR SOC Die Temp Sensor2", 0, kSweetTempG3D },
++	{ "Avg: PMGR SOC Die Temp Sensor2", 0, kSweetTempG3D },
++	{ "Max: PMGR SOC Die Temp Sensor2", 0, kSweetTempG3D },
++	{ "PMGR SOC Die Temp Sensor3", 0, kSweetTempG3D },
++	{ "Avg: PMGR SOC Die Temp Sensor3", 0, kSweetTempG3D },
++	{ "Max: PMGR SOC Die Temp Sensor3", 0, kSweetTempG3D },
++	{ "ACC Temp Sensor0", 0, kSweetTempCPU },
++	{ "Avg: ACC Temp Sensor0", 0, kSweetTempCPU },
++	{ "Max: ACC Temp Sensor0", 0, kSweetTempCPU },
++	{ "ACC Temp Sensor1", 0, kSweetTempCPU },
++	{ "Avg: ACC Temp Sensor1", 0, kSweetTempCPU },
++	{ "Max: ACC Temp Sensor1", 0, kSweetTempCPU },
++	{ "ACC Temp Sensor2", 0, kSweetTempCPU },
++	{ "Avg: ACC Temp Sensor2", 0, kSweetTempCPU },
++	{ "Max: ACC Temp Sensor2", 0, kSweetTempCPU },
++};
++#define SWEET_TEMP_COUNT ((unsigned int)(sizeof(kSweetTempSensors) / sizeof(kSweetTempSensors[0])))
++
++/* the reading of one source in hundredths of a degree C; false when none */
++static bool
++sweet_temp_read(int source, int *centi)
++{
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	int deci = 0;
++
++	switch (source) {
++	case kSweetTempCPU:
++	case kSweetTempG3D:
++		return a8_tmu_centi(source, centi) == 0;
++	case kSweetTempBattery:
++		if (jackpotlte_battery_temperature(&deci) != 0) {
++			return false;
++		}
++		*centi = deci * 10;
++		return true;
++	}
++#else
++	(void)source;
++	(void)centi;
++#endif
++	return false;
++}
++
++class SweetHIDTemperature : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDTemperature);
++public:
++	void setSensor(unsigned index) { fIndex = index; }
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching = NULL,
++	    IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }     /* Apple vendor */
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return 5; }              /* temperature sensor */
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return kSweetTempSensors[fIndex].location; }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE
++	{
++		return OSString::withCString(kSweetTempSensors[fIndex].product);
++	}
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 1000000; }   /* us: polled */
++private:
++	unsigned fIndex;
++	bool fMissSaid;
++};
++OSDefineMetaClassAndStructors(SweetHIDTemperature, IOHIDEventService);
++
++IOHIDEvent *
++SweetHIDTemperature::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused,
++    IOOptionBits options __unused)
++{
++	int centi = 0;
++
++	if (type != kIOHIDEventTypeTemperature) {
++		return NULL;
++	}
++	if (!sweet_temp_read(kSweetTempSensors[fIndex].source, &centi)) {
++		if (!fMissSaid) {
++			fMissSaid = true;
++			IOLog("SWEET THERMAL: \"%s\": no reading yet (said once)\n",
++			    kSweetTempSensors[fIndex].product);
++		}
++		return NULL;
++	}
++	/* IOFixed degrees C: 16.16 */
++	return IOHIDEvent::temperatureEvent(mach_absolute_time(),
++	           (IOFixed)((int64_t)centi * 65536 / 100), 0);
++}
++
++/* The root: publishes the services above when a8thermal=1. */
++class SweetThermal : public IOService {
++	OSDeclareDefaultStructors(SweetThermal);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++private:
++	OSArray *fServices;
++};
++OSDefineMetaClassAndStructors(SweetThermal, IOService);
++
++bool
++SweetThermal::start(IOService *provider)
++{
++	int on = 0, cpu = 0, g3d = 0, bat = 0;
++	bool have_cpu, have_g3d, have_bat;
++	unsigned made = 0;
++
++	(void)PE_parse_boot_argn("a8thermal", &on, sizeof(on));
++	if (!on) {
++		IOLog("SWEET THERMAL: off (a8thermal=1 publishes %u HID temperature services "
++		    "for thermalmonitord)\n", SWEET_TEMP_COUNT);
++		return false;
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fServices = OSArray::withCapacity(SWEET_TEMP_COUNT);
++	if (!fServices) {
++		return false;
++	}
++	for (unsigned i = 0; i < SWEET_TEMP_COUNT; i++) {
++		SweetHIDTemperature *t = OSTypeAlloc(SweetHIDTemperature);
++
++		if (!t) {
++			break;
++		}
++		t->setSensor(i);
++		if (!t->init() || !t->attach(this)) {
++			t->release();
++			continue;
++		}
++		if (!t->start(this)) {
++			t->detach(this);
++			t->release();
++			continue;
++		}
++		t->registerService();
++		fServices->setObject(t);
++		t->release();
++		made++;
++	}
++	have_cpu = sweet_temp_read(kSweetTempCPU, &cpu);
++	have_g3d = sweet_temp_read(kSweetTempG3D, &g3d);
++	have_bat = sweet_temp_read(kSweetTempBattery, &bat);
++	IOLog("SWEET THERMAL: %u of %u temperature services published (0xff00/5); now cpu %d.%02d C%s, "
++	    "g3d %d.%02d C%s, battery %d.%02d C%s\n", made, SWEET_TEMP_COUNT,
++	    cpu / 100, cpu % 100, have_cpu ? "" : " (no reading)", g3d / 100, g3d % 100,
++	    have_g3d ? "" : " (no reading)", bat / 100, bat % 100, have_bat ? "" : " (no reading yet)");
++	registerService();
++	return made != 0;
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 4686ab0..67b0f49 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -94,6 +94,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
++    "   {"                                       /* 0241: a8thermal=1 */
++    "     'IOClass'         = SweetThermal;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetThermal;"
++    "   },"
+ #if !defined(ARM64_BOARD_CONFIG_A5XELTE) || 1  /* S8: MAX77865 */
+     "   {"
+     "     'IOClass'         = SweetBattery;"
