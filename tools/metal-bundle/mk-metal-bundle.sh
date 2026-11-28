@@ -23,7 +23,10 @@ cc=$(xcrun --sdk iphoneos --find clang)
 rm -rf "$work"
 mkdir -p "$work/src" "$work/inc" "$work/out"
 cp "$here"/jesvi/* "$here/m2m.h" "$work/src/"
-patch --no-backup-if-mismatch -d "$work/src" -p1 < "$here/0001-jackpotlte.patch"
+for p in "$here"/0*.patch; do
+	echo "applying $(basename "$p")"
+	patch --no-backup-if-mismatch -d "$work/src" -p1 < "$p"
+done
 
 # IOKit's user headers: the iPhoneOS SDK has IOKit.tbd; when it has no IOKitLib.h,
 # the macOS SDK's headers stand in (the same API; only the declarations are borrowed)
@@ -77,5 +80,5 @@ codesign -s - -f out/metal_props
 	echo "classes:"; nm -gU "$bundle/JackpotlteMetal" | awk '$3 ~ /^_OBJC_CLASS_\$_/ {print "  " substr($3, 15)}'
 	echo "left undefined for Metal:"; for u in ${uflags[@]+"${uflags[@]}"}; do echo "  ${u#-Wl,-U,}"; done
 	echo "signature: $(codesign -dv "$bundle" 2>&1 | grep -E '^(Identifier|Signature|CodeDirectory)' | tr '\n' ' ')"
-	echo "patch: $(shasum -a 256 "$here/0001-jackpotlte.patch" | awk '{print $1}')"
+	echo "patches: $(cat "$here"/0*.patch | shasum -a 256 | awk '{print $1}')"
 } | tee out/build-record.txt

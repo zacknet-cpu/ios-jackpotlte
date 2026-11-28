@@ -48,6 +48,12 @@ jobs:
           strings "$b" | grep -q /private/var/mobile/Library/a8air/libredwoodair.dylib ||
             fail "the driver does not name the a8air libredwoodair"
           strings "$b" | grep -q JackpotlteMali || fail "the driver does not name JackpotlteMali"
+          # 0002: the protocol gaps of the 16.7 class check are answered by name
+          for sel in fillBuffer:range:pattern4: _aneIOSurface synchronizeTexture:slice:level: \
+                     copyIndirectCommandBuffer:sourceRange:destination:destinationIndex: \
+                     fillTexture:level:slice:region:color:pixelFormat:; do
+            strings "$b" | grep -qx "$sel" || fail "selector $sel is not in the driver"
+          done
           plutil -lint "$out/JackpotlteMetal.bundle/Info.plist"
           codesign -v "$out/JackpotlteMetal.bundle" || fail "the bundle's signature does not verify"
           codesign -v "$out/metal_props" || fail "metal_props has no valid signature"

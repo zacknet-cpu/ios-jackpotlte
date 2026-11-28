@@ -1,0 +1,237 @@
+Fill the protocol gaps of Jesvi's RedwoodMetal on iOS 16.7 (P13 class check, 2026-11-28).
+
+research\p13-corpus\class-check-167.txt found required methods (queue/encoder/SPI protocols
+from MetalTools, counting adopted protocols) that neither Apple's base classes nor Jesvi's
+classes implement. Sent to the driver, each would raise "unrecognized selector" in the app
+(the blit encoder's forwarding only catches public selectors whose protocol the runtime can
+find; SPI ones never). Now answered by name:
+- blit encoder (15): optimizeContentsFor{GPU,CPU}Access:slice:level:, synchronizeTexture:
+  slice:level: (no-ops: shared coherent memory); resetCommandsInBuffer:withRange:,
+  copyIndirectCommandBuffer:..., optimizeIndirectCommandBuffer:withRange: (no indirect command
+  buffers: ignored, said once); sampleCountersInBuffer:..., resolveCounters:...,
+  {get,reset}TextureAccessCounters:... (no counters); fillBuffer:range:pattern4: (one repeated
+  byte -> the library's fill; otherwise a processor fill after the earlier GPU work, in order);
+  copyFromTexture:...options: (the copy, options ignored); fillTexture: bytes:length: (one
+  pixel repeated over the region through rwa texture_write) and the two color: variants (pixel
+  made for R8, RG8, RGBA8/BGRA8 (+sRGB), R32F, RGBA16F, RGBA32F; other formats refused by name).
+- buffer (2): iosurface, _aneIOSurface -> NULL (GEM memory, never an IOSurface).
+- argument encoder (1): layout -> nil.
+Only the count is from the class check; behaviour on the phone is untested (phase 3).
+
+diff -ru a/redwoodmetal.m b/redwoodmetal.m
+--- a/redwoodmetal.m	2026-11-28 10:10:57.898042873 -0500
++++ b/redwoodmetal.m	2026-11-28 10:11:53.692365170 -0500
+@@ -107,6 +107,7 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <math.h>              /* jackpotlte 0002: lround/fmin/fmax for the colour fills */
+ #include <string.h>
+ #include <sys/sysctl.h>
+ #include <unistd.h>
+@@ -4789,6 +4790,9 @@
+ }
+ 
+ - (void *)contents          { return _contents; }
++/* jackpotlte 0002 (MTLBufferSPI): this port's buffers are GEM memory, never an IOSurface */
++- (void *)iosurface         { return NULL; }
++- (void *)_aneIOSurface     { return NULL; }
+ - (NSUInteger)length        { return _length; }
+ - (id)device                { return _owner; }
+ - (uint64_t)gpuAddress      { return _iova; }
+@@ -9347,6 +9351,186 @@
+ 	} note:"mipmaps"];
+ }
+ 
++/*
++ * jackpotlte 0002: the rest of MTLBlitCommandEncoder and its SPI as iOS 16.7 declares them
++ * (MetalTools' protocol copies, research\p13-corpus\class-check-167.txt). The forwarding
++ * below only catches public selectors whose protocol the runtime can find; these are answered
++ * by name so no caller can meet "unrecognized selector".
++ */
++/* hints: this GPU's memory is shared and coherent (write-combined), nothing to move */
++- (void)optimizeContentsForGPUAccess:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
++{
++	(void)texture; (void)slice; (void)level;
++}
++- (void)optimizeContentsForCPUAccess:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
++{
++	(void)texture; (void)slice; (void)level;
++}
++- (void)synchronizeTexture:(id)texture slice:(NSUInteger)slice level:(NSUInteger)level
++{
++	(void)texture; (void)slice; (void)level;
++}
++/* indirect command buffers: the device says it has none (-supportsIndirectCommandBuffers) */
++- (void)resetCommandsInBuffer:(id)buffer withRange:(NSRange)range
++{
++	(void)buffer; (void)range;
++	RW_ONCE('W', "ENC", "blit: resetCommandsInBuffer:withRange: ignored (no indirect command buffers)\n");
++}
++- (void)copyIndirectCommandBuffer:(id)source sourceRange:(NSRange)sourceRange
++		      destination:(id)destination destinationIndex:(NSUInteger)destinationIndex
++{
++	(void)source; (void)sourceRange; (void)destination; (void)destinationIndex;
++	RW_ONCE('W', "ENC", "blit: copyIndirectCommandBuffer ignored (no indirect command buffers)\n");
++}
++- (void)optimizeIndirectCommandBuffer:(id)buffer withRange:(NSRange)range
++{
++	(void)buffer; (void)range;
++}
++/* counters and sparse-texture access counters: not offered by this device */
++- (void)sampleCountersInBuffer:(id)sampleBuffer atSampleIndex:(NSUInteger)sampleIndex
++		   withBarrier:(BOOL)barrier
++{
++	(void)sampleBuffer; (void)sampleIndex; (void)barrier;
++	RW_ONCE('W', "ENC", "blit: sampleCountersInBuffer ignored (no counter sampling)\n");
++}
++- (void)resolveCounters:(id)sampleBuffer inRange:(NSRange)range
++      destinationBuffer:(id)destinationBuffer destinationOffset:(NSUInteger)destinationOffset
++{
++	(void)sampleBuffer; (void)range; (void)destinationBuffer; (void)destinationOffset;
++	RW_ONCE('W', "ENC", "blit: resolveCounters ignored (no counter sampling)\n");
++}
++- (void)getTextureAccessCounters:(id)texture region:(MTLRegion)region mipLevel:(NSUInteger)mipLevel
++			   slice:(NSUInteger)slice resetCounters:(BOOL)resetCounters
++		  countersBuffer:(id)countersBuffer countersBufferOffset:(NSUInteger)countersBufferOffset
++{
++	(void)texture; (void)region; (void)mipLevel; (void)slice; (void)resetCounters;
++	(void)countersBuffer; (void)countersBufferOffset;
++}
++- (void)resetTextureAccessCounters:(id)texture region:(MTLRegion)region mipLevel:(NSUInteger)mipLevel
++			     slice:(NSUInteger)slice
++{
++	(void)texture; (void)region; (void)mipLevel; (void)slice;
++}
++/* SPI: a 4-byte pattern; one repeated byte goes to the library's fill, anything else is written
++ * by the processor once the GPU work recorded before it has finished (in order, like the rest) */
++- (void)fillBuffer:(id)buffer range:(NSRange)range pattern4:(uint32_t)pattern
++{
++	if ((pattern & 0xffu) * 0x01010101u == pattern) {
++		[self fillBuffer:buffer range:range value:(uint8_t)pattern];
++		return;
++	}
++	[self record:^BOOL(char *why, size_t n) {
++		uint8_t *p = (uint8_t *)[buffer contents];
++
++		if (p == NULL) {
++			snprintf(why, n, "fillBuffer:range:pattern4: on a buffer with no processor address");
++			return NO;
++		}
++		if (mesa.finish != NULL && mesa.finish([[_commandBuffer device] mesaDevice], why, n) != 0) {
++			return NO;
++		}
++		for (NSUInteger i = 0; i < range.length; i++) {
++			p[range.location + i] = (uint8_t)(pattern >> (8 * (i & 3)));
++		}
++		return YES;
++	} note:"fill pattern4"];
++}
++/* SPI: the option bits (e.g. a format reinterpretation) are not ours to honour; the copy is */
++- (void)copyFromTexture:(id)source sourceSlice:(NSUInteger)sourceSlice
++	    sourceLevel:(NSUInteger)sourceLevel sourceOrigin:(MTLOrigin)sourceOrigin
++	     sourceSize:(MTLSize)sourceSize toTexture:(id)destination
++       destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel
++      destinationOrigin:(MTLOrigin)destinationOrigin options:(NSUInteger)options
++{
++	if (options != 0) {
++		RW_ONCE('W', "ENC", "blit: copyFromTexture options %#lx ignored\n", (unsigned long)options);
++	}
++	[self copyFromTexture:source sourceSlice:sourceSlice sourceLevel:sourceLevel
++		 sourceOrigin:sourceOrigin sourceSize:sourceSize toTexture:destination
++	     destinationSlice:destinationSlice destinationLevel:destinationLevel
++	    destinationOrigin:destinationOrigin];
++}
++/* SPI fills of a texture region: one pixel's bytes repeated over the region, written through
++ * the library in order with the rest of the command buffer */
++- (void)fillTexture:(id)texture level:(NSUInteger)level slice:(NSUInteger)slice
++	     region:(MTLRegion)region bytes:(const void *)bytes length:(NSUInteger)length
++{
++	size_t row, total;
++	uint8_t *fill;
++
++	if (mesa.texture_write == NULL || bytes == NULL || length == 0 || length > 16 ||
++	    region.size.width == 0 || region.size.height == 0) {
++		RW_ONCE('W', "ENC", "blit: fillTexture with a %lu-byte pixel refused\n", (unsigned long)length);
++		return;
++	}
++	row = region.size.width * length;
++	total = row * region.size.height * MAX(region.size.depth, (NSUInteger)1);
++	fill = malloc(total);
++	if (fill == NULL) {
++		return;
++	}
++	for (size_t at = 0; at < total; at += length) {
++		memcpy(fill + at, bytes, length);
++	}
++	[self record:^BOOL(char *why, size_t n) {
++		const unsigned origin[3] = { (unsigned)region.origin.x, (unsigned)region.origin.y,
++					     (unsigned)region.origin.z };
++		const unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
++					   (unsigned)MAX(region.size.depth, (NSUInteger)1) };
++		BOOL ok = mesa.texture_write([texture mesaTexture], (unsigned)level, (unsigned)slice, origin,
++		    size, fill, row, why, n) == 0;
++
++		free(fill);
++		return ok;
++	} note:"fill texture"];
++}
++/* the colour fills: the pixel made from the colour for the formats Apple's GL-on-Metal and
++ * CoreImage clear with; others are refused by name */
++- (void)fillTexture:(id)texture level:(NSUInteger)level slice:(NSUInteger)slice
++	     region:(MTLRegion)region color:(MTLClearColor)color pixelFormat:(MTLPixelFormat)format
++{
++	uint8_t px[16];
++	NSUInteger len = 0;
++	double c[4] = { color.red, color.green, color.blue, color.alpha };
++#define RW_UN8(v) ((uint8_t)lround(fmin(fmax((v), 0.0), 1.0) * 255.0))
++
++	switch (format) {
++	case MTLPixelFormatR8Unorm:
++		px[0] = RW_UN8(c[0]); len = 1; break;
++	case MTLPixelFormatRG8Unorm:
++		px[0] = RW_UN8(c[0]); px[1] = RW_UN8(c[1]); len = 2; break;
++	case MTLPixelFormatRGBA8Unorm:
++	case MTLPixelFormatRGBA8Unorm_sRGB:
++		for (int i = 0; i < 4; i++) px[i] = RW_UN8(c[i]);
++		len = 4; break;
++	case MTLPixelFormatBGRA8Unorm:
++	case MTLPixelFormatBGRA8Unorm_sRGB:
++		px[0] = RW_UN8(c[2]); px[1] = RW_UN8(c[1]); px[2] = RW_UN8(c[0]); px[3] = RW_UN8(c[3]);
++		len = 4; break;
++	case MTLPixelFormatR32Float: {
++		float f = (float)c[0]; memcpy(px, &f, 4); len = 4; break;
++	}
++	case MTLPixelFormatRGBA32Float:
++		for (int i = 0; i < 4; i++) { float f = (float)c[i]; memcpy(px + 4 * i, &f, 4); }
++		len = 16; break;
++	case MTLPixelFormatRGBA16Float:
++		for (int i = 0; i < 4; i++) { __fp16 h = (__fp16)c[i]; memcpy(px + 2 * i, &h, 2); }
++		len = 8; break;
++	default:
++		RW_ONCE('W', "ENC", "blit: fillTexture with a colour into pixel format %lu refused\n",
++		    (unsigned long)format);
++		return;
++	}
++#undef RW_UN8
++	[self fillTexture:texture level:level slice:slice region:region bytes:px length:len];
++}
++- (void)fillTexture:(id)texture level:(NSUInteger)level slice:(NSUInteger)slice
++	     region:(MTLRegion)region color:(MTLClearColor)color
++{
++	[self fillTexture:texture level:level slice:slice region:region color:color
++	      pixelFormat:[texture pixelFormat]];
++}
++
+ /* ordering and residency hints: everything here is in order and resident already */
+ - (void)synchronizeResource:(id)resource                      { (void)resource; }
+ - (void)optimizeContentsForGPUAccess:(id)texture               { (void)texture; }
+@@ -9820,6 +10004,8 @@
+  * that was too small would have the application overlapping its own encodings. */
+ - (NSUInteger)encodedLength { return _layout.encoded_length; }
+ - (NSUInteger)alignment     { return _layout.alignment; }
++/* jackpotlte 0002 (MTLArgumentEncoderSPI): no Apple layout object behind this recorder */
++- (id)layout                { return nil; }
+ 
+ /* Not part of MTLArgumentEncoder: what this encoder is for, so a test can read back the
+  * mapping between Metal's [[id(n)]] and the index the GPU is programmed with instead of
