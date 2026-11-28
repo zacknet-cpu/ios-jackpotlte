@@ -38,18 +38,10 @@ index 9204d7e..4091dba 100644
  	    a8s_word(line, "hlpm", &rest)) {
  		/* 0233: "aodlp N", "aodstop N", "hlpm N" (no N: report) */
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 020e61f..01f85f0 100644
+index d4e088c..01f85f0 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -50,6 +50,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
- #include <pexpert/pexpert.h>
- #include <pexpert/arm64/board_config.h>
- #include <kern/clock.h>
-+#include <kern/thread_call.h>
- #include <sys/proc.h>
- #include <libkern/OSAtomic.h>
- #include <string.h>
-@@ -321,7 +322,10 @@ extern "C" int a8_panel_brightness_get(void);
+@@ -322,7 +322,10 @@ extern "C" int a8_panel_brightness_get(void);
   * memory, while DECON otherwise sends it the same frame on every TE (seen
   * 11-27: frame-done keeps coming with no flip; masked, it stops).  Display on
   * arms the trigger first, then leaves HLPM, then puts the level back.
@@ -61,86 +53,7 @@ index 020e61f..01f85f0 100644
   */
  static int sweet_fb_aod_lp = -1;                /* -1: boot-arg not read yet */
  static int sweet_fb_aod_stop = -1;
-@@ -855,6 +859,58 @@ sweet_fb_gpu_gate_worker(uint64_t seq, uint64_t done)
- 	a8_gpu_gate_us += us;
- }
- 
-+/*
-+ * 0235 (P14 AOD): a flip while DECON's trigger is masked for the dim lock
-+ * screen (0233 aodstop) would never reach the panel -- with the live dim
-+ * lock screen (GL shim glca31b) CoreAnimation draws each new minute.  The
-+ * flip arms the trigger, and 50 ms later (three TE periods; the update has
-+ * gone by then, or it waits another 50 ms) it is masked again while the
-+ * screen is still dim.
-+ */
-+static uint32_t a8_decon_trigger(bool on);
-+static thread_call_t a8_remask_call;
-+static uint32_t a8_aod_frames_let;
-+
-+static void
-+a8_remask(thread_call_param_t p0, thread_call_param_t p1)
-+{
-+#pragma unused(p0, p1)
-+	bool again = false;
-+
-+	if (a8_scan_lock == NULL) {
-+		return;
-+	}
-+	IOSimpleLockLock(a8_scan_lock);
-+	if (sweet_fb_aod_stopped) {
-+		if (a8_scan_pending()) {
-+			again = true;
-+		} else {
-+			(void)a8_decon_trigger(false);
-+		}
-+	}
-+	IOSimpleLockUnlock(a8_scan_lock);
-+	if (again) {
-+		uint64_t deadline;
-+
-+		clock_interval_to_deadline(50, kMillisecondScale, &deadline);
-+		thread_call_enter_delayed(a8_remask_call, deadline);
-+	}
-+}
-+
-+static void
-+a8_aod_let_frame(void)
-+{
-+	uint64_t deadline;
-+
-+	if (a8_remask_call == NULL) {
-+		return;
-+	}
-+	(void)a8_decon_trigger(true);
-+	a8_aod_frames_let++;
-+	clock_interval_to_deadline(50, kMillisecondScale, &deadline);
-+	thread_call_enter_delayed(a8_remask_call, deadline);
-+}
-+
- /* Point DPP0 at a buffer and ask for the update (0191); a8_scan_lock held. */
- static void
- a8_scan_program(uint32_t height, uint32_t addr, uint32_t width)
-@@ -865,6 +921,9 @@ a8_scan_program(uint32_t height, uint32_t addr, uint32_t width)
- 	a8_shown_addr = addr;
- 	a8_shown_width = width;
- 	a8_flips++;
-+	if (sweet_fb_aod_stopped) {             /* 0235 */
-+		a8_aod_let_frame();
-+	}
- }
- 
- /* 0233: DECON's hardware trigger (HW_SW_TRIG_CONTROL): on = HW_TRIG_EN,
-@@ -1764,6 +1823,9 @@ sweet_fb_aodlp_set(int lp, int stop)
- 	    sweet_fb_aod_lp == 1 ? "HLPM 2 nit" : sweet_fb_aod_lp == 2 ? "HLPM 60 nit" :
- 	    sweet_fb_aod_lp == 0 ? "AOR dim" : "boot-arg not read yet", sweet_fb_aod_stop,
- 	    sweet_fb_aod_active ? "; dim now" : "", sweet_fb_aod_stopped ? ", DECON trigger masked" : "");
-+#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
-+	printf("A8SH: frames let through the masked trigger (0235): %u\n", a8_aod_frames_let);
-+#endif
- 	return sweet_fb_aod_lp;
- }
- 
-@@ -1949,18 +2011,23 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -2008,12 +2011,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  				sweet_fb_aod_saved = level;
  				sweet_fb_aod_active = 1;
  				if (sweet_fb_aod_lp < 0) {         /* 0233 boot-args, once each */
@@ -159,12 +72,3 @@ index 020e61f..01f85f0 100644
  				}
  				lp = sweet_fb_aod_lp > 0 ? a8_panel_hlpm(sweet_fb_aod_lp) : 0;
  				if (lp <= 0 && (level < 0 || level > sweet_fb_aod_level)) {
- 					(void)a8_panel_brightness((unsigned int)sweet_fb_aod_level);
- 				}
- 				if (sweet_fb_aod_stop > 0) {
-+					if (a8_remask_call == NULL) {   /* 0235 */
-+						a8_remask_call = thread_call_allocate(a8_remask, NULL);
-+					}
- 					sweet_fb_aod_stopped = 1;
- 					IOLog("SWEET FB: DECON trigger masked while dim (0233): 0x%x\n", a8_decon_trigger(false));
- 				}
