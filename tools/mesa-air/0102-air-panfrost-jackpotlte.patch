@@ -1,4 +1,4 @@
-Build the AIR (Metal) programs against panfrost v6, for the Galaxy S8's Mali-G71.
+Build the AIR (Metal) programs against panfrost v6, for the Galaxy A8 2018's Mali-G71 (Exynos 7885).
 
 Adapted from Jesvi-iOS tools/mesa/air-panfrost.patch (MIT, HakiOS / Darwin on
 redwood contributors; see tools/mesa-air/NOTICE.md). The differences:
