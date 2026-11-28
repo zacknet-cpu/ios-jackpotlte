@@ -23,6 +23,9 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
+    # the last step pushes the binaries to mesa-air-out (as mesa.yml on a8-mesa-o3 does for mesa-out)
+    permissions:
+      contents: write
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
