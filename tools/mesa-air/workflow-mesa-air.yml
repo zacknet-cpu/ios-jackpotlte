@@ -1,0 +1,93 @@
+name: mesa
+
+# NOT ACTIVE: kept here because the CI login has no `workflow` scope (11-28).
+# After `gh auth refresh -s workflow`, copy this file to
+# .github/workflows/mesa.yml on branch a8-p13-air (a workflow can only be
+# dispatched by a file name that exists on main), restore the production
+# tools/mesa-jackpotlte/mk-mesa-jackpotlte.sh from a8-mesa-o3, and dispatch:
+# it builds the AIR targets and pushes them to the mesa-air-out branch.
+#
+# P13 route A, phase 1 (build only): Jesvi-iOS's AIR (Metal shader) frontend
+# inside our Mesa 25.0.7 panfrost v6 tree, for arm64 iOS
+# (tools/mesa-air/mk-mesa-air.sh).
+#
+# A green run means libredwoodair, air_run, air_metal_test and air2nir build
+# for the phone against our drm face. It does not mean any Metal shader has run
+# on the Mali-G71: that is phase 2, on the phone, with the user.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: mesa-air-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          python3 --version
+          xcrun --show-sdk-version --sdk iphoneos
+
+      - name: Build the AIR targets for arm64 iOS
+        run: |
+          tools/mesa-air/mk-mesa-air.sh "$RUNNER_TEMP/mesa-air"
+
+      - name: The products are the phone's
+        run: |
+          set -e
+          out="$RUNNER_TEMP/mesa-air/out"
+          fail() { echo "::error::$1" >&2; exit 1; }
+          for f in libredwoodair.dylib air_run air_metal_test air2nir; do
+            [ -f "$out/$f" ] || fail "$f was not built"
+            lipo -info "$out/$f" | grep -q arm64 || fail "$f is not arm64"
+          done
+          otool -D "$out/libredwoodair.dylib" | grep -q /jackpotlte/lib/libredwoodair.dylib ||
+            fail "libredwoodair.dylib does not have its install name"
+          n=$(nm -gU "$out/libredwoodair.dylib" | awk '$3 ~ /^_rwa_/' | wc -l | tr -d ' ')
+          echo "rwa_* exports: $n"
+          [ "$n" -gt 10 ] || fail "libredwoodair exports almost nothing of air_metal.h"
+          # the drm face is in it (the panfrost screen is opened through it)
+          nm "$out/libredwoodair.dylib" | grep -q drmOpenWithType ||
+            fail "drmOpenWithType is not in libredwoodair: the drm face was not linked"
+          strings "$out/libredwoodair.dylib" | grep -q panfrost ||
+            fail "libredwoodair names no panfrost string"
+
+      - name: Show the build log if anything went wrong
+        if: failure()
+        run: |
+          echo "=== meson-setup.log ==="
+          tail -n 80 "$RUNNER_TEMP/mesa-air/meson-setup.log" || true
+          echo "=== build.log (errors) ==="
+          grep -nE 'error:|FAILED:' "$RUNNER_TEMP/mesa-air/build.log" | head -n 150 || true
+          echo "=== build.log (tail) ==="
+          tail -n 120 "$RUNNER_TEMP/mesa-air/build.log" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-air-panfrost-v6
+          path: |
+            ${{ runner.temp }}/mesa-air/out/
+            ${{ runner.temp }}/mesa-air/meson-setup.log
+            ${{ runner.temp }}/mesa-air/build.log
+
+      - name: Save the result to the mesa-air-out branch
+        if: success()
+        run: |
+          mkdir -p saveout
+          cp "$RUNNER_TEMP"/mesa-air/out/* saveout/
+          ls -la saveout
+          cd saveout
+          git init -q -b mesa-air-out
+          git config user.name "a8-gpu"
+          git config user.email "a8-gpu@users.noreply.github.com"
+          echo "built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})" > BUILD_INFO.txt
+          git add .
+          git commit -q -m "mesa-air-out from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" mesa-air-out
