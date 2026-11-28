@@ -1,0 +1,49 @@
+=== JackpotlteMetal build: from 37d35580be3620f042775d940872783f9a245d85 (run 46158606376) ===
+7dba44eafdb22bd8b5496f134758d6b095de7603039e4e727e055dd098a7b6a5 415696 JackpotlteMetal.bundle/JackpotlteMetal
+f8276547dec1009302964dd5ad73923b7fef0f4e8615bffc0dbfdad06277daaa 69712 metal_props
+5a88bc9521dc83fea3bd219f449b4a4b9ec61b12c25af3c1ed695a332053a411 422400 JackpotlteMetal.bundle.tar
+out/JackpotlteMetal.bundle/JackpotlteMetal: Mach-O 64-bit bundle arm64
+loads:
+	/System/Library/Frameworks/Foundation.framework/Foundation (compatibility version 300.0.0, current version 3502.0.0)
+	/System/Library/Frameworks/Metal.framework/Metal (compatibility version 1.0.0, current version 368.12.0)
+	/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit (compatibility version 1.0.0, current version 275.0.0)
+	/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation (compatibility version 150.0.0, current version 3502.0.0)
+	/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)
+	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)
+classes:
+  JackpotlteMetalDevice
+  RedwoodMetalArgumentEncoder
+  RedwoodMetalBlitEncoder
+  RedwoodMetalBuffer
+  RedwoodMetalCommandBuffer
+  RedwoodMetalCommandQueue
+  RedwoodMetalComputeEncoder
+  RedwoodMetalComputePipeline
+  RedwoodMetalDepthStencilState
+  RedwoodMetalDevice
+  RedwoodMetalRenderEncoder
+  RedwoodMetalRenderPipeline
+  RedwoodMetalSampler
+  RedwoodMetalTexture
+  RedwoodMetalWork
+left undefined for Metal:
+  _OBJC_CLASS_$__MTLCommandBuffer
+  _OBJC_CLASS_$__MTLCommandEncoder
+  _OBJC_CLASS_$__MTLCommandQueue
+  _OBJC_CLASS_$__MTLComputePipelineState
+  _OBJC_CLASS_$__MTLDepthStencilState
+  _OBJC_CLASS_$__MTLDevice
+  _OBJC_CLASS_$__MTLRenderPipelineState
+  _OBJC_CLASS_$__MTLResource
+  _OBJC_CLASS_$__MTLSamplerState
+  _OBJC_METACLASS_$__MTLCommandBuffer
+  _OBJC_METACLASS_$__MTLCommandEncoder
+  _OBJC_METACLASS_$__MTLCommandQueue
+  _OBJC_METACLASS_$__MTLComputePipelineState
+  _OBJC_METACLASS_$__MTLDepthStencilState
+  _OBJC_METACLASS_$__MTLDevice
+  _OBJC_METACLASS_$__MTLRenderPipelineState
+  _OBJC_METACLASS_$__MTLResource
+  _OBJC_METACLASS_$__MTLSamplerState
+signature: Identifier=com.jackpotlte.metal CodeDirectory v=20400 size=3309 flags=0x2(adhoc) hashes=97+3 location=embedded Signature=adhoc 
+patches: 3fb39208d07d4cf3e94163cc3f3c97e9edb431d22d609caaf8ce462e1d952c55
