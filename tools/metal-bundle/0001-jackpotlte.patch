@@ -1,0 +1,139 @@
+Adapt Jesvi-iOS's RedwoodMetal driver (userland/src, MIT) to the Galaxy A8 2018 port.
+
+- the GPU service: JackpotlteMali (xnu 0154) first. Its requests are panfrost's
+  (0x42 CREATE_BO with the GPU address back, 0x44 GET_PARAM, 0x09 GEM_CLOSE,
+  IOConnectMapMemory64 with the handle as the memory type) = Jesvi's RedwoodMali
+  shape, so gpu_is_mali is set for it; RedwoodGPU / RedwoodMali stay as fallbacks.
+- the drawable's surface request 0x7e: same number; JackpotlteMali takes the first
+  40 bytes of struct rwd_surface and hands back what it was given (planeOffset /
+  planeRowBytes come back zero: one plane).
+- the compiler library: /private/var/mobile/Library/a8air/libredwoodair.dylib (P13
+  phase 2's path; a copy beside the bundle's executable still wins).
+- class JackpotlteMetalDevice (a subclass, nothing added): the MetalPluginClassName
+  our kernel's jtmetal=1 and the fix library's per-process hook name.
+- metal_props: our names, and a note that our accelerator takes no properties.
+featureProfile stays Jesvi's default 1 (metal_profile= boot-arg to change).
+
+diff -ru a/metal_props.c b/metal_props.c
+--- a/metal_props.c	2026-11-28 09:46:26.315061861 -0500
++++ b/metal_props.c	2026-11-28 09:46:42.059903674 -0500
+@@ -21,9 +21,15 @@
+  *
+  *   metal_props                 show what the service carries now
+  *   metal_props auto            enable only with the kernel compatibility policy
+- *   metal_props on              set RedwoodMetal / RedwoodMetalDevice (what this port installs)
++ *   metal_props on              set JackpotlteMetal / JackpotlteMetalDevice (what this port installs)
+  *   metal_props on NAME CLASS   set those two instead
+  *   metal_props off             remove both (an empty string removes, see setProperties)
++
++ *
++ * jackpotlte: on this port the accelerator is SweetFramebuffer.cpp's IOAcceleratorES "sgx". It names
++ * JackpotlteMetal / JackpotlteMetalDevice only with the boot-arg jtmetal=1 (kept 0) and takes no
++ * properties from user space (on/off answer kIOReturnUnsupported); per-process Metal is the fix
++ * library's hook instead (P13 phase 3). Here "show" is the useful word.
+  */
+ #include <stdio.h>
+ #include <string.h>
+@@ -140,14 +146,14 @@
+         if (value && CFGetTypeID(value) == CFNumberGetTypeID())
+             CFNumberGetValue(value, kCFNumberIntType, &version);
+         if (value) CFRelease(value);
+-        if (version == 1) bad = set_both(service, "RedwoodMetal", "RedwoodMetalDevice");
++        if (version == 1) bad = set_both(service, "JackpotlteMetal", "JackpotlteMetalDevice");
+         else {
+             fprintf(stderr, "metal_props: compatibility policy unavailable; keeping legacy discovery\n");
+             bad = set_both(service, "", "");
+         }
+     } else if (strcmp(what, "on") == 0) {
+-		bad = set_both(service, argc > 3 ? argv[2] : "RedwoodMetal",
+-		    argc > 3 ? argv[3] : "RedwoodMetalDevice");
++		bad = set_both(service, argc > 3 ? argv[2] : "JackpotlteMetal",
++		    argc > 3 ? argv[3] : "JackpotlteMetalDevice");
+ 	} else if (strcmp(what, "off") == 0) {
+ 		bad = set_both(service, "", "");
+ 	} else if (strcmp(what, "show") != 0) {
+diff -ru a/redwooddrawable.m b/redwooddrawable.m
+--- a/redwooddrawable.m	2026-11-28 09:46:26.315087361 -0500
++++ b/redwooddrawable.m	2026-11-28 09:46:26.329715561 -0500
+@@ -100,9 +100,15 @@
+ int
+ rwd_gpu_open(io_connect_t *connection, char *why, size_t why_size)
+ {
+-	io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
++	/* jackpotlte: JackpotlteMali answers the same 0x7e (struct jackpotlte_surface: this
++	 * struct's first 40 bytes; it hands back what it was given, so planeOffset/planeRowBytes
++	 * come back as sent, zero) and the same 0x09 */
++	io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching("JackpotlteMali"));
+ 
+ 	if (service == 0) {
++		service = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
++	}
++	if (service == 0) {
+ 		/* the Exynos 990 phone's Mali-G77 (iokit/Kernel/RedwoodMali.cpp): the same kRedwoodSurface (0x7e)
+ 		 * request, with the same structure, and the same GEM close (0x09) */
+ 		service = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodMali"));
+@@ -557,7 +563,7 @@
+ 	static int looked;
+ 
+ 	if (!looked) {
+-		void *library = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW | RTLD_NOLOAD);
++		void *library = dlopen("/private/var/mobile/Library/a8air/libredwoodair.dylib", RTLD_NOW | RTLD_NOLOAD);
+ 
+ 		looked = 1;
+ 		if (library != NULL) {
+diff -ru a/redwoodmetal.m b/redwoodmetal.m
+--- a/redwoodmetal.m	2026-11-28 09:46:26.315107061 -0500
++++ b/redwoodmetal.m	2026-11-28 09:46:26.330218761 -0500
+@@ -581,7 +581,7 @@
+ 		}
+ 	}
+ 	if (mesa.handle == NULL)
+-		mesa.handle = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW);
++		mesa.handle = dlopen("/private/var/mobile/Library/a8air/libredwoodair.dylib", RTLD_NOW);   /* jackpotlte: the a8air copy */
+ 	if (mesa.handle == NULL) {
+ 		m2m_log('E', "DEV", "no compiler library: %s\n", dlerror());
+ 		return false;
+@@ -2982,9 +2982,17 @@
+ 	/* The gpu this driver would actually drive. Not fatal if it is absent: the port
+ 	 * starts the Adreno only with the boot argument gpu=1, and a device object that
+ 	 * cannot allocate is still the thing under test until the resource layer exists. */
+-	io_service_t gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
+-	const char *service = "RedwoodGPU";
++	/* jackpotlte: the Galaxy A8 2018's Mali-G71 (xnu 0154 JackpotlteMali), whose requests are
++	 * panfrost's (0x42 CREATE_BO with the GPU address back, 0x44 GET_PARAM, 0x09 GEM_CLOSE,
++	 * client memory of the handle's type), exactly RedwoodMali's shape */
++	io_service_t gpu = IOServiceGetMatchingService(0, IOServiceMatching("JackpotlteMali"));
++	const char *service = "JackpotlteMali";
+ 
++	gpu_is_mali = gpu != IO_OBJECT_NULL;
++	if (gpu == IO_OBJECT_NULL) {
++		gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
++		service = "RedwoodGPU";
++	}
+ 	if (gpu == IO_OBJECT_NULL) {
+ 		/* the Exynos 990 phone's Mali-G77 (boot-arg mali=1) */
+ 		gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodMali"));
+@@ -2993,7 +3001,7 @@
+ 	}
+ 	_gpu = IO_OBJECT_NULL;
+ 	if (gpu == IO_OBJECT_NULL) {
+-		m2m_log('E', "DEV", "no RedwoodGPU or RedwoodMali service (the gpu was not started)\n");
++		m2m_log('E', "DEV", "no JackpotlteMali, RedwoodGPU or RedwoodMali service (the gpu was not started)\n");
+ 	} else {
+ 		kern_return_t kr = IOServiceOpen(gpu, mach_task_self(), 0, &_gpu);
+ 
+@@ -10219,3 +10227,14 @@
+ 	class_replaceMethod(fn, sel_getUid("newArgumentEncoderWithBufferIndex:reflection:"),
+ 			    (IMP)rw_function_argument_encoder_reflection, "@@:Q^@");
+ }
++
++/*
++ * jackpotlte: the class name this port's kernel (jtmetal=1, SweetFramebuffer.cpp) and the fix
++ * library's per-process hook give Metal as MetalPluginClassName. -[NSBundle classNamed:] finds it
++ * in this bundle; Info.plist's NSPrincipalClass names it too.
++ */
++@interface JackpotlteMetalDevice : RedwoodMetalDevice
++@end
++
++@implementation JackpotlteMetalDevice
++@end

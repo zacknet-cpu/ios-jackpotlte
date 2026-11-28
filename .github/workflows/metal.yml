@@ -1,0 +1,75 @@
+name: metal
+
+# P13 phase 3 prep (build only): JackpotlteMetal.bundle + metal_props for arm64 iOS
+# (tools/metal-bundle/mk-metal-bundle.sh: Jesvi-iOS's RedwoodMetal, MIT, adapted to
+# JackpotlteMali). Runs on a push to a8-p13-air that touches tools/metal-bundle or this
+# file (a new workflow cannot be dispatched by name until main has it). The products go to
+# branch metal-bundle-out. A green run means the driver builds and links for the phone;
+# nothing here was loaded by Metal on the Mali-G71 (phase 3, on the phone, with the user).
+
+on:
+  push:
+    branches: [a8-p13-air]
+    paths:
+      - 'tools/metal-bundle/**'
+      - '.github/workflows/metal.yml'
+
+concurrency:
+  group: metal-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcrun --show-sdk-version --sdk iphoneos
+          ls "$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/Frameworks/IOKit.framework" || true
+
+      - name: Build JackpotlteMetal.bundle and metal_props
+        run: tools/metal-bundle/mk-metal-bundle.sh "$RUNNER_TEMP/metal"
+
+      - name: The products are the phone's
+        run: |
+          set -e
+          out="$RUNNER_TEMP/metal/out"
+          b="$out/JackpotlteMetal.bundle/JackpotlteMetal"
+          fail() { echo "::error::$1" >&2; exit 1; }
+          file "$b" | grep -q 'bundle arm64' || fail "JackpotlteMetal is not an arm64 Mach-O bundle"
+          nm -gU "$b" | grep -q '_OBJC_CLASS_\$_JackpotlteMetalDevice' || fail "no JackpotlteMetalDevice class"
+          nm -gU "$b" | grep -q '_OBJC_CLASS_\$_RedwoodMetalDevice' || fail "no RedwoodMetalDevice class"
+          otool -L "$b" | grep -q Metal.framework || fail "the driver does not load Metal"
+          strings "$b" | grep -q /private/var/mobile/Library/a8air/libredwoodair.dylib ||
+            fail "the driver does not name the a8air libredwoodair"
+          strings "$b" | grep -q JackpotlteMali || fail "the driver does not name JackpotlteMali"
+          plutil -lint "$out/JackpotlteMetal.bundle/Info.plist"
+          codesign -v "$out/JackpotlteMetal.bundle" || fail "the bundle's signature does not verify"
+          codesign -v "$out/metal_props" || fail "metal_props has no valid signature"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jackpotlte-metal
+          path: ${{ runner.temp }}/metal/out
+          if-no-files-found: warn
+
+      - name: Save the result to the metal-bundle-out branch
+        if: success()
+        run: |
+          mkdir -p saveout
+          cp "$RUNNER_TEMP"/metal/out/JackpotlteMetal.bundle.tar "$RUNNER_TEMP"/metal/out/metal_props \
+             "$RUNNER_TEMP"/metal/out/build-record.txt saveout/
+          cd saveout
+          git init -q -b metal-bundle-out
+          git config user.name "a8-gpu"
+          git config user.email "a8-gpu@users.noreply.github.com"
+          echo "built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})" > BUILD_INFO.txt
+          git add .
+          git commit -q -m "metal-bundle-out from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" metal-bundle-out

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.jackpotlte.metal</string>
+	<key>CFBundleName</key>
+	<string>JackpotlteMetal</string>
+	<key>CFBundleExecutable</key>
+	<string>JackpotlteMetal</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<!-- as Jesvi's metal_plugin.plist: Metal asks -[NSBundle classNamed:] for
+	     MetalPluginClassName and falls back to -principalClass, which reads this -->
+	<key>NSPrincipalClass</key>
+	<string>JackpotlteMetalDevice</string>
+</dict>
+</plist>
