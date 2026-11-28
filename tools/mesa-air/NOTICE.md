@@ -5,7 +5,9 @@
 (github.com/jesvi-eulah/Jesvi-iOS, commit 1b184e5bf3d60505d1907e6a11f292b23b1b433c,
 `tools/mesa/air/` and `tools/mesa/air-frontend.patch`).
 `0102-air-panfrost-jackpotlte.patch` is adapted from its `tools/mesa/air-panfrost.patch`
-(the header of that patch says what changed). Their license:
+(the header of that patch says what changed). `0104-panfrost-air-ubo0.patch` and
+`0105-air-image-store-type.patch` are ours (2026-11-28); 0105 changes `air_intrinsics.c` at build
+time, after mk-mesa-air.sh copies `air/` in, so `air/` itself stays as copied. Their license:
 
     MIT License
 

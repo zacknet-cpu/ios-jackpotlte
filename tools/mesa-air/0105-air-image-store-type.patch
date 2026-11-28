@@ -1,0 +1,52 @@
+air: an image write stores a sized, 32-bit value.
+
+air_intrinsics.c gave nir_image_store the src_type of the intrinsic's return
+type, which for a write is void: "uint" with no bit size. Bifrost needs the
+size for the register format (bi_reg_fmt_for_nir has no unsized case:
+"Invalid type for register format") and stores only 32-bit sources
+(bi_emit_image_store asserts it). The type now comes from the stored value's
+own AIR type (float/int/uint from it and the name, as for reads), and values
+narrower than 32 bits are widened (f2f32/i2i32/u2u32), as GL's image stores
+always are: the image's format does the narrowing. Found 11-28 with the host
+panfrost + noop drm-shim build (PAN_GPU_ID=6000): AV1SW BlitLumaKernel_Uint
+(a 16-bit luma value stored to a uint image) aborted; it compiles with this.
+Applies to src/compiler/air (tools/mesa-air/air, Jesvi-iOS 1b184e5, MIT),
+which mk-mesa-air.sh copies in before the 01xx patches.
+
+--- a/src/compiler/air/air_intrinsics.c
++++ b/src/compiler/air/air_intrinsics.c
+@@ -1725,6 +1725,11 @@
+       nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
+       if (!coord)
+          return false;
++      /* A write returns void, so dest_type above has no bit size ("uint"): the
++       * stored value's own type says float/int/uint and its size, which a
++       * backend needs for the register format (Bifrost's bi_reg_fmt_for_nir
++       * has no case for an unsized type). */
++      nir_alu_type src_type = tex_dest_type(c, in->operands[arg]->type, n);
+       nir_def *value = air_get_ssa(c, in->operands[arg++]);
+       if (!value)
+          return false;
+@@ -1737,12 +1742,21 @@
+       if (!tex.is_image)
+          return air_error(c, "intrinsic: air.%s to a texture the interface says is not "
+                              "written", n->part[0]);
++      /* Stored as 32 bits, as GL's image stores always are: the image's format
++       * does the narrowing, and Bifrost stores nothing narrower
++       * (bi_emit_image_store asserts a 32-bit source). */
++      if (value->bit_size < 32) {
++         nir_alu_type base = nir_alu_type_get_base_type(src_type);
++         value = base == nir_type_float ? nir_f2f32(&c->b, value) :
++                 base == nir_type_int ? nir_i2i32(&c->b, value) : nir_u2u32(&c->b, value);
++         src_type = base | 32;
++      }
+       nir_image_store(&c->b, nir_imm_int(&c->b, tex.binding),
+                       nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
+                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
+                       nir_imm_int(&c->b, 0),
+                       .image_dim = t.dim, .image_array = t.is_array,
+-                      .src_type = dest_type);
++                      .src_type = src_type);
+       return true;
+    }
+ 
