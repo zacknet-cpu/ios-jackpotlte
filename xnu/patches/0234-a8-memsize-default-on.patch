@@ -1,0 +1,20 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index d96d6e3..e91bbb0 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2737,11 +2737,12 @@ a8lo_give_to_vm(void)
+ 	 * before kernel_bootstrap() copies max_mem into machine_info (the
+ 	 * commpage's memory size) and before bsd_init's memorystatus_init
+ 	 * sizes jetsam's thresholds from max_mem; scale_setup() (zone and kmem
+-	 * sizes) ran before.  OFF by default: with it CC ran 4-5% slower (11-26);
+-	 * boot-arg a8memsize=1 counts them.
++	 * sizes) ran before.  With it CC ran 4-5% slower on 11-26 (CC ~485
++	 * then); 0234 turns it on by default to measure again with today's GPU
++	 * path (CC ~530): boot-arg a8memsize=0 leaves the sizes at 2 GiB.
+ 	 */
+ 	{
+-		int count = 0;
++		int count = 1;
+ 
+ 		(void)PE_parse_boot_argn("a8memsize", &count, sizeof(count));
+ 		if (count != 0 && pages != 0) {

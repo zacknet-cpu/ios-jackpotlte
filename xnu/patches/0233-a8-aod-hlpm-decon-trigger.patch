@@ -1,0 +1,283 @@
+diff --git a/bsd/dev/a5xelte_panel.c b/bsd/dev/a5xelte_panel.c
+index 1cc4c2d..1109553 100644
+--- a/bsd/dev/a5xelte_panel.c
++++ b/bsd/dev/a5xelte_panel.c
+@@ -596,6 +596,8 @@ a5xelte_panel_init(void)
+ static LCK_GRP_DECLARE(a8_bl_grp, "a8_brightness");
+ static LCK_MTX_DECLARE(a8_bl_lock, &a8_bl_grp);
+ static int a8_bl_level = -1;
++static volatile int a8_hlpm_mode;          /* 0233: 0 off, 1 HLPM 2 nit, 2 HLPM 60 nit */
++static int a8_hlpm_held;                  /* 0233: levels noted while HLPM is on */
+ static uint32_t a8_bl_aor_sent;
+ static uint32_t a8_bl_sends, a8_bl_timeouts;
+ 
+@@ -672,6 +674,16 @@ a8_panel_brightness(unsigned int level)
+ 		printf("A8 BL: the DSI link is not up; nothing sent\n");
+ 		return 0;
+ 	}
++	if (a8_hlpm_mode != 0) {
++		/* 0233: the panel is in its low-power mode; the level is sent at exit */
++		lck_mtx_lock(&a8_bl_lock);
++		a8_bl_level = (int)level;
++		lck_mtx_unlock(&a8_bl_lock);
++		if (a8_hlpm_held++ < 4) {
++			printf("A8 BL: level %u noted (HLPM on, sent at its exit)\n", level);
++		}
++		return 0;
++	}
+ 	value = a8_bl_aor(level);
+ 	aor[1] = (unsigned char)(value >> 8);
+ 	aor[2] = (unsigned char)value;
+@@ -701,6 +713,77 @@ a8_panel_brightness_get(void)
+ 	return a8_bl_level;
+ }
+ 
++/*
++ * 0233 (P14 AOD): the panel's own low-power mode, Samsung's HLPM
++ * (s6e3fa7_jackpot_lcd_ctrl.c s6e3fa7_enteralpm / s6e3fa7_setalpm /
++ * s6e3fa7_exitalpm, the bytes of s6e3fa7_jackpot_param.h): 1 = HLPM 2 nit,
++ * 2 = HLPM 60 nit, 0 = back to normal.  Enter: test key on, self mask off
++ * (7A 00), AOR B1 08 98, F7 03, 20 ms (a frame is written meanwhile), BB 15
++ * 8C|0C 08 10 7D, 53 03|02, F7 03, test key off.  Exit: test key on, BB 15 8C
++ * 88 7D, 34 ms, 53 00, self mask on (as the init sends it), test key off, then
++ * the last level asked for (brightness requests are only noted while HLPM is
++ * on).  The panel must be powered (ours stays on at display off; Samsung's
++ * enteralpm does nothing on a suspended panel).  Tried by hand 11-27 with the
++ * user watching (console pokes of these packets): 2 nit = the same picture,
++ * dimmer.  Returns the mode now, -1 when the DSI link is down.
++ */
++int a8_panel_hlpm(int mode);
++
++int
++a8_panel_hlpm(int mode)
++{
++	static const unsigned char key_on[] = { 0xF0, 0x5A, 0x5A };
++	static const unsigned char key_off[] = { 0xF0, 0xA5, 0xA5 };
++	static const unsigned char update[] = { 0xF7, 0x03 };
++	static const unsigned char mask_off[] = { 0x7A, 0x00 };
++	static const unsigned char aor_hlpm[] = { 0xB1, 0x08, 0x98 };
++	static const unsigned char ctl_02[] = { 0xBB, 0x15, 0x8C, 0x08, 0x10, 0x7D };
++	static const unsigned char ctl_60[] = { 0xBB, 0x15, 0x0C, 0x08, 0x10, 0x7D };
++	static const unsigned char ctl_off[] = { 0xBB, 0x15, 0x8C, 0x88, 0x7D };
++	static const unsigned char on_02[] = { 0x53, 0x03 };
++	static const unsigned char on_60[] = { 0x53, 0x02 };
++	static const unsigned char hlpm_off[] = { 0x53, 0x00 };
++	int was, level;
++	bool ok;
++
++	if (mode < 0 || mode > 2) {
++		return a8_hlpm_mode;
++	}
++	if (a5p_dsim == 0 || !(a5p_read(a5p_dsim, DSIM_LINK_STATUS3) & DSIM_PLL_STABLE)) {
++		printf("A8 HLPM: the DSI link is not up; nothing sent\n");
++		return -1;
++	}
++	lck_mtx_lock(&a8_bl_lock);
++	was = a8_hlpm_mode;
++	if (mode == was) {
++		lck_mtx_unlock(&a8_bl_lock);
++		return mode;
++	}
++	if (mode != 0) {
++		ok = a8_dsi_cmd(key_on, sizeof(key_on)) && a8_dsi_cmd(mask_off, sizeof(mask_off)) &&
++		    a8_dsi_cmd(aor_hlpm, sizeof(aor_hlpm)) && a8_dsi_cmd(update, sizeof(update));
++		delay(20000);
++		ok = ok && a8_dsi_cmd(mode == 1 ? ctl_02 : ctl_60, sizeof(ctl_02)) &&
++		    a8_dsi_cmd(mode == 1 ? on_02 : on_60, sizeof(on_02)) && a8_dsi_cmd(update, sizeof(update));
++	} else {
++		ok = a8_dsi_cmd(key_on, sizeof(key_on)) && a8_dsi_cmd(ctl_off, sizeof(ctl_off));
++		delay(34000);
++		ok = ok && a8_dsi_cmd(hlpm_off, sizeof(hlpm_off)) &&
++		    a8_dsi_cmd(seq_self_mask_on, sizeof(seq_self_mask_on));
++	}
++	ok = a8_dsi_cmd(key_off, sizeof(key_off)) && ok;
++	a8_hlpm_mode = mode;
++	a8_hlpm_held = 0;
++	level = a8_bl_level;
++	lck_mtx_unlock(&a8_bl_lock);
++	printf("A8 HLPM: %s -> %s%s\n", was == 0 ? "off" : was == 1 ? "2 nit" : "60 nit",
++	    mode == 0 ? "off" : mode == 1 ? "2 nit" : "60 nit", ok ? "" : " (the DSI FIFO did not drain)");
++	if (mode == 0 && level >= 0) {
++		(void)a8_panel_brightness((unsigned int)level);
++	}
++	return mode;
++}
++
+ static int
+ a8_bl_sysctl SYSCTL_HANDLER_ARGS
+ {
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 7c687e2..9204d7e 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1665,6 +1665,8 @@ extern int sweet_fb_flip_set(int on);           /* SweetFramebuffer.cpp, 0191 */
+ extern int sweet_fb_cahz_set(int hz);          /* SweetFramebuffer.cpp, 0217 */
+ extern int sweet_fb_trace_set(int count);       /* SweetFramebuffer.cpp, 0231 */
+ extern int sweet_fb_aod_set(int value);         /* SweetFramebuffer.cpp, 0232 */
++extern int sweet_fb_aodlp_set(int lp, int stop);  /* SweetFramebuffer.cpp, 0233 */
++extern int a8_panel_hlpm(int mode);             /* a5xelte_panel.c, 0233 */
+ extern int sweet_fb_out_set(uint32_t sel, int32_t off, uint64_t value, int list);
+ extern int sweet_fb_prop_set(const char *key, const char *value);
+ extern void a8_noexec_set(const char *names);   /* mem.c, 0219 */
+@@ -1741,6 +1743,9 @@ a8s_command(const char *line)
+ 		    "bl [0-255] (panel brightness by AOR; sysctl kern.a8_brightness)\n");
+ 		printf("A8SH: framebuffer (0231): fbtrace N | fbout SEL OFF|sN VALUE, fbout clear | "
+ 		    "fbprop NAME [N|true|false] | aod [0|1|LEVEL] (0232 dim lock screen)\n");
++		printf("A8SH: dim lock screen power (0233, try with the user watching): aodlp [0|1|2] "
++		    "(AOR dim | HLPM 2 nit | HLPM 60 nit) | aodstop [0|1] (DECON trigger masked) | "
++		    "hlpm [0|1|2] (now)\n");
+ 		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
+ 		    "(writes the slot that is not the default) | tryb (boot it once) | "
+ 		    "tryok | promote\n");
+@@ -1979,6 +1984,24 @@ a8s_command(const char *line)
+ 			}
+ 		}
+ 		(void)sweet_fb_aod_set(v);
++	} else if (a8s_word(line, "aodlp", &rest) || a8s_word(line, "aodstop", &rest) ||
++	    a8s_word(line, "hlpm", &rest)) {
++		/* 0233: "aodlp N", "aodstop N", "hlpm N" (no N: report) */
++		int v = -1;
++
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest >= '0' && *rest <= '9') {
++			v = *rest - '0';
++		}
++		if (line[0] == 'h') {
++			printf("A8SH: hlpm %d\n", a8_panel_hlpm(v));
++		} else if (line[3] == 'l') {
++			(void)sweet_fb_aodlp_set(v, -1);
++		} else {
++			(void)sweet_fb_aodlp_set(-1, v);
++		}
+ 	} else if (a8s_word(line, "fbtrace", &rest)) {
+ 		/* 0231: "fbtrace N" logs the next N framebuffer user-client calls */
+ 		int n = -1;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 363e058..020e61f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -310,6 +310,26 @@ extern "C" int a8_panel_brightness_get(void);
+ #define SWEET_FB_AOD_WAKE_DEFAULT 160           /* when no level was set since boot */
+ #endif
+ 
++/*
++ * 0233 (P14 AOD, power): two optional parts of the dim lock screen, both off
++ * by default until tried with the user watching.  sweet_fb_aod_lp: the
++ * panel's own low-power mode instead of the AOR dim (1 = HLPM 2 nit, 2 = HLPM
++ * 60 nit; a5xelte_panel.c a8_panel_hlpm).  sweet_fb_aod_stop: DECON's
++ * hardware trigger masked while dim (HW_SW_TRIG_CONTROL 0x1281 -> HW_TRIG_EN
++ * off, HW_TRIG_MASK_DECON on, as Samsung's decon_reg_set_trigger(DISABLE)):
++ * the s6e3fa7 is a command-mode panel and keeps the picture in its own
++ * memory, while DECON otherwise sends it the same frame on every TE (seen
++ * 11-27: frame-done keeps coming with no flip; masked, it stops).  Display on
++ * arms the trigger first, then leaves HLPM, then puts the level back.
++ * Boot-args a8aodlp=N, a8aodstop=1; console "aodlp N", "aodstop 0|1".
++ */
++static int sweet_fb_aod_lp = -1;                /* -1: boot-arg not read yet */
++static int sweet_fb_aod_stop = -1;
++static volatile int sweet_fb_aod_stopped;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++extern "C" int a8_panel_hlpm(int mode);                         /* a5xelte_panel.c, 0233 */
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -847,6 +867,27 @@ a8_scan_program(uint32_t height, uint32_t addr, uint32_t width)
+ 	a8_flips++;
+ }
+ 
++/* 0233: DECON's hardware trigger (HW_SW_TRIG_CONTROL): on = HW_TRIG_EN,
++ * off = HW_TRIG_MASK_DECON (Samsung's decon_reg_set_trigger); the value now. */
++#define A8_DECON_TRIG           0x70u
++#define A8_DECON_TRIG_EN        0x1u
++#define A8_DECON_TRIG_MASK      0x10u
++static uint32_t
++a8_decon_trigger(bool on)
++{
++	volatile uint32_t *reg;
++	uint32_t v;
++
++	if (a8_decon == 0) {
++		return 0;
++	}
++	reg = (volatile uint32_t *)(a8_decon + A8_DECON_TRIG);
++	v = *reg;
++	v = on ? ((v & ~A8_DECON_TRIG_MASK) | A8_DECON_TRIG_EN) : ((v & ~A8_DECON_TRIG_EN) | A8_DECON_TRIG_MASK);
++	*reg = v;
++	return *reg;
++}
++
+ /* 0209: called by the GPU worker after job `seq` is done (and by a swap that
+  * finds the GPU done meanwhile): programs a flip that waited for it. */
+ extern "C" void
+@@ -1708,6 +1749,24 @@ sweet_fb_aod_set(int value)
+ 	return sweet_fb_aod;
+ }
+ 
++/* 0233: console "aodlp N" (0 AOR dim, 1 HLPM 2 nit, 2 HLPM 60 nit) and
++ * "aodstop 0|1"; -1 reports.  They apply from the next display off. */
++extern "C" int
++sweet_fb_aodlp_set(int lp, int stop)
++{
++	if (lp >= 0 && lp <= 2) {
++		sweet_fb_aod_lp = lp;
++	}
++	if (stop == 0 || stop == 1) {
++		sweet_fb_aod_stop = stop;
++	}
++	printf("A8SH: aodlp %d (%s), aodstop %d%s%s\n", sweet_fb_aod_lp,
++	    sweet_fb_aod_lp == 1 ? "HLPM 2 nit" : sweet_fb_aod_lp == 2 ? "HLPM 60 nit" :
++	    sweet_fb_aod_lp == 0 ? "AOR dim" : "boot-arg not read yet", sweet_fb_aod_stop,
++	    sweet_fb_aod_active ? "; dim now" : "", sweet_fb_aod_stopped ? ", DECON trigger masked" : "");
++	return sweet_fb_aod_lp;
++}
++
+ extern "C" int
+ sweet_fb_trace_set(int count)
+ {
+@@ -1886,18 +1945,39 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			/* 0232: dim lock screen (see sweet_fb_aod) */
+ 			if (off && sweet_fb_aod && !sweet_fb_aod_active) {
+ 				int level = a8_panel_brightness_get();
++				int lp;
+ 				sweet_fb_aod_saved = level;
+ 				sweet_fb_aod_active = 1;
+-				if (level < 0 || level > sweet_fb_aod_level) {
++				if (sweet_fb_aod_lp < 0) {         /* 0233 boot-args, once each */
++					int v = 0;
++					sweet_fb_aod_lp = PE_parse_boot_argn("a8aodlp", &v, sizeof(v)) && v >= 1 && v <= 2 ? v : 0;
++				}
++				if (sweet_fb_aod_stop < 0) {
++					int v = 0;
++					sweet_fb_aod_stop = PE_parse_boot_argn("a8aodstop", &v, sizeof(v)) && v != 0 ? 1 : 0;
++				}
++				lp = sweet_fb_aod_lp > 0 ? a8_panel_hlpm(sweet_fb_aod_lp) : 0;
++				if (lp <= 0 && (level < 0 || level > sweet_fb_aod_level)) {
+ 					(void)a8_panel_brightness((unsigned int)sweet_fb_aod_level);
+ 				}
+-				IOLog("SWEET FB: display off as a dim lock screen (0232): level %d -> %d\n",
+-				    level, sweet_fb_aod_level);
++				if (sweet_fb_aod_stop > 0) {
++					sweet_fb_aod_stopped = 1;
++					IOLog("SWEET FB: DECON trigger masked while dim (0233): 0x%x\n", a8_decon_trigger(false));
++				}
++				IOLog("SWEET FB: display off as a dim lock screen (0232): level %d -> %s%d\n",
++				    level, lp > 0 ? "HLPM mode " : "", lp > 0 ? lp : sweet_fb_aod_level);
+ 				break;
+ 			}
+ 			if (!off && sweet_fb_aod_active) {
+ 				int level = sweet_fb_aod_saved >= 0 ? sweet_fb_aod_saved : SWEET_FB_AOD_WAKE_DEFAULT;
+ 				sweet_fb_aod_active = 0;
++				if (sweet_fb_aod_stopped) {        /* 0233: trigger first, then HLPM */
++					sweet_fb_aod_stopped = 0;
++					IOLog("SWEET FB: DECON trigger armed again (0233): 0x%x\n", a8_decon_trigger(true));
++				}
++				if (a8_panel_hlpm(-1) > 0) {
++					(void)a8_panel_hlpm(0);
++				}
+ 				if (a8_panel_brightness_get() != level) {
+ 					(void)a8_panel_brightness((unsigned int)level);
+ 				}

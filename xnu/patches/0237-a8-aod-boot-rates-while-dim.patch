@@ -1,0 +1,160 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 4091dba..b331666 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1666,6 +1666,7 @@ extern int sweet_fb_cahz_set(int hz);          /* SweetFramebuffer.cpp, 0217 */
+ extern int sweet_fb_trace_set(int count);       /* SweetFramebuffer.cpp, 0231 */
+ extern int sweet_fb_aod_set(int value);         /* SweetFramebuffer.cpp, 0232 */
+ extern int sweet_fb_aodlp_set(int lp, int stop);  /* SweetFramebuffer.cpp, 0233 */
++extern int sweet_fb_aodclk_set(int on);         /* SweetFramebuffer.cpp, 0237 */
+ extern int a8_panel_hlpm(int mode);             /* a5xelte_panel.c, 0233 */
+ extern int jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);   /* jackpotlte_pmic.c; 0236 "bat" */
+@@ -1747,7 +1748,7 @@ a8s_command(const char *line)
+ 		    "fbprop NAME [N|true|false] | aod [0|1|LEVEL] (0232 dim lock screen)\n");
+ 		printf("A8SH: dim lock screen power (0233, try with the user watching): aodlp [0|1|2] "
+ 		    "(AOR dim | HLPM 2 nit | HLPM 60 nit) | aodstop [0|1] (DECON trigger masked) | "
+-		    "hlpm [0|1|2] (now) | bat (gauge now, 0236)\n");
++		    "hlpm [0|1|2] (now) | bat (gauge now, 0236) | aodclk [0|1] (boot rates while dim, 0237)\n");
+ 		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
+ 		    "(writes the slot that is not the default) | tryb (boot it once) | "
+ 		    "tryok | promote\n");
+@@ -1986,6 +1987,12 @@ a8s_command(const char *line)
+ 			}
+ 		}
+ 		(void)sweet_fb_aod_set(v);
++	} else if (a8s_word(line, "aodclk", &rest)) {
++		/* 0237: boot rates while dim on/off (from the next display off) */
++		while (*rest == ' ') {
++			rest++;
++		}
++		printf("A8SH: aodclk %d\n", sweet_fb_aodclk_set(*rest == '0' ? 0 : *rest == '1' ? 1 : -1));
+ 	} else if (a8s_word(line, "bat", &rest)) {
+ 		/* 0236: one fresh charger / fuel gauge sample (drain measurements) */
+ 		unsigned pct = 0, mv = 0;
+diff --git a/bsd/dev/a8_acpm.c b/bsd/dev/a8_acpm.c
+index 2a39414..6b9a8c1 100644
+--- a/bsd/dev/a8_acpm.c
++++ b/bsd/dev/a8_acpm.c
+@@ -1391,6 +1391,64 @@ a8a_domain_named(const char *name)
+ 	return -1;
+ }
+ 
++/*
++ * 0237 (P14 AOD power, user's OK 11-28): while the screen is dim, big,
++ * little and g3d go to their boot rates (the S-Boot levels the phone ran at
++ * before a8dvfsboot, and where the 80 C watch puts them: big 1352000, little
++ * 1014000, g3d 343000 kHz, lower voltages); at wake the rates asked before
++ * come back.  Only domains that were above their boot rate are touched.
++ * Measured 11-28 before this: ~250-360 mA locked (97 -> 91 % in 30 min) with
++ * the CPUs nearly idle (12 % of one core) at 2184/1586/1100 MHz.
++ */
++static uint32_t a8a_dim_saved[A8A_DOMAINS];
++static bool a8a_dimmed;
++
++int a8_dvfs_dim(int on);
++
++int
++a8_dvfs_dim(int on)
++{
++	static const char *const want[] = { "big", "little", "g3d" };
++	int changed = 0;
++
++	if (a8a.allow == 0) {
++		return -1;
++	}
++	lck_mtx_lock(&a8a_lock);
++	if (on && !a8a_dimmed) {
++		for (unsigned i = 0; i < 3; i++) {
++			int d = a8a_domain_named(want[i]);
++			struct a8a_domain *dom;
++
++			if (d < 0) {
++				continue;
++			}
++			dom = &a8a.dom[d];
++			a8a_dim_saved[d] = 0;
++			if (dom->ok && dom->boot_khz != 0 && dom->asked_khz > dom->boot_khz) {
++				a8a_dim_saved[d] = dom->asked_khz;
++				a8a_dvfs_set((uint32_t)d, dom->boot_khz);
++				changed++;
++			}
++		}
++		a8a_dimmed = true;
++	} else if (!on && a8a_dimmed) {
++		for (uint32_t d = 0; d < A8A_DOMAINS; d++) {
++			if (a8a_dim_saved[d] != 0) {
++				a8a_dvfs_set(d, a8a_dim_saved[d]);
++				a8a_dim_saved[d] = 0;
++				changed++;
++			}
++		}
++		a8a_dimmed = false;
++	}
++	lck_mtx_unlock(&a8a_lock);
++	printf("A8 DVFS: dim lock screen %s (0237): %d domains\n", on ? "on, boot rates" : "off, rates back",
++	    changed);
++	return changed;
++}
++
++
+ /*
+  * acpm                     the framework, its plug-ins and channels
+  * acpm log                 the firmware's log buffer (and empties it)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 01f85f0..f087184 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -332,6 +332,8 @@ static int sweet_fb_aod_stop = -1;
+ static volatile int sweet_fb_aod_stopped;
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
+ extern "C" int a8_panel_hlpm(int mode);                         /* a5xelte_panel.c, 0233 */
++extern "C" int a8_dvfs_dim(int on);                             /* a8_acpm.c, 0237 */
++static int sweet_fb_aod_clk = -1;              /* 0237: boot rates while dim (a8aodclk=0 off) */
+ #endif
+ 
+ bool
+@@ -1810,6 +1812,20 @@ sweet_fb_aod_set(int value)
+ 
+ /* 0233: console "aodlp N" (0 AOR dim, 1 HLPM 2 nit, 2 HLPM 60 nit) and
+  * "aodstop 0|1"; -1 reports.  They apply from the next display off. */
++/* 0237: console "aodclk 0|1"; -1 reports */
++extern "C" int
++sweet_fb_aodclk_set(int on)
++{
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	if (on == 0 || on == 1) {
++		sweet_fb_aod_clk = on;
++	}
++	return sweet_fb_aod_clk;
++#else
++	return on;
++#endif
++}
++
+ extern "C" int
+ sweet_fb_aodlp_set(int lp, int stop)
+ {
+@@ -2024,6 +2040,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				if (lp <= 0 && (level < 0 || level > sweet_fb_aod_level)) {
+ 					(void)a8_panel_brightness((unsigned int)sweet_fb_aod_level);
+ 				}
++				if (sweet_fb_aod_clk < 0) {        /* 0237 */
++					int v = 1;
++					(void)PE_parse_boot_argn("a8aodclk", &v, sizeof(v));
++					sweet_fb_aod_clk = v != 0 ? 1 : 0;
++				}
++				if (sweet_fb_aod_clk > 0) {
++					(void)a8_dvfs_dim(1);
++				}
+ 				if (sweet_fb_aod_stop > 0) {
+ 					if (a8_remask_call == NULL) {   /* 0235 */
+ 						a8_remask_call = thread_call_allocate(a8_remask, NULL);
+@@ -2038,6 +2062,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (!off && sweet_fb_aod_active) {
+ 				int level = sweet_fb_aod_saved >= 0 ? sweet_fb_aod_saved : SWEET_FB_AOD_WAKE_DEFAULT;
+ 				sweet_fb_aod_active = 0;
++				(void)a8_dvfs_dim(0);              /* 0237: clocks back first */
+ 				if (sweet_fb_aod_stopped) {        /* 0233: trigger first, then HLPM */
+ 					sweet_fb_aod_stopped = 0;
+ 					IOLog("SWEET FB: DECON trigger armed again (0233): 0x%x\n", a8_decon_trigger(true));

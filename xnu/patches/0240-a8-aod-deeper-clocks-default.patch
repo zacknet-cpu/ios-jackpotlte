@@ -1,0 +1,15 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 277b583..68ba3a0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2092,8 +2092,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				if (lp <= 0 && (level < 0 || level > sweet_fb_aod_level)) {
+ 					(void)a8_panel_brightness((unsigned int)sweet_fb_aod_level);
+ 				}
+-				if (sweet_fb_aod_clk < 0) {        /* 0237 */
+-					int v = 1;
++				if (sweet_fb_aod_clk < 0) {        /* 0237; 0240: deeper by default */
++					int v = 2;
+ 					(void)PE_parse_boot_argn("a8aodclk", &v, sizeof(v));
+ 					sweet_fb_aod_clk = v >= 2 ? 2 : (v != 0 ? 1 : 0);
+ 				}

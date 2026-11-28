@@ -98,6 +98,12 @@
  * context), so its GL context makers answer nil instead of crashing at
  * pc 0; a8fix-cigl "1" keeps Apple's; see ci_apply.
  *
+ * Dim lock screen (v18e, P14 AOD): the cover sheet's darkening effect view is
+ * made clear when SpringBoard blanks the screen, so the frame the kernel keeps
+ * has the wallpaper (a8wall-aodfx = percent kept, "100" = off); with the GL
+ * shim's live dim (a8gl-aodlive "1") the lock screen clock keeps running
+ * (v18g); see aod_wall_apply.
+ *
  * Sensor curtain (v14, user report 11-25): the expanded island's X button had
  * a pill-shaped bite: the sensor cover (_SBSystemApertureMagiciansCurtainView
  * in the aperture window that takes no touches) is drawn above the content,
@@ -2768,6 +2774,197 @@ wall_report(void *context)
 }
 
 /*
+ * v18 (P14 AOD): the wallpaper on the dim lock screen.  The kernel's dim lock
+ * screen (xnu 0232) keeps the last frame CoreAnimation drew before display
+ * off, and the GL shim (glca30) holds the blank 700 ms so that frame is the
+ * lock screen.  But right after SpringBoard blanks the screen it darkens the
+ * cover sheet with a full-screen UIVisualEffectView (CSCoverSheetView >
+ * SBFTouchPassThroughView > UIVisualEffectView, a UICABackdropLayer with a
+ * colorBrightness filter: the wallpaper under it goes black, the clock above
+ * it stays; seen 11-27 with layer dumps).  The wallpaper window itself stays
+ * shown.  So on "com.apple.springboard.hasBlankedScreen" with state 1 that
+ * view's alpha is set to a8wall-aodfx percent (default 0) 250 and 500 ms
+ * later (it is put in after the notification), inside the shim's hold; state
+ * 0 (wake) puts its alpha back.  a8wall-aodfx "100" = leave it alone.
+ */
+extern unsigned int notify_register_dispatch(const char *name, int *out_token, void *queue,
+    void (^handler)(int));
+extern unsigned int notify_get_state(int token, unsigned long long *state);
+static int aod_token;
+static id aod_fx[6];
+static double aod_fx_alpha[6];
+static int aod_fx_n;
+static unsigned aod_gen;
+
+static id
+aod_cover_window(void)
+{
+	Class uiw = objc_getClass("UIWindow");
+	unsigned long (*count)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
+	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	unsigned long n, i;
+	id wins;
+
+	if (uiw == 0 || !((signed char (*)(id, SEL, SEL))objc_msgSend)((id)uiw,
+	    sel_registerName("respondsToSelector:"), all))
+		return 0;
+	wins = ((id (*)(id, SEL, signed char, signed char))objc_msgSend)((id)uiw, all, 1, 0);
+	n = wins != 0 ? count(wins, sel_registerName("count")) : 0;
+	for (i = 0; i < n; i++) {
+		id w = at(wins, sel_registerName("objectAtIndex:"), i);
+
+		if (fix_streq(class_getName(object_getClass(w)), "SBCoverSheetWindow"))
+			return w;
+	}
+	return 0;
+}
+
+static int
+aod_fx_known(id view)
+{
+	for (int k = 0; k < aod_fx_n; k++)
+		if (aod_fx[k] == view)
+			return 1;
+	return 0;
+}
+
+/* the big, shown UIVisualEffectViews under `view`: alpha to `keep` */
+static void
+aod_fx_find(id view, int depth, double keep)
+{
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	unsigned long (*count)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
+	id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+	fix_rect (*rect)(id, SEL) = (fix_rect (*)(id, SEL))objc_msgSend;
+	double (*dbl)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+	Class fx = objc_getClass("UIVisualEffectView");
+	unsigned long n, i;
+	id subs;
+	fix_rect box;
+
+	if (view == 0 || depth > 16 || fx == 0)
+		return;
+	if (((signed char (*)(id, SEL))objc_msgSend)(view, sel_registerName("isHidden")))
+		return;
+	box = rect(view, sel_registerName("bounds"));
+	if (box.w >= 300 && box.h >= 600 && ((signed char (*)(id, SEL, Class))objc_msgSend)(view,
+	    sel_registerName("isKindOfClass:"), fx)) {
+		double alpha = dbl(view, sel_registerName("alpha"));
+
+		if (!aod_fx_known(view) && aod_fx_n < 6) {
+			aod_fx_alpha[aod_fx_n] = alpha;
+			aod_fx[aod_fx_n++] = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("retain"));
+			wall_add("A8FIX aod: ");
+			wall_add(class_getName(object_getClass(get(view, sel_registerName("superview")))));
+			wall_add(" > UIVisualEffectView alpha% ");
+			wall_addn(alpha * 100.0);
+			wall_add(" -> ");
+			wall_addn(keep * 100.0);
+			wall_add(" (wallpaper on the dim lock screen)");
+			wall_flush();
+		}
+		((void (*)(id, SEL, double))objc_msgSend)(view, sel_registerName("setAlpha:"), keep);
+		return;
+	}
+	subs = get(view, sel_registerName("subviews"));
+	n = subs != 0 ? count(subs, sel_registerName("count")) : 0;
+	for (i = 0; i < n && i < 64; i++)
+		aod_fx_find(at(subs, sel_registerName("objectAtIndex:"), i), depth + 1, keep);
+}
+
+static void
+aod_fx_later(void *context)
+{
+	id text;
+	double keep;
+
+	if ((unsigned)(unsigned long)context != aod_gen)
+		return;                 /* woken meanwhile */
+	text = fix_switch_text("/private/var/mobile/Library/a8wall-aodfx");
+	keep = text != 0 ? ((double (*)(id, SEL))objc_msgSend)(text, sel_registerName("doubleValue")) / 100.0 : 0;
+	if (keep >= 1.0)
+		return;
+	if (keep < 0)
+		keep = 0;
+	aod_fx_find(aod_cover_window(), 0, keep);
+}
+
+static void
+aod_blank_changed(void)
+{
+	unsigned long long state = 0;
+
+	notify_get_state(aod_token, &state);
+	aod_gen++;
+	if (state != 0) {
+		dispatch_after_f(dispatch_time(0, 250000000LL), &_dispatch_main_q,
+		    (void *)(unsigned long)aod_gen, aod_fx_later);
+		dispatch_after_f(dispatch_time(0, 500000000LL), &_dispatch_main_q,
+		    (void *)(unsigned long)aod_gen, aod_fx_later);
+		return;
+	}
+	if (aod_fx_n > 0)
+		fix_put("A8FIX aod: wake, lock screen effect views as they were\n");
+	while (aod_fx_n > 0) {
+		aod_fx_n--;
+		((void (*)(id, SEL, double))objc_msgSend)(aod_fx[aod_fx_n], sel_registerName("setAlpha:"),
+		    aod_fx_alpha[aod_fx_n]);
+		((void (*)(id, SEL))objc_msgSend)(aod_fx[aod_fx_n], sel_registerName("release"));
+	}
+}
+
+/* v18g (P14 AOD, with the GL shim's live dim lock screen, glca31 switch
+ * a8gl-aodlive "1"): SpringBoard stops the lock screen clock at blank
+ * (-[SBFLockScreenDateViewController setScreenOff:YES] -> _stopUpdateTimer;
+ * seen 11-27: battery in the status bar went on updating, the clock did
+ * not).  With the switch on, the clock is told the screen stays on, so its
+ * minute timer keeps running and CoreAnimation (not blanked in that mode)
+ * draws each new minute. */
+static void (*date_screen_off_orig)(id, SEL, signed char);
+static int date_said;
+
+static int
+aod_live_on(void)
+{
+	id text = fix_switch_text("/private/var/mobile/Library/a8gl-aodlive");
+
+	return text != 0 && ((int (*)(id, SEL))objc_msgSend)(text, sel_registerName("intValue")) == 1;
+}
+
+static void
+date_screen_off(id self, SEL cmd, signed char off)
+{
+	if (off && aod_live_on()) {
+		if (date_said++ < 3)
+			fix_put("A8FIX aod: lock screen clock kept running at blank (live dim, v18g)\n");
+		off = 0;
+	}
+	date_screen_off_orig(self, cmd, off);
+}
+
+static void
+aod_wall_apply(void)
+{
+	notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &aod_token, &_dispatch_main_q,
+	    ^(int t) {
+		(void)t;
+		aod_blank_changed();
+	});
+	fix_put("A8FIX aod: wallpaper kept on the dim lock screen (v18e)\n");
+	{
+		Class k = objc_getClass("SBFLockScreenDateViewController");
+		Method m = k != 0 ? class_getInstanceMethod(k, sel_registerName("setScreenOff:")) : 0;
+
+		if (m != 0)
+			date_screen_off_orig = (void (*)(id, SEL, signed char))method_setImplementation(m,
+			    (IMP)date_screen_off);
+		else
+			fix_put("A8FIX aod: no -[SBFLockScreenDateViewController setScreenOff:]\n");
+	}
+}
+
+/*
  * v12: BlueTool mode.  With a8bt=1 (kernel 0221) the kernel puts this library
  * into Apple's BlueTool, and the library answers com.apple.BlueTool itself;
  * BlueTool's own code never runs.  The kernel has booted the Bluetooth chip
@@ -2882,8 +3079,10 @@ fix_init(void)
 	bd_apply();
 	ci_apply();
 	fix_is_springboard = fix_streq(getprogname(), "SpringBoard");
-	if (fix_is_springboard)
+	if (fix_is_springboard) {
 		curtain_apply();
+		aod_wall_apply();
+	}
 	/* (Control Center's module is a bundle loaded later: keep looking) */
 	_dyld_register_func_for_add_image(fix_image_added);
 	/* what the screen is, once UIKit is up (seen with the console's tee) */

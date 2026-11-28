@@ -1,0 +1,140 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index b331666..f726416 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1667,6 +1667,7 @@ extern int sweet_fb_trace_set(int count);       /* SweetFramebuffer.cpp, 0231 */
+ extern int sweet_fb_aod_set(int value);         /* SweetFramebuffer.cpp, 0232 */
+ extern int sweet_fb_aodlp_set(int lp, int stop);  /* SweetFramebuffer.cpp, 0233 */
+ extern int sweet_fb_aodclk_set(int on);         /* SweetFramebuffer.cpp, 0237 */
++extern int sweet_fb_aodvsync_set(int hz);       /* SweetFramebuffer.cpp, 0238 */
+ extern int a8_panel_hlpm(int mode);             /* a5xelte_panel.c, 0233 */
+ extern int jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);   /* jackpotlte_pmic.c; 0236 "bat" */
+@@ -1748,7 +1749,7 @@ a8s_command(const char *line)
+ 		    "fbprop NAME [N|true|false] | aod [0|1|LEVEL] (0232 dim lock screen)\n");
+ 		printf("A8SH: dim lock screen power (0233, try with the user watching): aodlp [0|1|2] "
+ 		    "(AOR dim | HLPM 2 nit | HLPM 60 nit) | aodstop [0|1] (DECON trigger masked) | "
+-		    "hlpm [0|1|2] (now) | bat (gauge now, 0236) | aodclk [0|1] (boot rates while dim, 0237)\n");
++		    "hlpm [0|1|2] (now) | bat (gauge now, 0236) | aodclk [0|1] (boot rates while dim, 0237) | aodvsync [HZ] (0238)\n");
+ 		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
+ 		    "(writes the slot that is not the default) | tryb (boot it once) | "
+ 		    "tryok | promote\n");
+@@ -1987,6 +1988,20 @@ a8s_command(const char *line)
+ 			}
+ 		}
+ 		(void)sweet_fb_aod_set(v);
++	} else if (a8s_word(line, "aodvsync", &rest)) {
++		/* 0238: vsync ticks per second while dim (0 = the full 60) */
++		int v = -1;
++
++		while (*rest == ' ') {
++			rest++;
++		}
++		if (*rest >= '0' && *rest <= '9') {
++			v = 0;
++			while (*rest >= '0' && *rest <= '9' && v < 1000) {
++				v = v * 10 + (*rest++ - '0');
++			}
++		}
++		printf("A8SH: aodvsync %d Hz while dim\n", sweet_fb_aodvsync_set(v));
+ 	} else if (a8s_word(line, "aodclk", &rest)) {
+ 		/* 0237: boot rates while dim on/off (from the next display off) */
+ 		while (*rest == ' ') {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f087184..a98e71d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -140,6 +140,7 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void kickVsync(void);           /* 0238: next tick now (wake) */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -334,6 +335,28 @@ static volatile int sweet_fb_aod_stopped;
+ extern "C" int a8_panel_hlpm(int mode);                         /* a5xelte_panel.c, 0233 */
+ extern "C" int a8_dvfs_dim(int on);                             /* a8_acpm.c, 0237 */
+ static int sweet_fb_aod_clk = -1;              /* 0237: boot rates while dim (a8aodclk=0 off) */
++/*
++ * 0238 (P14 AOD power): the vsync tick (60 Hz, a VSync notification to
++ * every framebuffer client -- backboardd's CoreAnimation -- each time, and
++ * where a pending frame is shown) runs at a8aodvsync Hz while the screen is
++ * dim (default 4; 0 or >= 60 keeps 60).  With the live dim lock screen a new
++ * minute still reaches the panel within a quarter second; display on asks
++ * for the next tick at once (kickVsync).  Console "aodvsync N".
++ */
++static int sweet_fb_aod_vsync_hz = -1;
++static uint32_t
++sweet_fb_aod_vsync_us(void)
++{
++	if (sweet_fb_aod_vsync_hz < 0) {
++		int v = 4;
++		(void)PE_parse_boot_argn("a8aodvsync", &v, sizeof(v));
++		sweet_fb_aod_vsync_hz = v < 0 ? 4 : v;
++	}
++	if (sweet_fb_aod_vsync_hz <= 0 || sweet_fb_aod_vsync_hz >= 60) {
++		return SWEET_FB_VSYNC_US;
++	}
++	return 1000000u / (uint32_t)sweet_fb_aod_vsync_hz;
++}
+ #endif
+ 
+ bool
+@@ -581,12 +604,26 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	if (sweet_fb_aod_active && sweet_fb_aod_vsync_us() > SWEET_FB_VSYNC_US) {
++		/* 0238: few ticks while dim */
++		sender->setTimeoutUS(sweet_fb_aod_vsync_us());
++		return;
++	}
+ 	sender->setTimeoutUS(a8_vsync_next_us());
+ #else
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ #endif
+ }
+ 
++/* 0238: the next vsync tick now (display on after the slow dim ticks) */
++void
++AppleCLCD::kickVsync(void)
++{
++	if (fVsync != NULL) {
++		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US / 4);
++	}
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -1812,6 +1849,21 @@ sweet_fb_aod_set(int value)
+ 
+ /* 0233: console "aodlp N" (0 AOR dim, 1 HLPM 2 nit, 2 HLPM 60 nit) and
+  * "aodstop 0|1"; -1 reports.  They apply from the next display off. */
++/* 0238: console "aodvsync N" (Hz while dim; 0 = 60); -1 reports */
++extern "C" int
++sweet_fb_aodvsync_set(int hz)
++{
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	if (hz >= 0 && hz <= 60) {
++		sweet_fb_aod_vsync_hz = hz;
++	}
++	(void)sweet_fb_aod_vsync_us();
++	return sweet_fb_aod_vsync_hz;
++#else
++	return hz;
++#endif
++}
++
+ /* 0237: console "aodclk 0|1"; -1 reports */
+ extern "C" int
+ sweet_fb_aodclk_set(int on)
+@@ -2063,6 +2115,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				int level = sweet_fb_aod_saved >= 0 ? sweet_fb_aod_saved : SWEET_FB_AOD_WAKE_DEFAULT;
+ 				sweet_fb_aod_active = 0;
+ 				(void)a8_dvfs_dim(0);              /* 0237: clocks back first */
++				fFB->kickVsync();                  /* 0238: 60 Hz ticks again now */
+ 				if (sweet_fb_aod_stopped) {        /* 0233: trigger first, then HLPM */
+ 					sweet_fb_aod_stopped = 0;
+ 					IOLog("SWEET FB: DECON trigger armed again (0233): 0x%x\n", a8_decon_trigger(true));

@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/a5xelte_usb.c b/bsd/dev/a5xelte_usb.c
+index 9204d7e..4091dba 100644
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1667,6 +1667,8 @@ extern int sweet_fb_trace_set(int count);       /* SweetFramebuffer.cpp, 0231 */
+ extern int sweet_fb_aod_set(int value);         /* SweetFramebuffer.cpp, 0232 */
+ extern int sweet_fb_aodlp_set(int lp, int stop);  /* SweetFramebuffer.cpp, 0233 */
+ extern int a8_panel_hlpm(int mode);             /* a5xelte_panel.c, 0233 */
++extern int jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full);   /* jackpotlte_pmic.c; 0236 "bat" */
+ extern int sweet_fb_out_set(uint32_t sel, int32_t off, uint64_t value, int list);
+ extern int sweet_fb_prop_set(const char *key, const char *value);
+ extern void a8_noexec_set(const char *names);   /* mem.c, 0219 */
+@@ -1745,7 +1747,7 @@ a8s_command(const char *line)
+ 		    "fbprop NAME [N|true|false] | aod [0|1|LEVEL] (0232 dim lock screen)\n");
+ 		printf("A8SH: dim lock screen power (0233, try with the user watching): aodlp [0|1|2] "
+ 		    "(AOR dim | HLPM 2 nit | HLPM 60 nit) | aodstop [0|1] (DECON trigger masked) | "
+-		    "hlpm [0|1|2] (now)\n");
++		    "hlpm [0|1|2] (now) | bat (gauge now, 0236)\n");
+ 		printf("A8SH: kernel slots: slots | bput SIZE SHA256, bd BASE64..., bend "
+ 		    "(writes the slot that is not the default) | tryb (boot it once) | "
+ 		    "tryok | promote\n");
+@@ -1984,6 +1986,16 @@ a8s_command(const char *line)
+ 			}
+ 		}
+ 		(void)sweet_fb_aod_set(v);
++	} else if (a8s_word(line, "bat", &rest)) {
++		/* 0236: one fresh charger / fuel gauge sample (drain measurements) */
++		unsigned pct = 0, mv = 0;
++		int ma = 0, ext = 0, chg = 0, full = 0;
++
++		if (jackpotlte_battery_read(&pct, &mv, &ma, &ext, &chg, &full) == 0) {
++			printf("A8SH: bat %u%% %u mV %d mA ext=%d chg=%d full=%d\n", pct, mv, ma, ext, chg, full);
++		} else {
++			printf("A8SH: bat: no reading\n");
++		}
+ 	} else if (a8s_word(line, "aodlp", &rest) || a8s_word(line, "aodstop", &rest) ||
+ 	    a8s_word(line, "hlpm", &rest)) {
+ 		/* 0233: "aodlp N", "aodstop N", "hlpm N" (no N: report) */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d4e088c..01f85f0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -322,7 +322,10 @@ extern "C" int a8_panel_brightness_get(void);
+  * memory, while DECON otherwise sends it the same frame on every TE (seen
+  * 11-27: frame-done keeps coming with no flip; masked, it stops).  Display on
+  * arms the trigger first, then leaves HLPM, then puts the level back.
+- * Boot-args a8aodlp=N, a8aodstop=1; console "aodlp N", "aodstop 0|1".
++ * Boot-args a8aodlp=N, a8aodstop=0|1; console "aodlp N", "aodstop 0|1".
++ * 0236: both ON by default (HLPM 2 nit + trigger masked, with 0235 letting
++ * each flip through), judged with the user watching on 11-28: the live clock
++ * updates, the picture is right, wake is normal.
+  */
+ static int sweet_fb_aod_lp = -1;                /* -1: boot-arg not read yet */
+ static int sweet_fb_aod_stop = -1;
+@@ -2008,12 +2011,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				sweet_fb_aod_saved = level;
+ 				sweet_fb_aod_active = 1;
+ 				if (sweet_fb_aod_lp < 0) {         /* 0233 boot-args, once each */
+-					int v = 0;
+-					sweet_fb_aod_lp = PE_parse_boot_argn("a8aodlp", &v, sizeof(v)) && v >= 1 && v <= 2 ? v : 0;
++					int v = 1;                  /* 0236: HLPM 2 nit by default (user, 11-28) */
++					(void)PE_parse_boot_argn("a8aodlp", &v, sizeof(v));
++					sweet_fb_aod_lp = v >= 0 && v <= 2 ? v : 1;
+ 				}
+ 				if (sweet_fb_aod_stop < 0) {
+-					int v = 0;
+-					sweet_fb_aod_stop = PE_parse_boot_argn("a8aodstop", &v, sizeof(v)) && v != 0 ? 1 : 0;
++					int v = 1;                  /* 0236: DECON trigger masked by default */
++					(void)PE_parse_boot_argn("a8aodstop", &v, sizeof(v));
++					sweet_fb_aod_stop = v != 0 ? 1 : 0;
+ 				}
+ 				lp = sweet_fb_aod_lp > 0 ? a8_panel_hlpm(sweet_fb_aod_lp) : 0;
+ 				if (lp <= 0 && (level < 0 || level > sweet_fb_aod_level)) {
