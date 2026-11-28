@@ -152,6 +152,22 @@ mkdir -p out
 for t in $all; do
 	cp "$build/$t" out/
 done
+
+# ---- the phone layout (P13 phase 2) ----------------------------------------
+# The tests go to /private/var/mobile/Library/a8air/ (the fput area). dyld on
+# this port has no AMFI policy outside the jtexecinject list (flags 0: no
+# @-paths, no DYLD_* variables), so air_metal_test names the library by its
+# absolute phone path; the library keeps its own install name. Every product is
+# ad-hoc signed (arm64 iOS code needs a signature; no entitlements: the Mali
+# user client checks none and this port has no sandbox kext).
+if [ -f out/air_metal_test ]; then
+	install_name_tool -change /jackpotlte/lib/libredwoodair.dylib \
+		/private/var/mobile/Library/a8air/libredwoodair.dylib out/air_metal_test
+fi
+for f in out/*; do
+	case "$(basename "$f")" in built-from) continue ;; esac
+	codesign -s - -f "$f"
+done
 cat "$patchset"/*.patch "$airset"/*.patch "$airset"/air/* "$shim"/*.c "$shim"/*.h |
 	shasum -a 256 | awk '{print $1}' > out/built-from
 
@@ -174,6 +190,11 @@ echo "libredwoodair exports: $(nm -gU out/libredwoodair.dylib | awk '$3 ~ /^_rwa
 		lipo -info "$f" 2>/dev/null || true
 	done
 	echo "install name: $(otool -D out/libredwoodair.dylib | tail -n 1)"
+	echo "air_metal_test loads: $(otool -L out/air_metal_test | grep redwoodair | awk '{print $1}')"
+	for f in out/*; do
+		case "$(basename "$f")" in built-from) continue ;; esac
+		echo "signature $(basename "$f"): $(codesign -dv "$f" 2>&1 | grep -E '^Signature|^CodeDirectory' | tr '\n' ' ')"
+	done
 	echo "rwa_* exports:"
 	nm -gU out/libredwoodair.dylib | awk '$3 ~ /^_rwa_/ {print "  " substr($3, 2)}'
 	echo "undefined in libredwoodair: $(nm -u out/libredwoodair.dylib | wc -l | tr -d ' ')"

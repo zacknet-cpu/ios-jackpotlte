@@ -50,6 +50,12 @@ jobs:
           done
           otool -D "$out/libredwoodair.dylib" | grep -q /jackpotlte/lib/libredwoodair.dylib ||
             fail "libredwoodair.dylib does not have its install name"
+          # the phone layout (P13 phase 2): absolute a8air path, ad-hoc signatures
+          otool -L "$out/air_metal_test" | grep -q /private/var/mobile/Library/a8air/libredwoodair.dylib ||
+            fail "air_metal_test does not load libredwoodair from /private/var/mobile/Library/a8air/"
+          for f in libredwoodair.dylib air_run air_metal_test air2nir; do
+            codesign -v "$out/$f" || fail "$f has no valid signature"
+          done
           n=$(nm -gU "$out/libredwoodair.dylib" | awk '$3 ~ /^_rwa_/' | wc -l | tr -d ' ')
           echo "rwa_* exports: $n"
           [ "$n" -gt 10 ] || fail "libredwoodair exports almost nothing of air_metal.h"
